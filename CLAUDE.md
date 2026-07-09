@@ -387,13 +387,13 @@ references — a tag with no logic reference wouldn't be in Studio's own export 
 this category are simply out of scope for the routine-carrier mechanism; no fallback (like
 synthesizing a dead-code reference) has been built, pending a decision on whether one is wanted.
 
-**First real, live end-to-end tests — two rounds of real Studio import failures, then a full
-ground-truth comparison that closed out every remaining gap.** Editing `SAMPLE_TAG_04`'s
-description (a controller-scope tag, referenced in `Continuous/SAMPLE_READ_ROUTINE`) and importing the
-exported routine via Studio's real Import Routine feature failed twice, both times on an
-unrelated context tag swept in only because `SAMPLE_READ_ROUTINE`'s own rung text (or an alias chain from it)
-also references it — nothing to do with the intended edit itself. Both rounds found real,
-general, previously-undiscovered bugs, not edge cases specific to one tag:
+**CONFIRMED WORKING END-TO-END, via a real tag-description edit imported into real Studio 5000.**
+This is the first fully successful real-world round-trip of the routine-carrier write-back
+mechanism: editing `SAMPLE_TAG_04`'s description (a controller-scope tag, referenced in
+`Continuous/SAMPLE_READ_ROUTINE`) and importing the exported routine via Studio's real Import Routine
+feature. Getting there took two rounds of real import failures, then a full ground-truth
+comparison against the user's own native `SAMPLE_READ_ROUTINE` export that closed out every remaining gap —
+both rounds found real, general, previously-undiscovered bugs, not edge cases specific to one tag:
 
 - **Round 1**: `Error: ... Failed to set the 'Data' property (Data type mismatch...)` on
   `SAMPLE_TAG_09`, plus a warning on `SAMPLE_TAG_08`. See "Initial-value decoding offset bugs" below
@@ -447,9 +447,11 @@ and rack/slot addressing), so this is a strong verification result — but it's 
 treat "verified" as "verified for the patterns this routine exercises," not "every possible RLL
 construct."
 
-A regenerated file (`LIVE_TEST_SAMPLE_TAG_04_desc_v5.L5X`, same project/tag/routine, all fixes
-applied) is ready for a final real-Studio retest as of this writing — expected to succeed cleanly
-based on the exact-match comparison above, but not yet confirmed by an actual import.
+**Final result**: `LIVE_TEST_SAMPLE_TAG_04_desc_v5.L5X` (same project/tag/routine, all six fixes
+applied) imported into real Studio 5000 with the exact same behavior as importing Studio's own
+native `SAMPLE_READ_ROUTINE.L5X` export — no errors, only the expected/normal "tag exists in project only"
+messages for I/O tags (see below), and the tag description overwrite applied successfully. The
+routine-carrier mechanism is proven end-to-end for the tag-description-edit case.
 
 **Confirmed normal, not a gap**: Studio's own Import Routine comparison shows "tag exists in
 project only" for `IO042:I` and `SAMPLE_MODULE_04:0:I` (I/O tags backed by `AB:` module-defined
