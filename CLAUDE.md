@@ -387,19 +387,39 @@ references — a tag with no logic reference wouldn't be in Studio's own export 
 this category are simply out of scope for the routine-carrier mechanism; no fallback (like
 synthesizing a dead-code reference) has been built, pending a decision on whether one is wanted.
 
-**First real, live end-to-end test — first attempt failed, second attempt is pending the user's
-retest.** Editing `SAMPLE_TAG_04`'s description (a controller-scope tag, referenced in
-`Continuous/SAMPLE_READ_ROUTINE`) and importing the exported routine via Studio's real Import Routine feature
-was rejected: `Error: ... Failed to set the 'Data' property (Data type mismatch...)` on an
-unrelated tag (`SAMPLE_TAG_09`) plus a warning on another (`SAMPLE_TAG_08`) — both swept in as
-context only because `SAMPLE_READ_ROUTINE`'s own rung text also references them, nothing to do with the
-intended edit. Both were real, general, previously-undiscovered bugs (not edge cases specific to
-these two tags) — see "Initial-value decoding offset bugs" below for the full root-cause and fix
-of both (a genuine one-element-array collapsing to a scalar, and TIMER/COUNTER-style built-in
-structs losing their BIT-overlay status members). A regenerated file
-(`LIVE_TEST_SAMPLE_TAG_04_desc_v2.L5X`, same project/tag/routine) has both fixes and is
-structurally verified locally, but **has not yet been re-tested against real Studio** as of this
-writing — that's the immediate next step once available.
+**First real, live end-to-end tests — two rounds so far, third attempt pending the user's retest.**
+Editing `SAMPLE_TAG_04`'s description (a controller-scope tag, referenced in `Continuous/SAMPLE_READ_ROUTINE`)
+and importing the exported routine via Studio's real Import Routine feature has twice failed so
+far, both times on an unrelated context tag swept in only because `SAMPLE_READ_ROUTINE`'s own rung text (or an
+alias chain from it) also references it — nothing to do with the intended edit itself. Both
+rounds found real, general, previously-undiscovered bugs, not edge cases specific to one tag:
+
+- **Round 1**: `Error: ... Failed to set the 'Data' property (Data type mismatch...)` on
+  `SAMPLE_TAG_09`, plus a warning on `SAMPLE_TAG_08`. See "Initial-value decoding offset bugs" below
+  for the full root-cause and fix of both (a genuine one-element-array collapsing to a scalar, and
+  TIMER/COUNTER-style built-in structs losing their BIT-overlay status members).
+- **Round 2** (after fixing round 1): `Error creating 'Tag[@Name="SAMPLE_MODULE_04:0:I"]' (Invalid
+  name.)`. Root cause: an Alias tag referenced by the routine (`SAMPLE_ALIAS_01`) has
+  `AliasFor="SAMPLE_MODULE_04:0:I.Data.7"` — an I/O tag target. The existing alias-target
+  base-name resolution correctly identified `SAMPLE_MODULE_04:0:I` as "referenced," but
+  `export_routine()` then rendered that literal I/O `Tag` object as its own `<Tag>` element.
+  `Tag._l5x_exclude` already encodes the right rule (I/O tags never appear as standalone `<Tag>`
+  elements in a real full-project export either — see the "I/O tags" bullet in "Pitfalls when
+  diffing against a real L5X" further up), but `export_routine()` builds its own ad-hoc
+  `controller_tags`/`program_tags` lists rather than going through the generic list-section
+  serialization that normally applies that exclusion. Fixed by filtering both lists through
+  `_l5x_exclude`. The legitimate alias tag itself (`SAMPLE_ALIAS_01`) and its
+  `AliasFor="SAMPLE_MODULE_04:..."` attribute (just a string, not a separate element) are
+  unaffected — verified the regenerated file has zero standalone
+  `<Tag Name="SAMPLE_MODULE_04...">` elements. **Not yet resolved**: whether the I/O tag's
+  *owning* `<Module>` needs to be included instead (the way a direct rung reference to an I/O tag
+  already triggers via `_referenced_modules()` — but an alias's I/O target doesn't go through that
+  path today, so this specific case still doesn't reference `SAMPLE_MODULE_04` at the Module level
+  at all). Whether that omission matters in practice is untested.
+
+A regenerated file (`LIVE_TEST_SAMPLE_TAG_04_desc_v3.L5X`, same project/tag/routine) has all three
+fixes and is structurally verified locally, but **has not yet been re-tested against real Studio**
+as of this writing — that's the immediate next step once available.
 
 ## Partial/context L5X exports (`export_routine()`)
 
