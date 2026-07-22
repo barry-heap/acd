@@ -916,7 +916,10 @@ exactly; `SAMPLE_TAG_08` (COUNTER) now renders all 5 status bits (structurally v
 independent real-Studio ground truth exists for this specific tag's own `Control` value).
 
 **5. Arrays need offset 0x1A2 + 2, not 0x1A2 — a major, project-wide bug, found via a real Studio
-5000 import error that turned out to be unrelated to what was actually wrong.** After re-testing an
+5000 import error that turned out to be unrelated to what was actually wrong. SUPERSEDED — see the
+"RESOLVED" note in "UDT total size must round up to a multiple of 4" below: the "array vs scalar"
+framing here was itself wrong; the real, general mechanism is `_tag_value_blob_offset()`.** After
+re-testing an
 `export_routine()` export following the `SAMPLE_DECISION_TAG`/`PARTWrk` fixes above, Studio reported `Only
 ASCII characters are supported` on an unrelated tag (`PARTTrm`) — chased down and fixed (see the
 STRING/latin-1 section below) — but while re-verifying the *other* tags swept into that same export
@@ -1279,17 +1282,60 @@ immediately following one). `SAMPLE_DECISION_TAG`/`SAMPLE_DECISION_TAG_2`'s `L5K
 byte-for-byte identical to real Studio ground truth after this change. New regression test:
 `test_apply_dead_member_byte_corrections_bool_array_absorbs_shift_via_alignment`.
 
-**Still open, NOT resolved by either fix above**: `SAMPLE_TAG_05`'s own scalar members (`PlssQty`, `Pstn`,
-etc.) still decode wrong — confirmed via raw byte inspection that the entire tag's value region
-needs an additional whole-tag +2 shift (base `0x1A2 + 2`, not `0x1A2`) despite `SAMPLE_TAG_05` being a
-*scalar* (non-array) tag, which contradicts the array-vs-scalar rule established for primitive
-arrays elsewhere in this file. A wide, systematic sweep of 60 real scalar UDT-typed tags found that
-`PART`/`PARTWrk`-typed tags are the *only* ones that don't need this additional shift — every other
-UDT type tested does — but no structural, `DataType`-level, or tag-level property found so far
-predicts this split; it may be a per-tag artifact of when/how that specific tag's data was
-allocated, not something derivable from the UDT's current declared structure at all. Do not guess a
-fix for this without further real data — see the git history around this comment for the specific
-hypotheses already tried and ruled out, so they aren't re-tried.
+**RESOLVED (was "still open" above) — the whole "some tags need +2" mystery, definitively.** The
+`0x1A2`/`0x1A2 + 2` split described throughout this section and "Initial-value decoding offset
+bugs" below was **never actually about scalar-vs-array, or about which UDT type is involved** —
+every one of those correlations (array-vs-scalar, `PART`/`PARTWrk`-vs-everything-else) was
+coincidental to the specific projects tested. The real mechanism, found by finally parsing the
+tag's `data_table_instance` comps record as the ordinary structured `RxGeneric` record it actually
+is instead of guessing an absolute byte offset into it:
+
+- That record's own header declares `count_record` attribute records, but `RxGeneric._read()`'s
+  Kaitai-generated parsing loop (`for i in range(self.count_record - 1)`) always leaves the
+  **last** one unparsed in the stream — deliberately or not, this last attribute record (always
+  `attribute_id 0x66`) is never read into `extended_records` at all.
+- That unparsed last attribute record **is the tag's own value blob**: its own 4-byte `len_value`
+  field always exactly equals the tag's computed value size (verified across every scalar/array,
+  primitive/UDT tag checked), and its value payload — starting 8 bytes (`attribute_id +
+  len_value`) after wherever the 3 parsed `extended_records` leave off — is the real data.
+- The "some tags need +2" appearance came entirely from this: the byte length consumed by the 3
+  *parsed* attribute records (in particular attribute `0x1`, an opaque boilerplate blob) genuinely
+  varies by a couple of bytes between records/projects — 286 bytes in one fresh Studio 5000 V32
+  test project, 288 bytes in an older V38 production project — which is a real, computable
+  difference in the record's own self-declared structure, not something dependent on whether the
+  tag is a scalar, an array, or which UDT type it uses.
+
+Fixed by adding `_tag_value_blob_offset(raw_rec)` (`elements.py`), which parses the record via
+`RxGeneric.from_bytes()` and computes `82 + sum(8 + len(value) for er in extended_records) + 8` —
+replacing the old fixed-constant/`is_array`-conditional guess entirely in both
+`_read_tag_initial_value` and `_decode_udt_initial_value`.
+
+**A second, compounding bug was found and fixed in the same investigation**: with the above fix
+alone, a real, *populated* `SAMPLE_DECISION_TAG` tag (`PARTWrk`-typed; the user provided a live Studio
+5000 screenshot of its Monitor tab) still decoded 5 populated fields wrong
+(`pntrTpStrt`/`pntrTpStp`/`pntrPART`/`Wrk[4]`) — because `_apply_dead_member_byte_corrections`
+(see "Nested-UDT decode recursion-depth double-increment" below) was *also* adding a +2 shift to
+every `PARTWrk` member following `BfrPART` (`PART`-typed, which has one deleted/orphaned member),
+double-counting a correction that the fix above already fully accounts for. The earlier "verified
+exact, 170/170 leaf values" claim for this exact tag was made against an **all-zero/unpopulated**
+instance, which cannot distinguish a correct offset from one that's off by 2 — this is why a real,
+populated instance was necessary to catch it, and a reminder that an "exact match" check is only
+as strong as the ground truth data actually exercises the code path in question. Fixed by making
+`_apply_dead_member_byte_corrections` a no-op — Rockwell's own stored per-member byte offsets
+already account for everything correctly, with no adjustment needed for a nested type's dead
+bytes. `_dead_member_bytes` is still computed and logged (`DataTypeBuilder.build()`) as a
+diagnostic that a type has an orphaned member, but no longer feeds into any byte-offset math
+anywhere.
+
+Verified end-to-end against the real project: `SAMPLE_TAG_05.PlssQty=256`, `SAMPLE_DECISION_TAG.pntrTpStrt=24`/
+`pntrTpStp=25`/`pntrPART=183`/`Wrk=[0,0,0,0,32790,0,0,0,0,0]` (all matching the user's live Studio
+5000 screenshot exactly), `PARTTrm[0].No=158`/`Year=2026`, `SAMPLE_TAG_20`'s first
+10 values — and, separately, the fresh V32 test project's `TestDintArray`/`TestPART`/`ZZTest1` all
+still decode correctly (proving the fix generalizes rather than just re-fitting the V38 project).
+A full whole-project `to_xml()` export of the real project also completes without error. Full test
+suite: 101 passed, 2 skipped (up from 97/2, after rewriting the tests that had encoded the old,
+disproven fixed-offset assumptions to instead build a synthetic `RxGeneric`-shaped record via a new
+`_build_dti_record()` test helper).
 
 ## Rung patch write-back (`patch_rungs`/`patch_sbregion_dat`)
 
