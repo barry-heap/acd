@@ -10,6 +10,7 @@ const { Member, DataType } = require("./render");
 const { Module } = require("./elements");
 const { CATALOG_NUMBERS } = require("./catalog_numbers");
 const { Tag } = require("./tag");
+const { Parameter, LocalTag, Routine } = require("./elements");
 const { readTagInitialValue, countArrayElements, SKIP_DECORATED } = require("./render");
 
 const CONNECTION_TYPE_BY_CODE = new Map([
@@ -716,6 +717,339 @@ function buildTag(db, objectId, hexOidMap = null) {
   });
 }
 
+function aoiTagUsageFlags(ext01) {
+  return ext01.length > 0x20e ? ext01[0x20e] : 0;
+}
+
+function aoiTagDataType(db, rawRec) {
+  if (rawRec.length < 0x2e) return "";
+  const dtOid = dv(rawRec).getUint32(0x2a, true);
+  const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [dtOid]);
+  return row ? row[0] : "";
+}
+
+function buildParameter(db, objectId) {
+  const row = queryOne(db, "SELECT comp_name, record FROM comps WHERE object_id=?", [objectId]);
+  const name = row[0];
+  const rawRec = row[1];
+
+  const dataType = aoiTagDataType(db, rawRec);
+
+  let dimensions = null;
+  if (rawRec.length >= 0x1e) {
+    const dimVal = dv(rawRec).getUint32(0x1a, true);
+    if (dimVal) dimensions = String(dimVal);
+  }
+
+  let r;
+  let exts;
+  try {
+    r = new RxGeneric(new KaitaiStream(rawRec));
+    exts = new Map();
+    for (const er of r.extendedRecords) exts.set(er.attributeId, er.value);
+  } catch (e) {
+    return new Parameter(name, "Base", dataType, "Input", null, "false", "false", "Read/Write", null, dimensions);
+  }
+
+  const ext01 = exts.get(0x01) || new Uint8Array(0);
+  const flags = aoiTagUsageFlags(ext01);
+
+  const usageBits = flags & 0x0c;
+  let usage;
+  if (usageBits === 0x04) usage = "Input";
+  else if (usageBits === 0x08) usage = "Output";
+  else usage = "InOut";
+
+  const required = flags & 0x20 ? "true" : "false";
+  const visible = flags & 0x40 ? "true" : "false";
+
+  let externalAccess;
+  let constant;
+  if (usage === "InOut") {
+    externalAccess = null;
+    constant = dataType === "MESSAGE" ? null : "false";
+  } else if (ext01.length > 0x21f) {
+    const eaVal = dv(ext01).getUint16(0x21e, true);
+    externalAccess = externalAccessEnum(eaVal);
+    constant = null;
+  } else {
+    externalAccess = "Read/Write";
+    constant = null;
+  }
+
+  let radix;
+  if (!dataType || ext01.length <= 0x20f) {
+    radix = null;
+  } else {
+    const radixIdx = ext01[0x20f] >> 4;
+    radix = radixIdx !== 0 ? radixEnum(radixIdx) : null;
+  }
+
+  let description = null;
+  if (rawRec.length >= 18) {
+    const memberRef = dv(rawRec).getUint32(14, true);
+    if (memberRef) {
+      const descRow = queryOne(db, "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1", [
+        r.commentId * 0x10000 + r.cipType,
+        memberRef,
+      ]);
+      if (descRow && descRow[0]) description = descRow[0];
+    }
+  }
+
+  return new Parameter(name, "Base", dataType, usage, radix, required, visible, externalAccess, constant, dimensions, {
+    description,
+  });
+}
+
+function buildLocalTag(db, objectId) {
+  const row = queryOne(db, "SELECT comp_name, record FROM comps WHERE object_id=?", [objectId]);
+  const name = row[0];
+  const rawRec = row[1];
+
+  const dataType = aoiTagDataType(db, rawRec);
+
+  let dimensions = null;
+  if (rawRec.length >= 0x1e) {
+    const dimVal = dv(rawRec).getUint32(0x1a, true);
+    if (dimVal) dimensions = String(dimVal);
+  }
+
+  let r;
+  let exts;
+  try {
+    r = new RxGeneric(new KaitaiStream(rawRec));
+    exts = new Map();
+    for (const er of r.extendedRecords) exts.set(er.attributeId, er.value);
+  } catch (e) {
+    return new LocalTag(name, dataType, dimensions, null, "Read/Write");
+  }
+
+  const ext01 = exts.get(0x01) || new Uint8Array(0);
+  let externalAccess;
+  if (ext01.length > 0x21f) {
+    const eaVal = dv(ext01).getUint16(0x21e, true);
+    externalAccess = externalAccessEnum(eaVal);
+  } else {
+    externalAccess = "Read/Write";
+  }
+
+  let radix;
+  if (ext01.length > 0x20f) {
+    const radixIdx = ext01[0x20f] >> 4;
+    radix = radixIdx !== 0 ? radixEnum(radixIdx) : null;
+  } else {
+    radix = null;
+  }
+
+  let description = null;
+  if (rawRec.length >= 18) {
+    const memberRef = dv(rawRec).getUint32(14, true);
+    if (memberRef) {
+      const descRow = queryOne(db, "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1", [
+        r.commentId * 0x10000 + r.cipType,
+        memberRef,
+      ]);
+      if (descRow && descRow[0]) description = descRow[0];
+    }
+  }
+
+  return new LocalTag(name, dataType, dimensions, radix, externalAccess, { description });
+}
+
+function routineTypeEnum(idx) {
+  switch (idx) {
+    case 0:
+      return "TypeLess";
+    case 1:
+      return "RLL";
+    case 2:
+      return "FBD";
+    case 3:
+      return "SFC";
+    case 4:
+      return "ST";
+    case 5:
+      return "External";
+    case 6:
+      return "Encrypted";
+    default:
+      return "Typeless";
+  }
+}
+
+function parseFffeff(data, offset) {
+  if (offset + 4 > data.length || !(data[offset] === 0xff && data[offset + 1] === 0xfe && data[offset + 2] === 0xff)) {
+    return ["", offset];
+  }
+  let length = data[offset + 3];
+  offset += 4;
+  if (length === 0xff) {
+    if (offset + 2 > data.length) return ["", offset];
+    length = dv(data).getUint16(offset, true);
+    offset += 2;
+  }
+  const s = KaitaiStream.bytesToStr(data.subarray(offset, offset + length * 2), "UTF-16LE");
+  return [s, offset + length * 2];
+}
+
+const ST_LINE_RECORD_TYPE = 0x01000002;
+
+function stRoutineLines(db, routineObjectId) {
+  const lines = [];
+  let frontier = [routineObjectId];
+  for (let depth = 0; depth < 6; depth++) {
+    if (!frontier.length) break;
+    const qmarks = frontier.map(() => "?").join(",");
+    const rows = queryAll(db, `SELECT object_id, record FROM nameless WHERE parent_id IN (${qmarks})`, frontier);
+    frontier = [];
+    for (const [oid, rec] of rows) {
+      frontier.push(oid);
+      if (rec.length < 24) continue;
+      if (dv(rec).getUint32(4, true) !== ST_LINE_RECORD_TYPE) continue;
+      const seq = dv(rec).getUint32(20, true);
+      if (seq === 0xffffffff) continue;
+      const [text] = parseFffeff(rec, 24);
+      lines.push([seq, text]);
+    }
+  }
+  if (!lines.length) return [];
+  lines.sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+  let texts = lines.map(([, text]) => text);
+
+  const allHex = new Set();
+  for (const t of texts) {
+    for (const m of t.matchAll(/@([0-9a-fA-F]{1,8})@/g)) allHex.add(m[1]);
+  }
+  if (allHex.size) {
+    const idToName = new Map();
+    for (const hexId of allHex) {
+      const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [parseInt(hexId, 16)]);
+      if (row && row[0]) idToName.set(hexId, row[0]);
+    }
+    if (idToName.size) {
+      texts = texts.map((line) => line.replace(/@([0-9a-fA-F]{1,8})@/g, (m, hex) => idToName.get(hex) || m));
+    }
+  }
+  return texts;
+}
+
+function lookupObjectDescription(db, r, record) {
+  try {
+    const ownScopeId = record.length >= 18 ? dv(record).getUint16(16, true) : 0;
+    const commentParent = r.commentId * 0x10000 + r.cipType;
+    const rows = queryAll(db, "SELECT record_string FROM comments WHERE parent=? AND scope_id=? AND record_type=1", [
+      commentParent,
+      ownScopeId,
+    ]);
+    const candidates = rows.map((row) => row[0]).filter(Boolean);
+    if (candidates.length) return candidates.reduce((a, b) => (b.length > a.length ? b : a));
+  } catch (e) {
+    // matches Python's bare except: pass
+  }
+  return null;
+}
+
+function buildRoutine(db, objectId) {
+  const results = queryAll(db, "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id=?", [objectId]);
+
+  let r;
+  try {
+    r = new RxGeneric(new KaitaiStream(results[0][3]));
+  } catch (e) {
+    return null;
+  }
+
+  const record = results[0][3];
+  const name = results[0][0];
+  const routineType = routineTypeEnum(dv(r.recordBuffer).getUint16(0x30, true));
+  if (routineType === "TypeLess") return null;
+
+  const rowsRaw = queryAll(
+    db,
+    "SELECT rm.object_id, r.rung FROM region_map rm LEFT JOIN rungs r ON r.object_id = rm.object_id " +
+      "WHERE rm.parent_id=? ORDER BY rm.unknown",
+    [objectId],
+  );
+  const rows = rowsRaw.filter((row) => row[1] !== null);
+  const rungIds = rows.map((row) => row[0]);
+  let rungs = rows.map((row) => row[1]);
+
+  const allHex = new Set();
+  for (const rung of rungs) {
+    if (!rung) continue;
+    for (const m of rung.matchAll(/&([0-9a-f]{8}):/g)) allHex.add(m[1]);
+  }
+  if (allHex.size) {
+    const idToName = new Map();
+    for (const hexId of allHex) {
+      const row2 = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [parseInt(hexId, 16)]);
+      if (row2) idToName.set(hexId, row2[0]);
+    }
+    if (idToName.size) {
+      rungs = rungs.map((rung) =>
+        rung ? rung.replace(/&([0-9a-f]{8}):/g, (m, hex) => (idToName.has(hex) ? idToName.get(hex) + ":" : m)) : rung,
+      );
+    }
+  }
+
+  const rungComments = new Map();
+  let description = null;
+  try {
+    const ownScopeId = record.length >= 18 ? dv(record).getUint16(16, true) : 0;
+    const commentParent = r.commentId * 0x10000 + r.cipType;
+    const commentRows = queryAll(db, "SELECT record_string, rung_content FROM comments WHERE parent=? AND scope_id=? AND record_type=1", [
+      commentParent,
+      ownScopeId,
+    ]);
+    const descCandidates = [];
+    const rungContentRows = [];
+    for (const [recStr, rungContent] of commentRows) {
+      if (rungContent) {
+        rungContentRows.push([rungContent, recStr]);
+      } else if (recStr) {
+        descCandidates.push(recStr);
+      }
+    }
+    if (descCandidates.length) description = descCandidates.reduce((a, b) => (b.length > a.length ? b : a));
+
+    if (rungContentRows.length) {
+      const rungIdToIndex = new Map(rungIds.map((oid, i) => [oid, i]));
+      for (const [rungContent, recStr] of rungContentRows) {
+        if (!recStr) continue;
+        const fragment = rungContent >>> 16;
+        let rungIndex = null;
+        const idxUids = queryAll(db, "SELECT rung_object_id FROM regnlink_idx WHERE routine_id=? AND fragment=?", [
+          objectId,
+          fragment,
+        ]).map((row) => row[0]);
+        if (idxUids.length) {
+          for (const uid of idxUids) {
+            rungIndex = rungIdToIndex.has(uid) ? rungIdToIndex.get(uid) : null;
+            if (rungIndex !== null) break;
+          }
+        } else {
+          const row3 = queryOne(db, "SELECT rung_object_id FROM regnlink WHERE routine_id=? AND fragment=?", [
+            objectId,
+            fragment,
+          ]);
+          if (row3 !== null) rungIndex = rungIdToIndex.has(row3[0]) ? rungIdToIndex.get(row3[0]) : null;
+        }
+        if (rungIndex !== null && rungIndex !== undefined && !rungComments.has(rungIndex)) {
+          rungComments.set(rungIndex, recStr);
+        }
+      }
+    }
+  } catch (e) {
+    // matches Python's bare except: pass
+  }
+
+  let stLines = [];
+  if (routineType === "ST") stLines = stRoutineLines(db, objectId);
+
+  return new Routine(name, routineType, rungs, { rungIds, rungComments, description, stLines });
+}
+
 module.exports = {
   radixEnum,
   externalAccessEnum,
@@ -726,5 +1060,12 @@ module.exports = {
   buildModule,
   buildHexOidMap,
   resolveTagNameFromOid,
+  routineTypeEnum,
+  parseFffeff,
+  stRoutineLines,
+  lookupObjectDescription,
+  buildRoutine,
+  buildParameter,
+  buildLocalTag,
   buildTag,
 };
