@@ -2,7 +2,6 @@
 // (identifier, lenRecord, record.recordBuffer), mirroring
 // DbExtract(path).read().records.record in Python.
 
-const fs = require("fs");
 const { KaitaiStream } = require("kaitai-struct");
 const { Dat } = require("./generated/Dat");
 
@@ -14,7 +13,12 @@ function parseDatBytes(bytes) {
 }
 
 // Node-only convenience for dev/testing against files already on disk.
+// require("fs") is deliberately lazy/inline here, not a top-level import --
+// this file is also embedded in the browser build (build.js), where "fs"
+// doesn't exist; a top-level require("fs") would throw as soon as the page
+// loads, before this function is ever called (it never is, from the UI).
 function parseDatFile(path) {
+  const fs = require("fs");
   return parseDatBytes(fs.readFileSync(path));
 }
 

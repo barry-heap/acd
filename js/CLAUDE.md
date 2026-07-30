@@ -308,8 +308,53 @@ non-reproducible between two separate runs, not a bug; `formatNowWeekdayString()
 Python's naive `datetime.now()`, not UTC, unlike the FILETIME-derived dates elsewhere which
 correctly use UTC). `CuteLogix.ACD`'s full L5X is 147,362 characters on both sides.
 
-This closes out the whole read pipeline (container → records → SQL → object graph → XML). What's
-left: the browser UI (file input → this function → `Blob` download).
+This closes out the whole read pipeline (container → records → SQL → object graph → XML).
+
+## Browser UI (`build.js`/`ui.js`/`test_browser.js`) — the whole thing runs as an offline web page
+
+`build.js` (dev-only, run via `node build.js` / `npm run build`) assembles every module above
+into one self-contained `dist/acd-to-l5x.html` — **this file is the actual shipped deliverable**,
+tracked in git despite the repo's general `dist/` ignore rule. No bundler dependency (webpack/
+esbuild/etc.) was introduced; instead it's a small hand-rolled CommonJS-in-the-browser shim
+(`__require`/`__modules` in the emitted `<script>`) that runs every existing, already-verified
+Node module **completely unmodified** — their own `require()`/`module.exports` lines are embedded
+as-is. The shim resolves relative specifiers (`"./render"`, `"../generated/RxGeneric"`) against
+each module's own id and maps the three external package names (`"kaitai-struct"`, `"pako"`,
+`"sql.js"`) to the UMD/global runtimes loaded via preceding `<script>` tags
+(`kaitai-struct/KaitaiStream.js`, `pako`'s UMD browser build, and **`sql.js`'s `sql-asm.js`
+variant specifically** — the plain-asm.js build with no separate `.wasm` file to fetch, keeping
+the whole thing offline/single-file with zero network requests).
+
+**One real portability bug found and fixed getting this to actually load in a browser** (not
+caught by any Node-side test, since Node has these globals and the browser doesn't):
+`parseDat.js` had `const fs = require("fs");` at module top level — harmless in Node, but since
+this same file is embedded verbatim in the browser bundle, that line executed the instant the
+page loaded (as soon as anything required `"./ingest"` → `"./parseDat"` transitively, which the
+UI bootstrap does immediately), throwing `Error: Node-only module 'fs' is not available` before
+the file input was even touched. Fixed by moving `require("fs")` inside `parseDatFile()` itself
+(the one Node-only convenience function that actually uses it, never called from the browser
+code path) instead of at module top level — the general lesson: any module meant to be embedded
+in the browser bundle must only reference Node-only globals (`fs`, `path`, `require.resolve`)
+*lazily inside functions that are never called from the browser path*, never at top level, since
+the shim executes every module's top-level code eagerly on first require regardless of environment.
+A second, related fix: `ingest.js`'s `initSqlJs({ locateFile: ... })` call used
+`require.resolve(...)` (Node-only) unconditionally; guarded behind an `isNode` check
+(`typeof process !== "undefined" && process.versions.node` — NOT a `typeof require` check, since
+the browser shim's own injected `require` function makes `typeof require === "function"` true in
+both environments) so the browser path calls `initSqlJs({})` with no `locateFile` at all (the
+embedded asm.js build never needs to fetch anything external).
+
+**Verified working in a real browser**: `test_browser.js` (Playwright, the pre-installed headless
+Chromium at `/opt/pw-browsers/chromium`) loads the built HTML, feeds it each of the 4 local
+fixtures with real controller content via the actual file-input element, and captures the
+downloaded `.L5X` — **byte-for-byte identical to Python's `ConvertAcdToL5x` output** (modulo
+`ExportDate`) for all 4, confirming the entire pipeline (container extraction, binary record
+parsing, SQL ingestion via sql.js's asm.js build, object-graph construction, XML emission) runs
+correctly end-to-end inside an actual browser page, not just under Node.
+
+**Scope note**: `test_browser.js`/`build.js` are dev tooling, not shipped — only
+`dist/acd-to-l5x.html` is the deliverable. `playwright` is a devDependency for this verification
+only, not needed to use the converter itself.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 

@@ -21,3 +21,9 @@ resources/*/
 /js/node_modules/
 /js/extracted/
 /js/resources/
+# The built single-file browser converter IS the shipped deliverable (see
+# js/build.js) -- track it despite the general "dist" ignore rule above,
+# but not other js/dist/ content (e.g. test_browser.js's downloaded output).
+!/js/dist/
+/js/dist/*
+!/js/dist/acd-to-l5x.html
