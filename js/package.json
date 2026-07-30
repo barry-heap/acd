@@ -6,12 +6,14 @@
   "main": "test_parse.js",
   "scripts": {
     "extract": "node extract.js",
-    "test": "node extract.js && node test_parse.js && node verify_records.js"
+    "test": "node extract.js && node test_parse.js && node verify_records.js && node verify_ingest.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "kaitai-struct": "^0.11.0"
+    "kaitai-struct": "^0.11.0",
+    "pako": "^3.0.1",
+    "sql.js": "^1.14.1"
   }
 }

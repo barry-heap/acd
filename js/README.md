@@ -19,22 +19,26 @@ ported — round-tripping needs a Studio-version HMAC key this project doesn't h
 - `record/` — per-file record-shape parsers (port of `acd/record/*.py`): `comps.js`,
   `sbregion.js`, `comments.js`, `nameless.js`.
 - `extract.js` — extracts `../resources/CuteLogix.ACD` into `./extracted/` (gitignored).
-- `test_parse.js` / `verify_records.js` — smoke tests / dev verification harness (dump parsed
-  tuples to JSON for diffing against the equivalent Python output — not part of the shipped app).
+- `ingest.js` — SQL ingestion layer (port of `acd/l5x/export_l5x.py`'s `ExportL5x`): extracts an
+  ACD, parses every `.Dat` file, and loads everything into a `sql.js` (SQLite-to-WASM) database
+  with the same schema Python's `ControllerBuilder` and friends query.
+- `test_parse.js` / `verify_records.js` / `verify_ingest.js` — smoke tests / dev verification
+  harnesses (dump parsed tuples / SQL table contents to JSON for diffing against the equivalent
+  Python output — not part of the shipped app).
 
-Not yet present: the SQL ingestion layer (`sql.js`-backed port of `acd/l5x/export_l5x.py`), the
-object-graph builders and XML emission (`acd/l5x/elements.py`), the pipeline entry point
-(`acd/api.py`), or the browser UI. See `CLAUDE.md` for current status on each.
+Not yet present: the object-graph builders and XML emission (`acd/l5x/elements.py`, the bulk of
+the remaining work), the pipeline entry point (`acd/api.py`), or the browser UI. See `CLAUDE.md`
+for current status on each.
 
 ## Running it
 
 ```bash
 npm install
-npm test        # extract fixture -> parse Comps.Dat smoke test -> full record-parser verification
+npm test        # extract fixture -> Comps.Dat smoke test -> record-parser verification -> SQL ingestion verification
 ```
 
-`npm test` runs `verify_records.js`, which parses all four `.Dat` files from the fixture ACD and
-writes the resulting tuples to `/tmp/js_*.json`. To confirm parity against Python, run the
-equivalent Python extraction (see `CLAUDE.md`'s "Verification recipe" for the exact snippet) and
-diff the two — this has been done and passes with zero mismatches as of the last update to
-`CLAUDE.md`, but isn't automated as a single command yet (no Python dependency is assumed here).
+`npm test` writes JSON dumps to `/tmp/js_*.json`. To confirm parity against Python, run the
+equivalent Python extraction (see `CLAUDE.md`'s "Verification recipe" for the exact snippets) and
+diff the two — this has been done for every layer so far and passes with zero mismatches (see
+`CLAUDE.md`'s "Status by layer"), but isn't wired into `npm test` as a single command since that
+would require a Python environment this JS project doesn't otherwise depend on.
