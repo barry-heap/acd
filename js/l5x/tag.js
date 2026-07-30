@@ -20,6 +20,7 @@ const {
   generateDecorated,
   buildCommentsXml,
   isFloatType,
+  isGenuineFloat,
 } = require("./render");
 
 class Tag extends L5xElement {
@@ -118,7 +119,7 @@ class Tag extends L5xElement {
         if (Array.isArray(iv)) {
           const fmtElemVal = (val) => {
             if (dtBase === "BOOL" || dtBase === "BIT") return val ? "1" : "0";
-            if (isFloatType(dtBase)) return decoratedRealLiteral(val, true);
+            if (isGenuineFloat(dtBase, val)) return decoratedRealLiteral(val, true);
             return String(Math.trunc(val));
           };
           const elems = iv.map((v, i) => `<Element Index="[${i}]" Value="${fmtElemVal(v)}"/>`).join("");
@@ -135,7 +136,7 @@ class Tag extends L5xElement {
           if (dtBase === "BOOL" || dtBase === "BIT") {
             valStr = iv ? "1" : "0";
             l5kVal = valStr;
-          } else if (isFloatType(dtBase)) {
+          } else if (isGenuineFloat(dtBase, iv)) {
             valStr = decoratedRealLiteral(iv, false);
             l5kVal = l5kRealLiteral(iv);
           } else {

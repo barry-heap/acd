@@ -505,6 +505,15 @@ function isFloatType(dtUpper) {
   return dtUpper === "REAL" || dtUpper === "LREAL";
 }
 
+// Combines isFloatType with the -0 out-of-bounds-fallback sentinel check
+// (see decodeScalarMember/readTagInitialValue): Python's isinstance(val,
+// float) is false for that fallback's plain int 0 even when the member's
+// declared type is REAL/LREAL, so real-number Decorated formatting must be
+// skipped for it specifically (renders bare "0", matching Python exactly).
+function isGenuineFloat(dtUpper, val) {
+  return isFloatType(dtUpper) && !Object.is(val, -0);
+}
+
 function udtScalarToXml(dtName, values, dataTypesMap) {
   if (isStringFamilyType(dtName, dataTypesMap)) {
     const length = values.LEN ?? 0;
@@ -537,7 +546,7 @@ function udtScalarToXml(dtName, values, dataTypesMap) {
       parts.push(`<ArrayMember Name="${mname}" DataType="${mdt}" Dimensions="${val.length}">${innerParts.join("")}</ArrayMember>`);
     } else if (Array.isArray(val)) {
       const radix = PRIMITIVE_RADIX[mdtUpper] || "Decimal";
-      const fmtElem = (v) => (isFloatType(mdtUpper) ? decoratedRealLiteral(v, true) : v);
+      const fmtElem = (v) => (isGenuineFloat(mdtUpper, v) ? decoratedRealLiteral(v, true) : v);
       const elems = val.map((v, i) => `<Element Index="[${i}]" Value="${fmtElem(v)}"/>`).join("");
       parts.push(`<ArrayMember Name="${mname}" DataType="${mdt}" Dimensions="${val.length}" Radix="${radix}">${elems}</ArrayMember>`);
     } else if (mdtUpper === "BOOL" || mdtUpper === "BIT") {
@@ -548,7 +557,7 @@ function udtScalarToXml(dtName, values, dataTypesMap) {
       if (radix === "Binary" && !isFloatType(mdtUpper)) {
         const elemSize = (PRIM[mdtUpper] || { size: 4 }).size;
         memberVal = decoratedBinaryLiteral(val, elemSize * 8);
-      } else if (isFloatType(mdtUpper)) {
+      } else if (isGenuineFloat(mdtUpper, val)) {
         memberVal = decoratedRealLiteral(val, false);
       } else {
         memberVal = val;
@@ -720,7 +729,13 @@ function readTagInitialValue(getCompsRecord, dataTableInstance, dataType, nEleme
     if (byteOff + prim.size <= rawRec.length) {
       values.push(prim.get(dv, byteOff));
     } else {
-      values.push(0);
+      // Mirrors Python's out-of-bounds fallback returning a plain int 0
+      // (never a float), even for a REAL/LREAL element -- downstream
+      // rendering must show bare "0", not "0.0", for this case specifically
+      // (see the -0 sentinel note on decodeScalarMember below). Using -0
+      // here (not +0) is an internal marker only; -0 === 0 everywhere else
+      // (arithmetic, truthiness, JSON), so this is otherwise invisible.
+      values.push(-0);
     }
   }
 
@@ -813,8 +828,26 @@ function decodeSingleUdtElement(blob, baseOffset, dataType, dataTypesMap, depth,
     }
   }
 
+  // Mirrors Python's `isinstance(target_val, int)` guard exactly: a real,
+  // built-in Rockwell structure (PID) has BIT-overlay flags (EN/CT/CL/...)
+  // whose target is "SP", a REAL member -- not just the DINT "Control"
+  // field TIMER/COUNTER overlay. JS has no int/float distinction at runtime
+  // (typeof 0.0 === "number", same as typeof 0), so `typeof targetVal ===
+  // "number"` would wrongly bit-extract a REAL's IEEE-754 bits and silently
+  // add EN/CT/CL/... keys Python's dict never has for this tag. Instead,
+  // look up the target member's own *declared* type: only a scalar integer
+  // primitive (never REAL/LREAL, an array, or a struct) passes, matching
+  // which decoded values are Python `int` vs `float`/`list`/`dict`.
+  const memberByName = new Map(dataType.members.map((m) => [m.name, m]));
   for (const member of dataType.members) {
     if (member.dataType !== "BIT") continue;
+    const targetMember = memberByName.get(member.target);
+    const targetIsIntPrim =
+      targetMember !== undefined &&
+      targetMember.dimension === 0 &&
+      PRIM[targetMember.dataType.toUpperCase()] !== undefined &&
+      !isFloatType(targetMember.dataType.toUpperCase());
+    if (!targetIsIntPrim) continue;
     const targetVal = result[member.target];
     if (typeof targetVal === "number" && member.bitNumber !== null && member.bitNumber !== undefined) {
       result[member.name] = (targetVal >> member.bitNumber) & 1;
@@ -836,7 +869,11 @@ function decodeScalarMember(blob, offset, dataType, dataTypesMap, depth, bitNumb
       }
       return val;
     }
-    return 0;
+    // -0 sentinel: mirrors Python's out-of-bounds fallback (`return 0`),
+    // which is always a plain int regardless of dataType -- see the note on
+    // the array fallback in readTagInitialValue above for why this matters
+    // for REAL/LREAL members specifically.
+    return -0;
   }
 
   if (isStringFamilyType(mdtUpper, dataTypesMap)) {
@@ -885,6 +922,7 @@ module.exports = {
   escapeXmlAttr,
   multilineXmlText,
   isFloatType,
+  isGenuineFloat,
   sanitizeXmlText,
   toXmlAttrName,
   L5xElement,

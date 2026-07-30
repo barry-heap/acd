@@ -10,7 +10,7 @@ const { Member, DataType } = require("./render");
 const { Module } = require("./elements");
 const { CATALOG_NUMBERS } = require("./catalog_numbers");
 const { Tag } = require("./tag");
-const { Parameter, LocalTag, Routine, AOI, Program, Task, EventInfo, ScheduledProgram } = require("./elements");
+const { Parameter, LocalTag, Routine, AOI, Program, Task, EventInfo, ScheduledProgram, Controller, RSLogix5000Content } = require("./elements");
 const { decodeUdtInitialValue } = require("./render");
 const { readTagInitialValue, countArrayElements, SKIP_DECORATED } = require("./render");
 
@@ -1364,6 +1364,456 @@ function buildTask(db, objectId, commentIdToProgram) {
   );
 }
 
+const WEEKDAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Mirrors Python's (datetime(1601,1,1) + timedelta(seconds=raw)).strftime("%a %b %d %H:%M:%S %Y")
+// for a FILETIME-derived seconds-since-1601 value (raw may be fractional; only
+// whole-second precision is shown, matching strftime's %S).
+function filetimeSecondsToWeekdayString(rawSeconds) {
+  const SECONDS_1601_TO_1970 = 11644473600;
+  const unixSeconds = rawSeconds - SECONDS_1601_TO_1970;
+  const date = new Date(unixSeconds * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  // getUTCDay(): 0=Sunday..6=Saturday; WEEKDAY_ABBR is Mon-first, so remap.
+  const dayIdx = (date.getUTCDay() + 6) % 7;
+  return (
+    `${WEEKDAY_ABBR[dayIdx]} ${MONTH_ABBR[date.getUTCMonth()]} ${p(date.getUTCDate())} ` +
+    `${p(date.getUTCHours())}:${p(date.getUTCMinutes())}:${p(date.getUTCSeconds())} ${date.getUTCFullYear()}`
+  );
+}
+
+function decodeUtf16TrimNul(extendedRecords, key) {
+  const raw = extendedRecords.get(key);
+  if (raw === undefined || raw.length < 2) return "";
+  return KaitaiStream.bytesToStr(raw.subarray(0, raw.length - 2), "UTF-16LE");
+}
+
+function buildController(db) {
+  const rootResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE parent_id=0 AND record_type=256",
+  );
+  if (rootResults.length !== 1) throw new Error("Does not contain exactly one root controller node");
+
+  const rootRecord = rootResults[0][4];
+  const r = new RxGeneric(new KaitaiStream(rootRecord));
+
+  const controllerDescription = lookupObjectDescription(db, r, rootRecord);
+
+  const extendedRecords = new Map();
+  for (const er of r.extendedRecords) extendedRecords.set(er.attributeId, er.value);
+
+  const sfcExecutionControl = decodeUtf16TrimNul(extendedRecords, 0x6f);
+  const sfcRestartPosition = decodeUtf16TrimNul(extendedRecords, 0x70);
+  const sfcLastScan = decodeUtf16TrimNul(extendedRecords, 0x71);
+
+  let commPathPrefix = null;
+  if (extendedRecords.has(0x06a)) {
+    const cpStr = KaitaiStream.bytesToStr(extendedRecords.get(0x06a), "UTF-16LE").replace(/\0+$/, "");
+    if (cpStr) commPathPrefix = cpStr;
+  } else {
+    let recOffset = 82;
+    for (const er of r.extendedRecords) recOffset += 4 + 4 + er.value.length;
+    const tail = rootRecord.subarray(recOffset);
+    if (tail.length >= 8) {
+      const dTail = dv(tail);
+      const lastAttrId = dTail.getUint32(0, true);
+      const lastLenValue = dTail.getUint32(4, true);
+      if (lastAttrId === 0x06a && lastLenValue >= 4) {
+        const actualLen = lastLenValue - 4;
+        if (tail.length >= 8 + actualLen && actualLen > 0) {
+          const cpVal = tail.subarray(8, 8 + actualLen);
+          const cpStr = KaitaiStream.bytesToStr(cpVal, "UTF-16LE").replace(/\0+$/, "");
+          if (cpStr) commPathPrefix = cpStr;
+        }
+      }
+    }
+  }
+
+  let projectSn;
+  if (extendedRecords.has(0x75)) {
+    const snRaw = dv(extendedRecords.get(0x75))
+      .getUint32(0, true)
+      .toString(16)
+      .padStart(8, "0");
+    projectSn = `16#${snRaw.slice(0, 4)}_${snRaw.slice(4)}`;
+  } else {
+    projectSn = "Unknown";
+  }
+
+  const rawModifiedDate = Number(dv(extendedRecords.get(0x66)).getBigUint64(0, true)) / 10000000;
+  const lastModifiedDate = filetimeSecondsToWeekdayString(rawModifiedDate);
+
+  const rawCreatedDate = Number(dv(extendedRecords.get(0x65)).getBigUint64(0, true)) / 10000000;
+  const projectCreationDate = filetimeSecondsToWeekdayString(rawCreatedDate);
+
+  let majorFaultProgram = null;
+  if (extendedRecords.has(0x068) && extendedRecords.get(0x068).length >= 4) {
+    const mfpOid = dv(extendedRecords.get(0x068)).getUint32(0, true);
+    if (mfpOid && mfpOid !== 0xffffffff) {
+      const mfpRow = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [mfpOid]);
+      majorFaultProgram = mfpRow ? mfpRow[0] : null;
+    }
+  }
+
+  const ctrlExt001 = extendedRecords.get(0x001) || new Uint8Array(0);
+  const redundancyEnabled = ctrlExt001.length > 0x0e ? Boolean(ctrlExt001[0x0e]) : false;
+
+  const controllerObjectId = rootResults[0][1];
+  const controllerName = rootResults[0][0];
+
+  const dtCollResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND comp_name='RxDataTypeCollection'",
+    [controllerObjectId],
+  );
+  if (dtCollResults.length > 1) throw new Error("Contains more than one controller data type collection");
+  const dataTypeCollId = dtCollResults[0][1];
+  const dtChildResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=?",
+    [dataTypeCollId],
+  );
+
+  const dataTypes = [];
+  const allDataTypesMap = new Map();
+  for (const result of dtChildResults) {
+    const dt = buildDataType(db, result[1]);
+    allDataTypesMap.set(dt.name.toUpperCase(), dt);
+    if (dt.cls === "User") dataTypes.push(dt);
+  }
+
+  applyDeadMemberByteCorrections(allDataTypesMap);
+  const dataTypesMap = allDataTypesMap;
+
+  const tagCollResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND comp_name='RxTagCollection'",
+    [controllerObjectId],
+  );
+  if (tagCollResults.length > 1) throw new Error("Contains more than one controller tag collection");
+  const tagCollectionObjectId = tagCollResults[0][1];
+  const tagChildResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND record_type != 264",
+    [tagCollectionObjectId],
+  );
+
+  const hexOidMap = buildHexOidMap(db);
+
+  const tags = [];
+  for (const result of tagChildResults) {
+    const tagObjectId = result[1];
+    const tag = buildTag(db, tagObjectId, hexOidMap);
+    tag._dataTypesMap = dataTypesMap;
+    if ((tag._initialValue === null || tag._initialValue === undefined) && tag._dataTableInstance) {
+      const n = countArrayElements(tag.dimensions);
+      const getCompsRecord = (oid) => {
+        const row = queryOne(db, "SELECT record FROM comps WHERE object_id=?", [oid]);
+        return row ? row[0] : undefined;
+      };
+      const udtVal = decodeUdtInitialValue(getCompsRecord, tag._dataTableInstance, tag.dataType, n, dataTypesMap, tag.dimensions !== null);
+      if (udtVal !== null && udtVal !== undefined) tag._initialValue = udtVal;
+    }
+    if (
+      tag.dataType &&
+      !tag.name.startsWith("$") &&
+      !tag.name.startsWith("__l0") &&
+      !tag.name.startsWith("__CLONE")
+    ) {
+      tags.push(tag);
+    }
+  }
+
+  // Resolve comment paths to full Studio 5000 addresses for I/O tags.
+  for (const tag of tags) {
+    if (!tag.name.includes(":")) continue;
+    if (!tag._comments.length) continue;
+    const dt = dataTypesMap.get(tag.dataType.toUpperCase());
+    let dataMember = null;
+    if (dt) {
+      for (const m of dt.members) {
+        if ((m.bitNumber === null || m.bitNumber === undefined) && !["FAULT", "STATUS"].includes(m.name.toUpperCase())) {
+          dataMember = m;
+          break;
+        }
+      }
+      if (dataMember === null) {
+        for (const m of dt.members) {
+          if (m.bitNumber === null || m.bitNumber === undefined) {
+            dataMember = m;
+            break;
+          }
+        }
+      }
+    }
+
+    const resolved = [];
+    for (const [path, text] of tag._comments) {
+      if (!path) {
+        resolved.push([path, text]);
+      } else if (path.startsWith(".!")) {
+        let arrayMember = null;
+        if (dt) {
+          for (const m of dt.members) {
+            if ((m.bitNumber === null || m.bitNumber === undefined) && m.dimension > 0) {
+              arrayMember = m;
+              break;
+            }
+          }
+        }
+        const dm = arrayMember || dataMember;
+        if (!dm) {
+          resolved.push([path, text]);
+          continue;
+        }
+        const inner = path.slice(2);
+        if (inner.includes("[") && inner.includes(".") && inner.indexOf("[") < inner.lastIndexOf(".")) {
+          const bracketIdx = inner.indexOf("[");
+          const bracketPart = inner.slice(bracketIdx + 1);
+          const dotIdx = bracketPart.lastIndexOf(".");
+          let arrayIdx = bracketPart.slice(0, dotIdx);
+          const bitPart = bracketPart.slice(dotIdx + 1);
+          arrayIdx = arrayIdx.replace(/\]+$/, "");
+          resolved.push([`${tag.name}.${dm.name}[${arrayIdx}].${bitPart}`, text]);
+        } else if (inner.includes("[")) {
+          const bracketIdx = inner.indexOf("[");
+          let suffix = inner.slice(bracketIdx + 1);
+          suffix = suffix.replace(/\]+$/, "");
+          resolved.push([`${tag.name}.${dm.name}[${suffix}]`, text]);
+        } else {
+          resolved.push([path, text]);
+        }
+      } else if (path.startsWith("!")) {
+        if (!dataMember) {
+          resolved.push([path, text]);
+          continue;
+        }
+        const rest = path.slice(1);
+        if (rest.includes(".")) {
+          const dotIdx = rest.indexOf(".");
+          const suffix = rest.slice(dotIdx + 1);
+          if (dataMember.dimension > 0) {
+            resolved.push([`${tag.name}.${dataMember.name}[${suffix}]`, text]);
+          } else {
+            resolved.push([`${tag.name}.${dataMember.name}.${suffix}`, text]);
+          }
+        } else if (rest.includes("[")) {
+          const bracketIdx = rest.indexOf("[");
+          let suffix = rest.slice(bracketIdx + 1);
+          suffix = suffix.replace(/\]+$/, "");
+          resolved.push([`${tag.name}.${dataMember.name}[${suffix}]`, text]);
+        } else {
+          resolved.push([path, text]);
+        }
+      } else if (path.endsWith("]")) {
+        resolved.push([`${tag.name}[${path}`, text]);
+      } else if (/^\d+$/.test(path)) {
+        resolved.push([`${tag.name}.${path}`, text]);
+      } else {
+        resolved.push([path, text]);
+      }
+    }
+    tag._comments = resolved;
+  }
+
+  const progCollResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND comp_name='RxProgramCollection'",
+    [controllerObjectId],
+  );
+  if (progCollResults.length > 1) throw new Error("Contains more than one controller program collection");
+  const programCollectionObjectId = progCollResults[0][1];
+  const progChildResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND record_type=256",
+    [programCollectionObjectId],
+  );
+  const programs = [];
+  for (const result of progChildResults) {
+    programs.push(buildProgram(db, result[1], dataTypesMap, redundancyEnabled, hexOidMap));
+  }
+
+  const commentIdToProgram = new Map();
+  for (const [pname, rec] of queryAll(db, "SELECT comp_name, record FROM comps WHERE parent_id=?", [programCollectionObjectId])) {
+    commentIdToProgram.set(dv(rec).getUint16(0x0c, true), pname);
+  }
+
+  const taskCollRow = queryOne(db, "SELECT comp_name, object_id FROM comps WHERE parent_id=? AND comp_name='RxTaskCollection'", [
+    controllerObjectId,
+  ]);
+  const tasks = [];
+  if (taskCollRow) {
+    const taskCollectionObjectId = taskCollRow[1];
+    const taskResults = queryAll(db, "SELECT comp_name, object_id FROM comps WHERE parent_id=? AND record_type=256", [
+      taskCollectionObjectId,
+    ]);
+    for (const taskResult of taskResults) {
+      try {
+        tasks.push(buildTask(db, taskResult[1], commentIdToProgram));
+      } catch (e) {
+        console.warn(`Skipping undecodable task ${JSON.stringify(taskResult[0])}: ${e}`);
+      }
+    }
+  }
+
+  const aoiCollResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND comp_name='RxUDIDefinitionCollection'",
+    [controllerObjectId],
+  );
+  if (aoiCollResults.length > 1) throw new Error("Contains more than one AOI collection");
+  const aois = [];
+  if (aoiCollResults.length) {
+    const aoiCollectionObjectId = aoiCollResults[0][1];
+    const aoiChildResults = queryAll(
+      db,
+      "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND record_type=256",
+      [aoiCollectionObjectId],
+    );
+    for (const result of aoiChildResults) {
+      aois.push(buildAoi(db, result[1]));
+    }
+  }
+
+  const aoiParamNames = new Map();
+  for (const aoi of aois) {
+    aoiParamNames.set(aoi.name.toUpperCase(), new Set(aoi.parameters.map((p) => p.name)));
+  }
+  if (aoiParamNames.size) {
+    const stripAoiBindingComments = (tagList) => {
+      for (const t of tagList) {
+        if (!t.dataType || !t._comments.length) continue;
+        const dt = allDataTypesMap.get(t.dataType.toUpperCase());
+        if (!dt) continue;
+        const memberTypes = new Map(dt.members.map((m) => [m.name, m.dataType]));
+        const kept = [];
+        for (const [ref, text] of t._comments) {
+          if (ref.startsWith(t.name)) {
+            const suffix = ref.slice(t.name.length);
+            if (suffix.startsWith(".") && !suffix.slice(1).includes(".") && !suffix.includes("[")) {
+              const mname = suffix.slice(1);
+              const mtype = memberTypes.get(mname);
+              if (mtype) {
+                const paramNames = aoiParamNames.get(mtype.toUpperCase());
+                if (paramNames && paramNames.has(text)) continue;
+              }
+            }
+          }
+          kept.push([ref, text]);
+        }
+        t._comments = kept;
+      }
+    };
+    stripAoiBindingComments(tags);
+    for (const p of programs) stripAoiBindingComments(p.tags);
+  }
+
+  const devCollRow = queryOne(db, "SELECT object_id FROM comps WHERE parent_id=? AND comp_name='RxMapDeviceCollection'", [
+    controllerObjectId,
+  ]);
+  let modules = [];
+  if (devCollRow) {
+    const collOid = devCollRow[0];
+    const modRows = queryAll(
+      db,
+      "SELECT comp_name, object_id, record FROM comps WHERE parent_id=? AND record_type=256 ORDER BY seq_number",
+      [collOid],
+    );
+
+    const modidToName = new Map();
+    for (const [dbName, modOid, modRec] of modRows) {
+      const displayName = dbName.startsWith("$") && dbName.endsWith("$") ? "?" : dbName;
+      try {
+        const rMod = new RxGeneric(new KaitaiStream(modRec));
+        if (rMod.cipType === 0x69) {
+          const exts = new Map();
+          for (const er of rMod.extendedRecords) exts.set(er.attributeId, er.value);
+          const e1 = exts.get(0x001) || new Uint8Array(0);
+          if (e1.length >= 0x30) {
+            const modid = dv(e1).getUint32(0x2c, true);
+            modidToName.set(modid, displayName);
+          }
+        }
+      } catch (e) {
+        // matches Python's bare except: pass
+      }
+    }
+
+    modules = modRows.map(([, modOid]) => buildModule(db, modOid, modidToName));
+
+    const childCounts = new Map();
+    for (const m of modules) {
+      const key = `${m.parentModule},${m.parentModPortId}`;
+      childCounts.set(key, (childCounts.get(key) || 0) + 1);
+    }
+    for (const m of modules) {
+      const portChildCounts = new Map();
+      for (let portId = 1; portId < 20; portId++) {
+        const key = `${m.name},${portId}`;
+        if (childCounts.has(key)) portChildCounts.set(portId, childCounts.get(key));
+      }
+      m._portChildCounts = portChildCounts;
+    }
+  }
+
+  const processorType = modules.find((m) => m.majorFault === "true" && m.catalogNumber)?.catalogNumber || null;
+
+  const localModule = modules.find((m) => m.name === "Local") || modules.find((m) => m.majorFault === "true") || null;
+  let majorRev;
+  let minorRev;
+  if (localModule !== null) {
+    majorRev = String(localModule.major);
+    minorRev = String(localModule.minor);
+  } else {
+    majorRev = "0";
+    minorRev = "0";
+  }
+
+  let commPath = null;
+  if (commPathPrefix !== null) {
+    const ctrlModule = modules.find((m) => m.majorFault === "true");
+    if (ctrlModule !== undefined) {
+      commPath = commPathPrefix + String(ctrlModule._slot);
+    }
+  }
+
+  return new Controller(
+    {
+      use: "Target",
+      name: controllerName,
+      processorType,
+      majorRev,
+      minorRev,
+      majorFaultProgram,
+      projectCreationDate,
+      lastModifiedDate,
+      sfcExecutionControl,
+      sfcRestartPosition,
+      sfcLastScan,
+      commPath,
+      projectSn,
+      matchProjectToController: "false",
+      canUseRpiFromProducer: "false",
+      inhibitAutomaticFirmwareUpdate: "0",
+      passThroughConfiguration: "EnabledWithAppend",
+      downloadProjectDocumentationAndExtendedProperties: "true",
+      downloadProjectCustomProperties: "true",
+      reportMinorOverflow: "false",
+      autoDiagsEnabled: "false",
+      webServerEnabled: "false",
+      dataTypes,
+      modules,
+      tags,
+      programs,
+      tasks,
+      aois,
+    },
+    { redundancyEnabled, description: controllerDescription },
+  );
+}
+
 module.exports = {
   radixEnum,
   externalAccessEnum,
@@ -1387,4 +1837,5 @@ module.exports = {
   buildAoi,
   buildProgram,
   buildTask,
+  buildController,
 };
