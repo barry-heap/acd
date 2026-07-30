@@ -22,7 +22,11 @@ var FafaComps = (function() {
     this._raw_header = this._io.readBytes(144);
     var _io__raw_header = new KaitaiStream(this._raw_header);
     this.header = new Header(_io__raw_header, this, this._root);
-    this.recordBuffer = this._io.readBytes((this.recordLength - 144) - 4);
+    // NOTE: fixed vs. the raw kaitai-struct-compiler output, which read
+    // (recordLength - 144) - 4. Verified against the real, validated Python
+    // parser (acd/generated/comps/fafa_comps.py): record_buffer is
+    // recordLength - 144, with no extra -4. See js/README.md.
+    this.recordBuffer = this._io.readBytes(this.recordLength - 144);
   }
 
   var Header = FafaComps.Header = (function() {
