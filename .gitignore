@@ -20,3 +20,4 @@ out.L5X/
 resources/*/
 /js/node_modules/
 /js/extracted/
+/js/resources/
