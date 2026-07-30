@@ -94,13 +94,56 @@ tags in one earlier sample).
     `pako` for gzip instead of Node's `zlib` (`writeFiles(dir)` stays as a thin Node-only
     wrapper around `extractAll()` for `extract.js`'s dev/fixture use). Re-verified byte-identical
     extraction after this change.
-- **Object graph / builders / XML emission (`elements.py`, ~5000 lines)**: not started. This is
+- **Object graph / builders / XML emission (`elements.py`, ~5000 lines)**: IN PROGRESS. This is
   the bulk of the remaining work — see `../CLAUDE.md` for how deep and hard-won this logic is
   (comment resolution, BIT-overlay members, dead-member-byte corrections, tag-value-blob-offset
-  resolution, NaN/Infinity rendering, STRING latin-1 decoding, ...). Expect this to be ported
-  incrementally, prioritizing a working end-to-end pipeline for the common cases (scalar/array/UDT
-  tags, RLL rungs, basic Module/AOI references) before the long tail of edge cases documented
-  there.
+  resolution, NaN/Infinity rendering, STRING latin-1 decoding, ...). Being ported incrementally,
+  prioritizing a working end-to-end pipeline for the common cases (scalar/array/UDT tags, RLL
+  rungs, basic Module/AOI references) before the long tail of edge cases.
+  - **Done so far**: `l5x/render.js` (the module-level rendering/value-decode helpers, Python
+    lines ~1-1585: `L5xElement` base class + generic reflection-based `toXml()`, `Member`,
+    `DataType`, all the L5K/Decorated value-formatting helpers, and the tag-value decode chain
+    `tagValueBlobOffset`/`readTagInitialValue`/`decodeUdtInitialValue`/`decodeSingleUdtElement`/
+    `decodeScalarMember`) and `l5x/tag.js` (the `Tag` class + its `toXml()`, Python lines
+    ~1587-1891). **api.py's write-back-only helpers (`export_routine`, `export_datatype`,
+    `patch_rungs`, the diff/CSV functions) are explicitly OUT OF SCOPE** for this read-only
+    converter — confirmed by reading `ConvertAcdToL5x` in `api.py`: it only needs
+    `ControllerBuilder.build()` + `ProjectBuilder.build()` + `RSLogix5000Content.to_xml()`, none
+    of those write-back helpers. This narrows the real remaining surface considerably.
+  - **Verified** against Python with targeted synthetic + real-data tests (not yet a full
+    whole-project diff, which needs the builders too): every numeric/string rendering helper
+    (`l5kRealLiteral`, `decoratedRealLiteral`, `shortestFloat32Repr`, `l5kStringPadded`,
+    `decoratedBinaryLiteral`, `escapeXmlAttr`, `multilineXmlText`), the UDT rendering functions
+    (`udtScalarToXml`, `l5kUdtLiteral`, `structMembersXml`, `generateDecorated`, `udtArrayToXml`)
+    against a synthetic UDT (DINT/REAL/BOOL[4]/nested-TIMER members), `tagValueBlobOffset` against
+    75 real tag records from `CuteLogix.ACD` (parsing their real `RxGeneric` comps records), and
+    `Tag.toXml()` end-to-end against 9 synthetic cases (scalar/array primitives, scalar/array UDT,
+    Alias, no-value, scalar STRING, with comments) — all exact matches after fixing two real bugs
+    found by these tests (see below).
+  - **Two real bugs found and fixed by this testing, both worth remembering for any future
+    render-layer work**:
+    1. `l5kStringPadded`'s `'` → `$'` escape used JS's *string* form of `.replace()`, where `$'`
+       is a special replacement pattern meaning "everything after the match" — not a literal
+       `$'`. Silently corrupted any text containing an apostrophe (`"it's"` → `"itss"`). Fixed by
+       using replacer *functions* (`.replace(re, () => "$'")`) instead of replacement strings,
+       which are never special-cased. General lesson: never pass a literal string containing `$`
+       as a JS `.replace()` replacement — always use a function.
+    2. Every place that needs to distinguish "format this as a REAL/LREAL" from "format this as
+       an integer" was checking `Number.isInteger(val)` — which is wrong, because JS numbers
+       have no int/float distinction at runtime (`1.0 === 1`), unlike Python where
+       `struct.unpack("<f"/"<d", ...)` always yields a `float`-typed value even for an
+       exact-whole-number result. This silently misrendered any REAL member/tag whose value
+       happened to be a whole number (e.g. `1.0` → bare `"1"` instead of `"1.0"`) — caught by the
+       synthetic UDT test's `B: 1.0` (REAL) field. Fixed by adding `isFloatType(dtUpper)` (checks
+       the *declared* data type name, exported from `render.js`) and using it everywhere instead
+       of `Number.isInteger()` (`udtScalarToXml`'s two sites, `Tag.toXml()`'s two sites). Any
+       future rendering code must key float-vs-integer formatting off the known data type name,
+       never off a runtime check of the JS number's value.
+  - **Not yet ported**: `LocalTag`, `Parameter`, `Module`, `Routine`, `AOI`, `Program`,
+    `ScheduledProgram`, `EventInfo`, `Task`, `Controller`, `RSLogix5000Content` classes (Python
+    lines ~1894-2430), `radix_enum`/`external_access_enum`/`_resolve_bit_target` (~2431-2507),
+    and every `*Builder` class (`MemberBuilder` through `ControllerBuilder`/`ProjectBuilder`,
+    ~2507-4980 — the majority of the remaining line count). This is next.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 
