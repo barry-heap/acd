@@ -175,11 +175,25 @@ tags in one earlier sample).
     full `toXml()` output match Python's `ModuleBuilder.build()` exactly. Caveat carried over from
     the Python `CLAUDE.md`: this doesn't exercise bridged/remote racks or every
     `_CONNECTION_TYPE_BY_CODE` value, since no available fixture has one.
-  - **Not yet ported**: `_build_hex_oid_map`/`_resolve_tag_name_from_oid`, `TagBuilder`
-    (~260 lines), `ParameterBuilder`/`LocalTagBuilder`, `RoutineBuilder` + ST-routine helpers,
-    `AoiBuilder`, `ProgramBuilder`/`TaskBuilder`, `ControllerBuilder` (~530 lines, the
+  - `buildHexOidMap`/`resolveTagNameFromOid`/`buildTag` (ports of `_build_hex_oid_map`/
+    `_resolve_tag_name_from_oid`/`TagBuilder`, the single largest individual builder at ~260
+    lines) are now in `builders.js` too — covers scalar/array/UDT tag decoding, Alias tag target
+    resolution (including the `@HEXOID@` path-walking logic), hex-OID comment resolution, and the
+    full comment-path normalization rules.
+  - **A real bug found and fixed by testing** (not present in any isolated unit test, only showed
+    up against real tag data): the two early-return `new Tag(...)` calls for unparseable/
+    non-tag records had `tagType` accidentally set to the tag's own name instead of the literal
+    `"Base"` (an argument-position slip, not a logic error) — caught immediately by comparing
+    against Python's `TagBuilder.build()` on real data, not by isolated construction.
+  - **Verified against all 148 real tags in `CuteLogix.ACD`** (every `cip_type` 0x68/0x6B comps
+    record) — every field (name, tag_type, data_type, radix, external_access, constant,
+    dimensions, target, data_table_instance, normalized comments, decoded initial_value) matches
+    Python's `TagBuilder.build()` **exactly, zero mismatches**.
+  - **Not yet ported**: `ParameterBuilder`/`LocalTagBuilder`, `RoutineBuilder` + ST-routine
+    helpers, `AoiBuilder`, `ProgramBuilder`/`TaskBuilder`, `ControllerBuilder` (~530 lines, the
     orchestrator — including the modid→name map and port-child-count passes that feed
-    `buildModule`), `ProjectBuilder`.
+    `buildModule`, and the second pass that decodes UDT-typed tags' initial values once
+    `data_types_map` is available), `ProjectBuilder`.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 
