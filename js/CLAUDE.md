@@ -70,8 +70,30 @@ tags in one earlier sample).
   - Not yet ported: `_normalize_comment`'s bracket-repair regex and the `seen[key]` dedup-by-
     `(parent, tag_reference, scope_id, rung_content)` step from `export_l5x.py` — these belong to
     the next layer (SQL ingestion), not the record parser itself, and aren't done yet either.
-- **SQL ingestion layer (`export_l5x.py`'s SQLite schema/population, `sql.js`-backed)**: not
-  started.
+- **SQL ingestion layer (`ingest.js`, `sql.js`-backed port of `export_l5x.py`'s
+  `ExportL5x.__post_init__`)**: done, verified. All 8 tables (`comps`, `pointers`, `rungs`,
+  `region_map`, `comments`, `nameless`, `regnlink`, `regnlink_idx`) match Python's own
+  `ExportL5x` table contents on the full fixture, **zero mismatches**, including the `comments`
+  table's dedup step (335 raw comment records → 31 after the `(parent, tag_reference, scope_id,
+  rung_content)` dedup-keep-longest rule — same 31 on both sides) and `populate_region_map`/
+  `populate_regnlink`'s hand-rolled byte parsing (133 region_map rows, 192 regnlink rows, 146
+  regnlink_idx rows, all matching). `pointers` is intentionally always empty — confirmed via
+  `grep` that Python's own pipeline creates but never populates or queries it either (dead
+  table in the reference implementation, not a JS omission).
+  - `ingestAcd(acdBytes)` is the entry point: takes the whole `.ACD` file as a `Uint8Array`/
+    `Buffer`, returns `{ db, rawFiles, fileOrder, idToName }` (a `sql.js` `Database`, plus the
+    extracted-files map / original file order / object_id→name lookup, carried through for a
+    potential future write-back feature the way Python's `ExportL5x` does — not otherwise used
+    by this converter, which is read-only).
+  - `verify_ingest.js` is the reusable dev harness for this layer (dumps every table to
+    `/tmp/js_ingest_full.json`); the matching Python-side snippet (not checked in, since it
+    needs the `venv` from the repo root) constructs `ExportL5x(acd_path, _temp_dir=tmp)` and
+    dumps the same 7 tables/columns, sorted the same way, to compare.
+  - `unzip.js` was refactored to be isomorphic during this layer's work: it now takes raw bytes
+    directly (not a file path) and exposes `extractAll() -> Map<filename, Uint8Array>` using
+    `pako` for gzip instead of Node's `zlib` (`writeFiles(dir)` stays as a thin Node-only
+    wrapper around `extractAll()` for `extract.js`'s dev/fixture use). Re-verified byte-identical
+    extraction after this change.
 - **Object graph / builders / XML emission (`elements.py`, ~5000 lines)**: not started. This is
   the bulk of the remaining work — see `../CLAUDE.md` for how deep and hard-won this logic is
   (comment resolution, BIT-overlay members, dead-member-byte corrections, tag-value-blob-offset
@@ -84,11 +106,20 @@ tags in one earlier sample).
 
 ## Dependencies
 
-Only `kaitai-struct` (npm) so far, used purely as a byte-reading runtime (`KaitaiStream`) for the
-`generated/*.js` modules — no Java/build-step dependency ships to the browser, `kaitai-struct-
-compiler` was only ever a build-time tool used once, externally, to produce the checked-in
-`generated/*.js` files (see the ground-rule section above for why those need spot-checking, not
-blind trust). Everything in `record/*.js` is hand-written using plain `DataView`, no generated-
-code dependency. Future layers will need `sql.js` (SQLite-to-WASM, for the ingestion layer) and
-`pako` (pure-JS gzip, for the browser build — `unzip.js` currently uses Node's `zlib`, which
-doesn't exist in a browser; swap this when building the actual browser bundle, not before).
+- `kaitai-struct` (npm) — used purely as a byte-reading runtime (`KaitaiStream`) for the
+  `generated/*.js` modules. No Java/build-step dependency ships to the browser;
+  `kaitai-struct-compiler` was only ever a build-time tool used once, externally, to produce the
+  checked-in `generated/*.js` files (see the ground-rule section above for why those need
+  spot-checking, not blind trust). Everything in `record/*.js` and `ingest.js` is hand-written
+  using plain `DataView`, no generated-code dependency.
+- `pako` — pure-JS gzip, used by `unzip.js` for decompressing gzip'd container members. Works
+  in both Node and the browser (unlike Node's `zlib`, which `unzip.js` used before being made
+  isomorphic).
+- `sql.js` — SQLite compiled to WASM, used by `ingest.js` for the relational ingestion layer
+  (same schema/queries as Python's `sqlite3`-backed `ExportL5x`). Works in both Node (used for
+  all verification so far) and the browser; the browser build will need to fetch the `.wasm`
+  asset (`sql-wasm.wasm`) — inline it as a base64 data URI or ship it alongside the single HTML
+  file when building the actual UI, to keep the "single file, no build step" property. Not
+  addressed yet — deferred to the wrapper-UI task.
+
+All three are pure-JS/WASM with no native bindings, no Java, and no server dependency.

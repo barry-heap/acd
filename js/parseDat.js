@@ -6,10 +6,16 @@ const fs = require("fs");
 const { KaitaiStream } = require("kaitai-struct");
 const { Dat } = require("./generated/Dat");
 
-function parseDatFile(path) {
-  const buf = fs.readFileSync(path);
-  const dat = new Dat(new KaitaiStream(buf));
+// bytes: Uint8Array of a whole .Dat file's contents (already extracted/
+// decompressed). This is the browser-compatible entry point.
+function parseDatBytes(bytes) {
+  const dat = new Dat(new KaitaiStream(bytes));
   return dat.records.record;
 }
 
-module.exports = { parseDatFile };
+// Node-only convenience for dev/testing against files already on disk.
+function parseDatFile(path) {
+  return parseDatBytes(fs.readFileSync(path));
+}
+
+module.exports = { parseDatBytes, parseDatFile };
