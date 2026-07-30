@@ -189,10 +189,21 @@ tags in one earlier sample).
     record) — every field (name, tag_type, data_type, radix, external_access, constant,
     dimensions, target, data_table_instance, normalized comments, decoded initial_value) matches
     Python's `TagBuilder.build()` **exactly, zero mismatches**.
-  - **Not yet ported**: `ParameterBuilder`/`LocalTagBuilder`, `RoutineBuilder` + ST-routine
-    helpers, `AoiBuilder`, `ProgramBuilder`/`TaskBuilder`, `ControllerBuilder` (~530 lines, the
-    orchestrator — including the modid→name map and port-child-count passes that feed
-    `buildModule`, and the second pass that decodes UDT-typed tags' initial values once
+  - `buildParameter`/`buildLocalTag` (AOI parameter/local-tag builders) and `buildRoutine` (+
+    `routineTypeEnum`, `parseFffeff`, `stRoutineLines`, `lookupObjectDescription`) are also in
+    `builders.js` now. `buildRoutine` covers RLL rung text (including `&hexid:` module-reference
+    resolution), rung-comment attribution via the `regnlink_idx`/`regnlink` tables (the
+    hard-won mechanism documented at length in `../CLAUDE.md`'s "Rung comments" section), routine
+    descriptions, and ST routine bodies (`stRoutineLines`, walking the `nameless` parent tree).
+  - **Verified against all 29 real routines across every `RxRoutineCollection` in
+    `CuteLogix.ACD`** (both AOI logic routines and regular program routines) — name, type, rung
+    text, rung ids, rung comments, description, ST lines, and full `toXml()` output all match
+    Python's `RoutineBuilder.build()` **exactly, zero mismatches**. (No ST routines exist in this
+    fixture, so `stRoutineLines` ran but wasn't exercised with real ST content — flagging this the
+    same way the Python `CLAUDE.md` flags fixture-coverage gaps elsewhere.)
+  - **Not yet ported**: `AoiBuilder`, `ProgramBuilder`/`TaskBuilder`, `ControllerBuilder`
+    (~530 lines, the orchestrator — including the modid→name map and port-child-count passes that
+    feed `buildModule`, and the second pass that decodes UDT-typed tags' initial values once
     `data_types_map` is available), `ProjectBuilder`.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
