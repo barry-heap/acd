@@ -288,6 +288,28 @@ tags in one earlier sample).
   5/6/7/23/48, no bridged/remote rack, only one real AOI available. Treat "verified" as "verified
   for what these four fixtures exercise," the same caveat the Python `CLAUDE.md` applies to its own
   verification claims.
+
+## Pipeline entry point (`convert.js`) — full ACD → L5X now works end to end
+
+`convertAcdToL5x(acdBytes)` (port of `api.py`'s `ConvertAcdToL5x`) wires `ingestAcd` →
+`buildController` → `buildProjectContent` → `.toXml()` together and returns the complete L5X XML
+text with its declaration prepended — the same shape Python's `ConvertAcdToL5x(...).extract()`
+writes to a file, just returned as a string instead (no filesystem dependency, so this works
+unchanged in a browser). Pretty-printing (Python's optional `xml.dom.minidom`-based indentation)
+is intentionally **not** ported — it's cosmetic only (Studio 5000 imports either form identically,
+already relied on elsewhere in this repo's own verification), and skipping it avoids pulling in an
+XML-parsing dependency for a purely cosmetic feature.
+
+**Verified end-to-end against all 4 local fixtures with real controller content**: the full
+`convertAcdToL5x()` output matches Python's `ConvertAcdToL5x(...).extract()` output **exactly**,
+modulo the `ExportDate` attribute (both sides stamp "now" at build time — inherently
+non-reproducible between two separate runs, not a bug; `formatNowWeekdayString()` matches Python's
+`datetime.now().strftime("%a %b %d %H:%M:%S %Y")` format convention, using local time like
+Python's naive `datetime.now()`, not UTC, unlike the FILETIME-derived dates elsewhere which
+correctly use UTC). `CuteLogix.ACD`'s full L5X is 147,362 characters on both sides.
+
+This closes out the whole read pipeline (container → records → SQL → object graph → XML). What's
+left: the browser UI (file input → this function → `Blob` download).
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 
