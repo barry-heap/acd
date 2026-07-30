@@ -1,12 +1,12 @@
 {
   "name": "acd-l5x-js-poc",
   "version": "0.1.0",
-  "description": "Proof-of-concept JS/Node port of the acd-tools ACD binary parser (Kaitai-struct generated), for evaluating a browser/Node-based ACD reader alongside the mature Python implementation in ../acd.",
+  "description": "JS/Node port of the acd-tools ACD binary parser and L5X exporter, building toward a standalone offline browser-based ACD-to-L5X converter (see README.md for scope/status). Ported field-for-field from the mature Python implementation in ../acd.",
   "private": true,
   "main": "test_parse.js",
   "scripts": {
     "extract": "node extract.js",
-    "test": "node extract.js && node test_parse.js"
+    "test": "node extract.js && node test_parse.js && node verify_records.js"
   },
   "keywords": [],
   "author": "",
