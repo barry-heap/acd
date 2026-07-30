@@ -151,9 +151,14 @@ function populateRegnlink(db, files, knownObjectIds) {
 // _raw_files/_file_order (kept for a future write-back/round-trip feature,
 // out of scope for this converter but cheap to carry through).
 async function ingestAcd(acdBytes) {
-  const SQL = await initSqlJs({
-    locateFile: (file) => require.resolve(`sql.js/dist/${file}`),
-  });
+  // In Node, point sql.js at its own package files on disk. In the browser
+  // build (see build.js/ui.js), initSqlJs is the plain-JS asm.js variant
+  // embedded directly in the page -- it has no separate .wasm to fetch, so
+  // locateFile is never actually invoked there; passing a Node-only
+  // require.resolve unconditionally would throw in that environment before
+  // it even got called, since `require` itself isn't a browser global.
+  const isNode = typeof process !== "undefined" && !!process.versions && !!process.versions.node;
+  const SQL = await initSqlJs(isNode ? { locateFile: (file) => require.resolve(`sql.js/dist/${file}`) } : {});
   const db = new SQL.Database();
   for (const stmt of SCHEMA) db.run(stmt);
 

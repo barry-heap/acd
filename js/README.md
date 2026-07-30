@@ -40,9 +40,26 @@ ported — round-tripping needs a Studio-version HMAC key this project doesn't h
   (modulo the inherently-timestamped `ExportDate` attribute) for every local fixture with real
   controller content.
 
-Not yet present: the browser UI (file input → `convertAcdToL5x()` → `Blob` download). This is the
-last remaining piece — everything ACD → L5X conversion needs now works, just without a UI wrapper.
-See `CLAUDE.md` for current status.
+- `ui.js` — browser UI glue: file input / drag-drop → `convertAcdToL5x()` → `Blob` download.
+- `build.js` — dev-only assembler: bundles every module above (plus the `kaitai-struct`/`pako`/
+  `sql.js`-asm runtimes) into one self-contained, offline HTML file using a small hand-rolled
+  CommonJS-in-the-browser shim — no bundler dependency, no build step for the **end user** (they
+  just open the file). Run `node build.js` after any source change to regenerate
+  **`dist/acd-to-l5x.html`, the actual shipped deliverable** (tracked in git despite the general
+  `dist/` ignore rule — see the repo root `.gitignore`).
+- `test_browser.js` — dev-only Playwright smoke test: loads the built HTML in real headless
+  Chromium, feeds it a fixture ACD via the file input, and captures the downloaded L5X.
+
+## Using the converter
+
+Open `dist/acd-to-l5x.html` in any modern browser (double-click it, or `file://` it — no server,
+no install). Drop a `.ACD` file on it (or click to choose one); it downloads a `.L5X` file. Never
+uploads anything anywhere — the whole conversion runs in your browser tab.
+
+**Verified working in real headless Chromium** (via `test_browser.js`) for all 4 local fixtures
+with real controller content — output matches Python's `ConvertAcdToL5x` exactly (modulo the
+inherently-timestamped `ExportDate`), the same as the Node-side verification. This is the
+complete ACD → L5X pipeline running as an actual offline web page, not just Node-side modules.
 
 ## Running it
 
