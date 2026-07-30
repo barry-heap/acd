@@ -34,8 +34,14 @@ ported — round-tripping needs a Studio-version HMAC key this project doesn't h
   fixture with real controller content — see `CLAUDE.md` for the verification detail and two
   real bugs found reaching this milestone.
 
-Not yet present: the pipeline entry point (wiring `ingestAcd` + `buildController` +
-`buildProjectContent` together, mirroring `acd/api.py`'s `ConvertAcdToL5x`) and the browser UI.
+- `convert.js` — the pipeline entry point: `convertAcdToL5x(acdBytes)` wires everything above
+  together (port of `acd/api.py`'s `ConvertAcdToL5x`) and returns the full L5X XML text.
+  **Verified end-to-end**: matches Python's `ConvertAcdToL5x(...).extract()` output exactly
+  (modulo the inherently-timestamped `ExportDate` attribute) for every local fixture with real
+  controller content.
+
+Not yet present: the browser UI (file input → `convertAcdToL5x()` → `Blob` download). This is the
+last remaining piece — everything ACD → L5X conversion needs now works, just without a UI wrapper.
 See `CLAUDE.md` for current status.
 
 ## Running it
