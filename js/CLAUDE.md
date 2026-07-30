@@ -201,10 +201,23 @@ tags in one earlier sample).
     Python's `RoutineBuilder.build()` **exactly, zero mismatches**. (No ST routines exist in this
     fixture, so `stRoutineLines` ran but wasn't exercised with real ST content — flagging this the
     same way the Python `CLAUDE.md` flags fixture-coverage gaps elsewhere.)
-  - **Not yet ported**: `AoiBuilder`, `ProgramBuilder`/`TaskBuilder`, `ControllerBuilder`
-    (~530 lines, the orchestrator — including the modid→name map and port-child-count passes that
-    feed `buildModule`, and the second pass that decodes UDT-typed tags' initial values once
-    `data_types_map` is available), `ProjectBuilder`.
+  - `buildAoi` (+ `filetimeToIso`, `parseAoiNameless`), `buildProgram`, and `buildTask` are also in
+    `builders.js` now. `buildProgram` includes the second pass that decodes a UDT-typed tag's
+    initial value once `data_types_map` is available (via `decodeUdtInitialValue`, already
+    verified separately in the render-layer work).
+  - **Verified against real data**: the single real AOI available in any fixture
+    (`ACDTestsWithAOI.ACD`, `CuteLogix.ACD` itself has none) matches Python's `AoiBuilder.build()`
+    exactly, including the full `toXml()` output; all 3 real Programs and 2 real Tasks in
+    `CuteLogix.ACD` match `ProgramBuilder.build()`/`TaskBuilder.build()` exactly (zero mismatches
+    across every field, including scheduled-program names resolved through the comment_id→program
+    map). `buildProgram`'s UDT-initial-value second pass ran but wasn't exercised with a real
+    UDT-typed program tag in this pass — worth a targeted check in a future session if one turns
+    up in a richer fixture.
+  - **Not yet ported**: `ControllerBuilder` (~530 lines, the orchestrator — builds the
+    modid→name map and port-child-count passes that feed `buildModule`, the AOI-instance-
+    parameter-binding-comment stripping pass, and wires every other builder together) and
+    `ProjectBuilder` (reads `QuickInfo.XML` for the `RSLogix5000Content` top-level attributes).
+    These are the last pieces before a genuine end-to-end JS `ConvertAcdToL5x` exists.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 

@@ -10,7 +10,8 @@ const { Member, DataType } = require("./render");
 const { Module } = require("./elements");
 const { CATALOG_NUMBERS } = require("./catalog_numbers");
 const { Tag } = require("./tag");
-const { Parameter, LocalTag, Routine } = require("./elements");
+const { Parameter, LocalTag, Routine, AOI, Program, Task, EventInfo, ScheduledProgram } = require("./elements");
+const { decodeUdtInitialValue } = require("./render");
 const { readTagInitialValue, countArrayElements, SKIP_DECORATED } = require("./render");
 
 const CONNECTION_TYPE_BY_CODE = new Map([
@@ -1050,6 +1051,319 @@ function buildRoutine(db, objectId) {
   return new Routine(name, routineType, rungs, { rungIds, rungComments, description, stLines });
 }
 
+function filetimeToIso(ft) {
+  const ftBig = typeof ft === "bigint" ? ft : BigInt(ft);
+  if (ftBig === 0n) return "";
+  const microsSince1601 = ftBig / 10n;
+  const EPOCH_DIFF_MICROS = 11644473600000000n;
+  const unixMicros = microsSince1601 - EPOCH_DIFF_MICROS;
+  const unixMillis = unixMicros / 1000n;
+  const millisNum = Number(unixMillis);
+  if (!Number.isFinite(millisNum)) return "";
+  const date = new Date(millisNum);
+  const year = date.getUTCFullYear();
+  if (Number.isNaN(date.getTime()) || year < 1 || year > 9999) return "";
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return (
+    `${p(year, 4)}-${p(date.getUTCMonth() + 1)}-${p(date.getUTCDate())}` +
+    `T${p(date.getUTCHours())}:${p(date.getUTCMinutes())}:${p(date.getUTCSeconds())}.` +
+    `${p(date.getUTCMilliseconds(), 3)}Z`
+  );
+}
+
+function parseAoiNameless(data) {
+  const result = {};
+  let offset = 0x1a;
+  for (let i = 0; i < 3; i++) {
+    [, offset] = parseFffeff(data, offset);
+  }
+  offset += 8;
+  offset += 2;
+
+  [result.createdBy, offset] = parseFffeff(data, offset);
+  [, offset] = parseFffeff(data, offset);
+  offset += 4;
+  [, offset] = parseFffeff(data, offset);
+
+  result.createdDate = filetimeToIso(dv(data).getBigUint64(offset, true));
+  offset += 8;
+
+  [result.editedBy, offset] = parseFffeff(data, offset);
+  [result.softwareRevision, offset] = parseFffeff(data, offset);
+  offset += 4;
+
+  let revExt;
+  [revExt, offset] = parseFffeff(data, offset);
+  result.revisionExtension = revExt || null;
+
+  result.editedDate = filetimeToIso(dv(data).getBigUint64(data.length - 8, true));
+
+  return result;
+}
+
+function buildAoi(db, objectId) {
+  const results = queryAll(db, "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id=?", [objectId]);
+  const aoiRecord = results[0][3];
+  const name = results[0][0];
+
+  let rAoi = null;
+  let revMajor = 1;
+  let revMinor = 0;
+  try {
+    const r = new RxGeneric(new KaitaiStream(aoiRecord));
+    rAoi = r;
+    const exts = new Map();
+    for (const e of r.extendedRecords) exts.set(e.attributeId, e.value);
+    const e01 = exts.get(0x01) || new Uint8Array(0);
+    revMajor = e01.length > 0x1b ? dv(e01).getUint16(0x1a, true) : 1;
+    revMinor = e01.length > 0x1d ? dv(e01).getUint16(0x1c, true) : 0;
+  } catch (e) {
+    revMajor = 1;
+    revMinor = 0;
+  }
+  const revision = `${revMajor}.${revMinor}`;
+
+  const vlen = aoiRecord.length > 0xa8 ? dv(aoiRecord).getUint16(0xa6, true) : 0;
+  const vendor = vlen > 0 ? KaitaiStream.bytesToStr(aoiRecord.subarray(0xa8, 0xa8 + vlen), "UTF-8") : null;
+
+  const namelessRow = queryOne(db, "SELECT record FROM nameless WHERE parent_id=? ORDER BY LENGTH(record) DESC LIMIT 1", [
+    objectId,
+  ]);
+  let meta;
+  if (namelessRow && namelessRow[0].length > 50) {
+    meta = parseAoiNameless(namelessRow[0]);
+  } else {
+    meta = { createdBy: "", createdDate: "", editedBy: "", editedDate: "", softwareRevision: "", revisionExtension: null };
+  }
+
+  const parameters = [];
+  const localTags = [];
+  const routines = [];
+
+  const tagCollRow = queryOne(db, "SELECT object_id FROM comps WHERE parent_id=? AND comp_name='RxTagCollection'", [objectId]);
+  if (tagCollRow) {
+    const tagCollOid = tagCollRow[0];
+    const childRows = queryAll(db, "SELECT object_id, record FROM comps WHERE parent_id=? AND record_type != 512 ORDER BY seq_number", [
+      tagCollOid,
+    ]);
+    for (const [childOid, childRec] of childRows) {
+      let isParam = false;
+      try {
+        const rChild = new RxGeneric(new KaitaiStream(childRec));
+        const extsChild = new Map();
+        for (const er of rChild.extendedRecords) extsChild.set(er.attributeId, er.value);
+        const ext01 = extsChild.get(0x01) || new Uint8Array(0);
+        const flags = aoiTagUsageFlags(ext01);
+        isParam = Boolean(flags & 0x0c);
+      } catch (e) {
+        // matches Python's bare except: pass
+      }
+
+      if (isParam) {
+        try {
+          parameters.push(buildParameter(db, childOid));
+        } catch (e) {
+          // matches Python's bare except: pass
+        }
+      } else {
+        try {
+          localTags.push(buildLocalTag(db, childOid));
+        } catch (e) {
+          // matches Python's bare except: pass
+        }
+      }
+    }
+  }
+
+  const routineCollRow = queryOne(db, "SELECT object_id FROM comps WHERE parent_id=? AND comp_name='RxRoutineCollection'", [
+    objectId,
+  ]);
+  if (routineCollRow) {
+    const routineCollOid = routineCollRow[0];
+    const childOids = queryAll(db, "SELECT object_id FROM comps WHERE parent_id=?", [routineCollOid]).map((r) => r[0]);
+    for (const childOid of childOids) {
+      let routine;
+      try {
+        routine = buildRoutine(db, childOid);
+      } catch (e) {
+        routine = null;
+      }
+      if (routine !== null) routines.push(routine);
+    }
+  }
+
+  let aoiDescription = null;
+  let revisionNote = "";
+  if (rAoi !== null) {
+    const aoiCommentParent = rAoi.commentId * 0x10000 + rAoi.cipType;
+    const descRow = queryOne(
+      db,
+      "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 AND record_type=1 LIMIT 1",
+      [aoiCommentParent],
+    );
+    if (descRow && descRow[0]) aoiDescription = descRow[0];
+    try {
+      const rnRow = queryOne(db, "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' LIMIT 1", [
+        aoiCommentParent,
+      ]);
+      if (rnRow) revisionNote = rnRow[0] || "";
+    } catch (e) {
+      // matches Python's bare except: pass
+    }
+  }
+
+  return new AOI(
+    name,
+    revision,
+    meta.revisionExtension,
+    vendor,
+    "false",
+    "false",
+    "false",
+    meta.createdDate,
+    meta.createdBy,
+    meta.editedDate,
+    meta.editedBy,
+    meta.softwareRevision,
+    parameters,
+    localTags,
+    routines,
+    { description: aoiDescription, revisionNote },
+  );
+}
+
+function buildProgram(db, objectId, dataTypesMap = new Map(), redundancyEnabled = false, hexOidMap = null) {
+  const results = queryAll(db, "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id=?", [objectId]);
+
+  const progRecord = results[0][3];
+  const r = new RxGeneric(new KaitaiStream(progRecord));
+
+  const name = results[0][0];
+
+  const exts = new Map();
+  for (const e of r.extendedRecords) exts.set(e.attributeId, e.value);
+  let mainRoutineName = null;
+  let faultRoutineName = null;
+  if (exts.has(0x12d) && exts.get(0x12d).length >= 4) {
+    const mainOid = dv(exts.get(0x12d)).getUint32(0, true);
+    if (mainOid) {
+      const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [mainOid]);
+      mainRoutineName = row ? row[0] : null;
+    }
+  }
+  if (exts.has(0x066) && exts.get(0x066).length >= 4) {
+    const faultOid = dv(exts.get(0x066)).getUint32(0, true);
+    if (faultOid) {
+      const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [faultOid]);
+      faultRoutineName = row ? row[0] : null;
+    }
+  }
+
+  const ext01 = exts.get(0x01) || new Uint8Array(0);
+  const disabledFlag = ext01.length >= 0x28 ? dv(ext01).getUint32(0x24, true) !== 0 : false;
+  const disabled = disabledFlag ? "true" : "false";
+
+  const collectionResults = queryAll(db, "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id=? AND comp_name='RxRoutineCollection'", [
+    objectId,
+  ]);
+
+  const routines = [];
+  if (collectionResults.length) {
+    const collectionId = collectionResults[0][1];
+    const routineResults = queryAll(db, "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id=?", [
+      collectionId,
+    ]);
+    for (const child of routineResults) {
+      const routine = buildRoutine(db, child[1]);
+      if (routine !== null) routines.push(routine);
+    }
+  }
+
+  const tagCollResults = queryAll(
+    db,
+    "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND comp_name='RxTagCollection'",
+    [objectId],
+  );
+  if (tagCollResults.length > 1) throw new Error("Contains more than one program tag collection");
+
+  const tags = [];
+  if (tagCollResults.length) {
+    const childResults = queryAll(
+      db,
+      "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id=? AND record_type != 264",
+      [tagCollResults[0][1]],
+    );
+    for (const result of childResults) {
+      const tag = buildTag(db, result[1], hexOidMap);
+      tag._dataTypesMap = dataTypesMap;
+      if ((tag._initialValue === null || tag._initialValue === undefined) && tag._dataTableInstance) {
+        const n = countArrayElements(tag.dimensions);
+        const getCompsRecord = (oid) => {
+          const row = queryOne(db, "SELECT record FROM comps WHERE object_id=?", [oid]);
+          return row ? row[0] : undefined;
+        };
+        const udtVal = decodeUdtInitialValue(getCompsRecord, tag._dataTableInstance, tag.dataType, n, dataTypesMap, tag.dimensions !== null);
+        if (udtVal !== null && udtVal !== undefined) tag._initialValue = udtVal;
+      }
+      tags.push(tag);
+    }
+  }
+
+  const syncRedundancy = redundancyEnabled ? "true" : null;
+
+  const description = lookupObjectDescription(db, r, progRecord);
+
+  return new Program(name, "false", mainRoutineName, faultRoutineName, disabled, syncRedundancy, "false", tags, routines, {
+    description,
+  });
+}
+
+const TASK_TYPE_MAP = new Map([
+  [1, "EVENT"],
+  [2, "PERIODIC"],
+  [4, "CONTINUOUS"],
+]);
+
+function buildTask(db, objectId, commentIdToProgram) {
+  const row = queryOne(db, "SELECT comp_name, record FROM comps WHERE object_id=?", [objectId]);
+  const [name, record] = row;
+  const d = dv(record);
+
+  const rateUs = d.getUint32(0x106c, true);
+  const typeVal = d.getUint16(0x10f6, true);
+  const priority = d.getUint16(0x10f8, true);
+  const watchdogUs = d.getUint32(0x110a, true);
+  const disableUpdate = record[0x112e];
+
+  const taskType = TASK_TYPE_MAP.get(typeVal) || "PERIODIC";
+  const rateStr = taskType !== "CONTINUOUS" ? String(Math.floor(rateUs / 1000)) : null;
+
+  const progCount = d.getUint16(0x5a, true);
+  const scheduledPrograms = [];
+  for (let i = 0; i < progCount; i++) {
+    const offset = 0x5a + 2 + i * 4;
+    if (offset + 4 > record.length) break;
+    const cid = d.getUint32(offset, true);
+    const progName = commentIdToProgram.get(cid);
+    if (progName) scheduledPrograms.push(new ScheduledProgram(progName));
+  }
+
+  let eventInfo = null;
+  if (taskType === "EVENT") eventInfo = new EventInfo("EVENT Instruction Only", "false");
+
+  return new Task(
+    name,
+    taskType,
+    rateStr,
+    String(priority),
+    String(Math.floor(watchdogUs / 1000)),
+    disableUpdate ? "true" : "false",
+    "false",
+    eventInfo,
+    scheduledPrograms,
+  );
+}
+
 module.exports = {
   radixEnum,
   externalAccessEnum,
@@ -1068,4 +1382,9 @@ module.exports = {
   buildParameter,
   buildLocalTag,
   buildTag,
+  filetimeToIso,
+  parseAoiNameless,
+  buildAoi,
+  buildProgram,
+  buildTask,
 };
