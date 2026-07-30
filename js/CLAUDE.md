@@ -148,10 +148,23 @@ tags in one earlier sample).
     their Python originals (`CATALOG_NUMBERS`/`PORT_STRUCTURES`), and `Module.toXml()` verified
     byte-identical to Python's `Module.to_xml()` for a real CPU module case (1756-L83E, exercising
     the port/bus lookup path).
-  - **Not yet ported**: `radix_enum`/`external_access_enum`/`_resolve_bit_target`
-    (Python ~2431-2507), and every `*Builder` class (`MemberBuilder` through
-    `ControllerBuilder`/`ProjectBuilder`, ~2507-4980 — the majority of the remaining line count,
-    and where the actual SQL-cursor-driven object construction happens). This is next.
+  - `l5x/sqlutil.js` (`queryAll`/`queryOne`) replaces Python's `cur.execute()`/`fetchall()`/
+    `fetchone()` cursor pattern for sql.js. `l5x/builders.js` now has `radixEnum`,
+    `externalAccessEnum`, `resolveBitTarget`, `buildMember` (port of `MemberBuilder`),
+    `buildDataType` (port of `DataTypeBuilder`), and `applyDeadMemberByteCorrections` (a no-op,
+    matching Python's own now-disproven-theory no-op). Builders are plain functions
+    `(db, objectId, ...)` rather than dataclass instances (no cursor-attached-to-self convention
+    to mirror in JS).
+  - **Verified against all 164 real `DataType`s in `CuteLogix.ACD`** (via `RxDataTypeCollection`'s
+    children) — full recursive member detail (name, data_type, dimension, radix, hidden,
+    BIT-overlay target, bit_number, byte_offset, description) matches Python's
+    `DataTypeBuilder.build()` **exactly, zero mismatches**, including every UDT's BIT-overlay
+    `Target` resolution (`resolveBitTarget`'s fallback-target-first chain) and hidden/dead-member
+    handling.
+  - **Not yet ported**: `ModuleBuilder` (~300 lines, next), `_build_hex_oid_map`/
+    `_resolve_tag_name_from_oid`, `TagBuilder` (~260 lines), `ParameterBuilder`/`LocalTagBuilder`,
+    `RoutineBuilder` + ST-routine helpers, `AoiBuilder`, `ProgramBuilder`/`TaskBuilder`,
+    `ControllerBuilder` (~530 lines, the orchestrator), `ProjectBuilder`.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 
