@@ -26,9 +26,17 @@ ported — round-tripping needs a Studio-version HMAC key this project doesn't h
   harnesses (dump parsed tuples / SQL table contents to JSON for diffing against the equivalent
   Python output — not part of the shipped app).
 
-Not yet present: the object-graph builders and XML emission (`acd/l5x/elements.py`, the bulk of
-the remaining work), the pipeline entry point (`acd/api.py`), or the browser UI. See `CLAUDE.md`
-for current status on each.
+- `l5x/render.js` / `l5x/tag.js` / `l5x/elements.js` / `l5x/builders.js` / `l5x/project.js` —
+  the full object-graph builders and XML emission layer (port of `acd/l5x/elements.py`): every
+  `*Builder` class, all L5X element classes, and the L5K/Decorated value-rendering engine.
+  **`buildController(db)` produces a complete `Controller` object whose `.toXml()` output is
+  byte-for-byte identical to Python's `ControllerBuilder.build().to_xml()`** for every local
+  fixture with real controller content — see `CLAUDE.md` for the verification detail and two
+  real bugs found reaching this milestone.
+
+Not yet present: the pipeline entry point (wiring `ingestAcd` + `buildController` +
+`buildProjectContent` together, mirroring `acd/api.py`'s `ConvertAcdToL5x`) and the browser UI.
+See `CLAUDE.md` for current status.
 
 ## Running it
 

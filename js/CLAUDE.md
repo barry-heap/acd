@@ -213,11 +213,81 @@ tags in one earlier sample).
     map). `buildProgram`'s UDT-initial-value second pass ran but wasn't exercised with a real
     UDT-typed program tag in this pass — worth a targeted check in a future session if one turns
     up in a richer fixture.
-  - **Not yet ported**: `ControllerBuilder` (~530 lines, the orchestrator — builds the
-    modid→name map and port-child-count passes that feed `buildModule`, the AOI-instance-
-    parameter-binding-comment stripping pass, and wires every other builder together) and
-    `ProjectBuilder` (reads `QuickInfo.XML` for the `RSLogix5000Content` top-level attributes).
-    These are the last pieces before a genuine end-to-end JS `ConvertAcdToL5x` exists.
+  - **`ControllerBuilder` and `ProjectBuilder` are now ported too** (`buildController` in
+    `builders.js`, `buildProject`/`buildProjectContent` in the new `l5x/project.js`). This
+    completes the entire object-graph/XML-emission layer — `elements.py` is now fully ported.
+    `buildProject` parses `QuickInfo.XML` (UTF-16LE-encoded) with a small regex-based attribute
+    extractor rather than a full XML parser, since the only elements needed
+    (root/`SchemaVersion`/`SWVersion`/`DeviceIdentity`) are simple self-closing tags — keeps this
+    port dependency-light.
+
+  ### Milestone: full whole-project `<Controller>` XML now byte-for-byte identical to Python
+
+  Verified against **all 4 local fixtures with real controller content**
+  (`CuteLogix.ACD`, `Test_IO.ACD`, `ACDTestsWithAOI.ACD`, `ACDTestsNonRedundant.ACD`): the
+  complete `Controller.toXml()` output — every data type, tag (with decoded initial values),
+  program, routine, task, module, and AOI — is **byte-for-byte identical** to Python's
+  `ControllerBuilder.build().to_xml()` for every one of them (`CuteLogix.ACD` alone is 147,023
+  characters, zero differences). This is the strongest verification in this port so far: it
+  doesn't just check individual builders in isolation, it checks the fully-assembled real output.
+
+  **Two more real bugs found and fixed reaching this milestone** (both the same underlying root
+  cause as the `isFloatType` bug documented above — JS's lack of an int/float runtime
+  distinction — but manifesting in two new, non-obvious places a synthetic unit test would never
+  have caught; only a full real-project XML diff surfaced them):
+
+  1. **`decodeSingleUdtElement`'s BIT-overlay extraction pass wrongly bit-shifted a REAL-typed
+     target.** The code assumed (following the TIMER/COUNTER pattern) that a BIT-overlay member's
+     backing field is always an integer (`typeof targetVal === "number"`, matching Python's
+     `isinstance(target_val, int)` — except in JS every float is also `typeof "number"`). A real,
+     built-in Rockwell `PID` structure has BIT flags (`EN`/`CT`/`CL`/`PVT`/`DOE`/`SWM`/`CA`/`MO`/
+     `PE`/`NDF`/`NOBC`/`NOZC`/`INI`/`SPOR`/`OLL`/`OLH`/`EWD`/`DVNA`/`DVPA`/`PVLA`/`PVHA`) whose
+     target is `"SP"` — a REAL member. Python's `isinstance` check correctly excludes this (a
+     Python float is never `int`), so these 21 keys never appear in Python's decoded dict at all;
+     my JS version was bit-extracting IEEE-754 float bits and adding 21 phantom keys. Found via a
+     real tag (`PID_Master`, `PID`-typed) in `CuteLogix.ACD` whose decoded `initial_value` dict had
+     21 extra keys compared to Python's. Fixed by looking up the **target member's own declared
+     type** (`PRIM` + `!isFloatType`) instead of checking the runtime value's `typeof` — only a
+     scalar integer-primitive target is eligible for bit extraction, matching exactly which
+     Python values are `int` vs `float`/`list`/`dict`.
+  2. **A rarer, more subtle variant of the same class**: Python's `_decode_scalar_member`/
+     `_read_tag_initial_value` both return a **plain Python `int` 0** — never a `float`, no matter
+     the member's declared type — when a computed byte offset falls outside the tag's actual data
+     blob (an out-of-bounds/truncated read, e.g. from a deeply-nested Motion/Axis structure like
+     `AXIS_VIRTUAL` whose declared size exceeds the real data available). Downstream, Python's
+     `isinstance(val, float)` check then renders this as bare `"0"`, not `"0.0"`, **even for a
+     REAL/LREAL member** — the opposite direction from bug #1 above (there JS over-eagerly treated
+     an int-like value as float-worthy; here it's the reverse: JS's `isFloatType(declaredType)`
+     check would treat this fallback zero as a genuine float and wrongly render `"0.0"`). Since JS
+     has no way to tag "this specific number came from an int fallback path" on the value itself,
+     fixed by using **`-0` (negative zero) as an internal sentinel** for this one fallback case
+     specifically (`decodeScalarMember`'s and `readTagInitialValue`'s out-of-bounds branches now
+     `return -0` instead of `0`) — `-0 === 0` and `Boolean(-0) === false` everywhere else
+     (arithmetic, truthiness, JSON, L5K rendering — Python's own L5K path doesn't check
+     `isinstance` at all, always formatting REAL/LREAL by declared type, so no L5K-side fix was
+     needed), so this is invisible everywhere except the four Decorated-XML rendering call sites
+     that now check `isGenuineFloat(declaredType, val)` (`isFloatType(...) && !Object.is(val, -0)`)
+     instead of bare `isFloatType(...)`. Found via the same `CuteLogix.ACD` full-XML diff, isolated
+     to tag `VAxis` (`AXIS_VIRTUAL`-typed)'s `ActualPosition` member.
+
+  **Lesson worth restating a third time in this file** (the Python `CLAUDE.md` makes the identical
+  point repeatedly about its own byte-offset bugs): a fix that resolves the specific symptom found
+  isn't proof the underlying pattern is fully handled everywhere it appears. Both bugs above are
+  instances of the *same* root cause (JS's `typeof x === "number"` conflates Python's `int`/`float`
+  distinction) that had already been fixed once (the `isFloatType` fix in the render-layer
+  milestone) — but that first fix only covered the *known-value* rendering path, not the
+  *decode-time fallback* paths, which needed their own, differently-shaped fix. Any *new* rendering
+  or decoding code that formats a numeric value by REAL/LREAL-ness must go through
+  `isGenuineFloat`/the declared-type check, never a bare runtime `typeof`/`Number.isInteger` test —
+  and should be re-checked against a real whole-project diff, not just a synthetic sample, since
+  both of these were invisible to every earlier targeted test and only surfaced this way.
+
+  **What "fully ported" here does and doesn't mean**: this milestone confirms every builder is
+  wired together correctly, but the port's exercised real fixture *coverage* has known gaps carried
+  over from earlier notes in this file — no ST routine content, no connection-type code beyond
+  5/6/7/23/48, no bridged/remote rack, only one real AOI available. Treat "verified" as "verified
+  for what these four fixtures exercise," the same caveat the Python `CLAUDE.md` applies to its own
+  verification claims.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 
