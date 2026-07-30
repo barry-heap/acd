@@ -139,11 +139,19 @@ tags in one earlier sample).
        of `Number.isInteger()` (`udtScalarToXml`'s two sites, `Tag.toXml()`'s two sites). Any
        future rendering code must key float-vs-integer formatting off the known data type name,
        never off a runtime check of the JS number's value.
-  - **Not yet ported**: `LocalTag`, `Parameter`, `Module`, `Routine`, `AOI`, `Program`,
-    `ScheduledProgram`, `EventInfo`, `Task`, `Controller`, `RSLogix5000Content` classes (Python
-    lines ~1894-2430), `radix_enum`/`external_access_enum`/`_resolve_bit_target` (~2431-2507),
-    and every `*Builder` class (`MemberBuilder` through `ControllerBuilder`/`ProjectBuilder`,
-    ~2507-4980 — the majority of the remaining line count). This is next.
+  - `l5x/elements.js` now also has `LocalTag`, `Parameter`, `Module`, `Routine`, `AOI`, `Program`,
+    `ScheduledProgram`, `EventInfo`, `Task`, `Controller`, `RSLogix5000Content` (Python lines
+    ~1894-2430). `l5x/port_structures.js`/`port_structures.json` and `l5x/catalog_numbers.js` port
+    the two hardware lookup tables `Module` needs — the port-structures data was mechanically
+    generated from the Python source into JSON (39 module types, too much to safely
+    hand-transcribe) rather than typed by hand; both tables verified as an **exact match** against
+    their Python originals (`CATALOG_NUMBERS`/`PORT_STRUCTURES`), and `Module.toXml()` verified
+    byte-identical to Python's `Module.to_xml()` for a real CPU module case (1756-L83E, exercising
+    the port/bus lookup path).
+  - **Not yet ported**: `radix_enum`/`external_access_enum`/`_resolve_bit_target`
+    (Python ~2431-2507), and every `*Builder` class (`MemberBuilder` through
+    `ControllerBuilder`/`ProjectBuilder`, ~2507-4980 — the majority of the remaining line count,
+    and where the actual SQL-cursor-driven object construction happens). This is next.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 

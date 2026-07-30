@@ -1,0 +1,504 @@
+{
+  "1,14,166": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "slot",
+      "busMode": "fixed:17"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "omit",
+      "busMode": "always"
+    }
+  ],
+  "1,14,167": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "slot",
+      "busMode": "fixed:17"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "omit",
+      "busMode": "always"
+    }
+  ],
+  "1,14,168": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "slot",
+      "busMode": "fixed:17"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "omit",
+      "busMode": "always"
+    }
+  ],
+  "1,14,93": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": false,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,14,94": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": false,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,12,166": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "slot",
+      "busMode": "children_or_none"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "empty",
+      "busMode": "always"
+    }
+  ],
+  "1,12,169": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "slot",
+      "busMode": "children_or_none"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "empty",
+      "busMode": "always"
+    }
+  ],
+  "1,12,258": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "slot",
+      "busMode": "children_or_none"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": false,
+      "upstreamPort": false,
+      "addressMode": "empty",
+      "busMode": "always"
+    }
+  ],
+  "1,12,90": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "omit",
+      "busMode": "fixed:8"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1,12,261": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "omit",
+      "busMode": "fixed:8"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1,12,322": [
+    {
+      "portId": 1,
+      "portType": "5094",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "slot",
+      "busMode": "fixed:17"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1,7,34": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,7,35": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,7,37": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,7,156": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,10,25": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,10,26": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,10,153": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,10,154": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,109,6": [
+    {
+      "portId": 1,
+      "portType": "Flex",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,7,397": [
+    {
+      "portId": 1,
+      "portType": "5094",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,7,399": [
+    {
+      "portId": 1,
+      "portType": "5094",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,115,323": [
+    {
+      "portId": 1,
+      "portType": "5094",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    },
+    {
+      "portId": 2,
+      "portType": "HART",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "omit",
+      "busMode": "fixed:8"
+    }
+  ],
+  "1,115,324": [
+    {
+      "portId": 1,
+      "portType": "5094",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    },
+    {
+      "portId": 2,
+      "portType": "HART",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "omit",
+      "busMode": "fixed:8"
+    }
+  ],
+  "1,7,11": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,7,30": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,10,7": [
+    {
+      "portId": 1,
+      "portType": "ICP",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,123,1168": [
+    {
+      "portId": 1,
+      "portType": "RhinoBP",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "zero",
+      "busMode": "always"
+    },
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1,142,1168": [
+    {
+      "portId": 1,
+      "portType": "RhinoBP",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "zero",
+      "busMode": "always"
+    },
+    {
+      "portId": 5,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1,143,2192": [
+    {
+      "portId": 1,
+      "portType": "RhinoBP",
+      "upstreamFixed": true,
+      "upstreamPort": false,
+      "addressMode": "zero",
+      "busMode": "always"
+    },
+    {
+      "portId": 13,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1,0,28": [
+    {
+      "portId": 2,
+      "portType": "RhinoBP",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "slot",
+      "busMode": "none"
+    }
+  ],
+  "1,0,18": [
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1182,0,4162": [
+    {
+      "portId": 1,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1182,0,4177": [
+    {
+      "portId": 1,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1182,43,4154": [
+    {
+      "portId": 1,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1182,43,4155": [
+    {
+      "portId": 1,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1182,43,4156": [
+    {
+      "portId": 1,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "1182,43,4170": [
+    {
+      "portId": 1,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ],
+  "322,12,1422": [
+    {
+      "portId": 2,
+      "portType": "Ethernet",
+      "upstreamFixed": true,
+      "upstreamPort": true,
+      "addressMode": "empty",
+      "busMode": "none"
+    }
+  ]
+}
