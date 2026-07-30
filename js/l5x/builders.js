@@ -9,6 +9,8 @@ const { queryAll, queryOne } = require("./sqlutil");
 const { Member, DataType } = require("./render");
 const { Module } = require("./elements");
 const { CATALOG_NUMBERS } = require("./catalog_numbers");
+const { Tag } = require("./tag");
+const { readTagInitialValue, countArrayElements, SKIP_DECORATED } = require("./render");
 
 const CONNECTION_TYPE_BY_CODE = new Map([
   [5, "Input"],
@@ -486,6 +488,234 @@ function buildModule(db, objectId, modidToName) {
   );
 }
 
+function buildHexOidMap(db) {
+  const rows = queryAll(
+    db,
+    "SELECT m.comp_name, m.record FROM comps m " +
+      "INNER JOIN comps c ON m.parent_id = c.object_id " +
+      "WHERE c.comp_name = 'RxTypeMemberCollection'",
+  );
+  const hexOidMap = new Map();
+  for (const [name, rec] of rows) {
+    if (rec.length < 18) continue;
+    const d = dv(rec);
+    const high = d.getUint16(12, true);
+    const low = d.getUint16(16, true);
+    const oid = (high << 16) | low;
+    const existing = hexOidMap.get(oid >>> 0);
+    if (existing === undefined || name.length < existing.length) hexOidMap.set(oid >>> 0, name);
+  }
+  return hexOidMap;
+}
+
+function resolveTagNameFromOid(db, oid) {
+  const row = queryOne(db, "SELECT comp_name, record FROM comps WHERE object_id=?", [oid]);
+  if (!row) return null;
+  const [compName, rec] = row;
+  try {
+    const r = new RxGeneric(new KaitaiStream(rec));
+    for (const er of r.extendedRecords) {
+      if (er.attributeId === 1) {
+        const v = er.value;
+        const nl = dv(v).getUint16(0, true);
+        return KaitaiStream.bytesToStr(v.subarray(2, 2 + nl), "UTF-8");
+      }
+    }
+  } catch (e) {
+    // fall through
+  }
+  return compName;
+}
+
+function buildTag(db, objectId, hexOidMap = null) {
+  const getCompsRecord = (oid) => {
+    const row = queryOne(db, "SELECT record FROM comps WHERE object_id=?", [oid]);
+    return row ? row[0] : undefined;
+  };
+
+  const results = queryAll(db, "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id=?", [objectId]);
+  const rawRec = results[0][3];
+
+  let externalAccess;
+  let constantFlag;
+  if (rawRec.length > 0x279) {
+    externalAccess = externalAccessEnum(rawRec[0x278]);
+    constantFlag = Boolean(rawRec[0x279]);
+  } else {
+    externalAccess = "Read/Write";
+    constantFlag = false;
+  }
+
+  let r;
+  try {
+    r = new RxGeneric(new KaitaiStream(rawRec));
+  } catch (e) {
+    return new Tag(results[0][0], "Base", "", null, externalAccess, constantFlag ? "true" : "false", null);
+  }
+
+  if (r.cipType !== 0x6b && r.cipType !== 0x68) {
+    return new Tag(results[0][0], "Base", "", null, externalAccess, constantFlag ? "true" : "false", null);
+  }
+
+  let dataType;
+  if (r.mainRecord.dataType === 0xffffffff) {
+    dataType = "";
+  } else {
+    const dtRow = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [r.mainRecord.dataType]);
+    dataType = dtRow[0];
+  }
+
+  const ownScopeId = rawRec.length >= 18 ? dv(rawRec).getUint16(16, true) : 0;
+  let commentResults = queryAll(db, "SELECT tag_reference, record_string FROM comments WHERE parent=? AND scope_id=?", [
+    r.commentId * 0x10000 + r.cipType,
+    ownScopeId,
+  ]);
+
+  const extendedRecords = new Map();
+  for (const er of r.extendedRecords) extendedRecords.set(er.attributeId, er.value);
+
+  const rawRadix = r.mainRecord.radix;
+  const radix = rawRadix !== 0 ? radixEnum(rawRadix) : null;
+
+  const dimParts = [];
+  if (r.mainRecord.dimension1 !== 0) dimParts.push(String(r.mainRecord.dimension1));
+  if (r.mainRecord.dimension2 !== 0) dimParts.push(String(r.mainRecord.dimension2));
+  if (r.mainRecord.dimension3 !== 0) dimParts.push(String(r.mainRecord.dimension3));
+  const dimensions = dimParts.length ? dimParts.join(",") : null;
+  const dti = r.mainRecord.dataTableInstance;
+  const initialValue = readTagInitialValue(getCompsRecord, dti, dataType, countArrayElements(dimensions), dimensions !== null);
+
+  let tagName = results[0][0];
+  if (extendedRecords.has(0x01)) {
+    const ext01 = extendedRecords.get(0x01);
+    const nameLength = dv(ext01).getUint16(0, true);
+    tagName = KaitaiStream.bytesToStr(ext01.subarray(2, nameLength + 2), "UTF-8");
+  }
+
+  let tagType = "Base";
+  let target = null;
+
+  let consumed = 82;
+  for (const er of r.extendedRecords) consumed += 8 + er.value.length;
+  const remaining = rawRec.subarray(consumed);
+  if (remaining.length >= 8) {
+    const dRem = dv(remaining);
+    const extraAttrId = dRem.getUint32(0, true);
+    if (extraAttrId === 0x65) {
+      tagType = "Alias";
+      const extraLen = dRem.getUint32(4, true);
+      if (extraLen > 0 && 8 + extraLen <= remaining.length) {
+        const pathBytes = remaining.subarray(8, 8 + extraLen);
+        const pathText = KaitaiStream.bytesToStr(pathBytes, "UTF-16LE").replace(/\0+$/, "");
+        const baseTarget = resolveTagNameFromOid(db, dti);
+        if (baseTarget !== null) {
+          target = baseTarget;
+          const subpathParts = [];
+          if (pathText.includes("@.")) {
+            const parts = pathText.split("@.");
+            for (const part of parts.slice(1)) {
+              if (!part) continue;
+              if (part.startsWith("@")) {
+                const end = part.indexOf("@", 1);
+                const hexOid = end >= 0 ? part.slice(1, end) : part.slice(1);
+                const literal = end >= 0 ? part.slice(end + 1) : "";
+                const oid = parseInt(hexOid, 16) || 0;
+                if (oid) {
+                  const memberName = resolveTagNameFromOid(db, oid);
+                  if (memberName) subpathParts.push(memberName);
+                }
+                if (literal) subpathParts.push(literal);
+              } else {
+                subpathParts.push(part);
+              }
+            }
+          } else if (pathText.includes("@")) {
+            const end = pathText.indexOf("@", 1);
+            if (end >= 0) {
+              const rest = pathText.slice(end + 1);
+              if (rest) subpathParts.push(rest);
+            }
+          }
+          if (subpathParts.length) {
+            let subpathStr = "";
+            for (const sp of subpathParts) {
+              if (sp.startsWith("[")) {
+                subpathStr += sp;
+              } else if (subpathStr) {
+                subpathStr += "." + sp;
+              } else {
+                subpathStr = sp;
+              }
+            }
+            target = subpathStr.startsWith("[") ? baseTarget + subpathStr : baseTarget + "." + subpathStr;
+          }
+        }
+      }
+    }
+  }
+
+  if (!tagName.includes(":")) {
+    const map = hexOidMap !== null ? hexOidMap : buildHexOidMap(db);
+    if (map.size) {
+      commentResults = commentResults.map(([ref, text]) => {
+        if (ref && ref.includes("!")) {
+          const newRef = ref.replace(/!([0-9A-F]{8})/g, (m, hex) => {
+            const hexVal = parseInt(hex, 16);
+            const name = map.get(hexVal);
+            return name !== undefined ? name : m;
+          });
+          return [newRef, text];
+        }
+        return [ref, text];
+      });
+    }
+  }
+
+  const normalized = [];
+  for (const [ref, text] of commentResults) {
+    if (!ref) {
+      normalized.push([ref, text]);
+    } else if (ref.startsWith(".!") || ref.startsWith("!")) {
+      normalized.push([ref, text]);
+    } else if (ref.endsWith("]")) {
+      if (ref.includes("[") && !ref.startsWith("[")) {
+        normalized.push([`${tagName}.${ref}`, text]);
+      } else if (ref.startsWith("[")) {
+        normalized.push([`${tagName}${ref}`, text]);
+      } else {
+        normalized.push([`${tagName}[${ref}`, text]);
+      }
+    } else if (/^\d+$/.test(ref)) {
+      normalized.push([`${tagName}.${ref}`, text]);
+    } else if (ref.includes("].")) {
+      normalized.push([`${tagName}${ref}`, text]);
+    } else if (ref.includes(".") && !ref.includes(":")) {
+      const sep = ref.startsWith(".") ? "" : ".";
+      if (dimensions !== null) {
+        normalized.push([`${tagName}[0]${sep}${ref}`, text]);
+      } else {
+        normalized.push([`${tagName}${sep}${ref}`, text]);
+      }
+    } else {
+      normalized.push([ref, text]);
+    }
+  }
+
+  let constant;
+  if (tagType === "Alias" || SKIP_DECORATED.has(dataType.toUpperCase())) {
+    constant = null;
+  } else {
+    constant = constantFlag ? "true" : "false";
+  }
+
+  return new Tag(tagName, tagType, dataType, radix, externalAccess, constant, dimensions, {
+    target,
+    dataTableInstance: dti,
+    comments: normalized,
+    initialValue,
+  });
+}
+
 module.exports = {
   radixEnum,
   externalAccessEnum,
@@ -494,4 +724,7 @@ module.exports = {
   buildDataType,
   applyDeadMemberByteCorrections,
   buildModule,
+  buildHexOidMap,
+  resolveTagNameFromOid,
+  buildTag,
 };
