@@ -161,10 +161,25 @@ tags in one earlier sample).
     `DataTypeBuilder.build()` **exactly, zero mismatches**, including every UDT's BIT-overlay
     `Target` resolution (`resolveBitTarget`'s fallback-target-first chain) and hidden/dead-member
     handling.
-  - **Not yet ported**: `ModuleBuilder` (~300 lines, next), `_build_hex_oid_map`/
-    `_resolve_tag_name_from_oid`, `TagBuilder` (~260 lines), `ParameterBuilder`/`LocalTagBuilder`,
-    `RoutineBuilder` + ST-routine helpers, `AoiBuilder`, `ProgramBuilder`/`TaskBuilder`,
-    `ControllerBuilder` (~530 lines, the orchestrator), `ProjectBuilder`.
+  - `buildModule` (port of `ModuleBuilder`, including its `_ip_from_data_collection`/
+    `_comms_from_data_collection`/`_chassis_size_from_data_collection` helpers, which scrape XML
+    fragments out of raw `RxDataCollection` records) is also in `builders.js` now. Uses a
+    `latin1Decode()` helper (lossless 1:1 byte↔codepoint mapping) so byte-level substring/regex
+    matching on raw records ports directly to JS string operations — equivalent to Python's raw
+    `bytes` `in`/`re.search(rb"...")` checks as long as the needle is pure ASCII (always true here).
+  - **Verified against all 3 real Modules available across the repo's fixtures** (1 in
+    `CuteLogix.ACD`, 2 in `Test_IO.ACD` — the only fixtures with any `RxMapDeviceCollection`
+    entries; no fixture here exercises every connection-type code or a remote/bridged chassis) —
+    every field (catalog number, vendor/product ids, parent/port, EKey state, slot, IP, backplane
+    slot, chassis size, description, CommMethod, connections, extended properties) **and** the
+    full `toXml()` output match Python's `ModuleBuilder.build()` exactly. Caveat carried over from
+    the Python `CLAUDE.md`: this doesn't exercise bridged/remote racks or every
+    `_CONNECTION_TYPE_BY_CODE` value, since no available fixture has one.
+  - **Not yet ported**: `_build_hex_oid_map`/`_resolve_tag_name_from_oid`, `TagBuilder`
+    (~260 lines), `ParameterBuilder`/`LocalTagBuilder`, `RoutineBuilder` + ST-routine helpers,
+    `AoiBuilder`, `ProgramBuilder`/`TaskBuilder`, `ControllerBuilder` (~530 lines, the
+    orchestrator — including the modid→name map and port-child-count passes that feed
+    `buildModule`), `ProjectBuilder`.
 - **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
 - **Browser UI**: not started.
 

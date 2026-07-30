@@ -7,6 +7,16 @@ const { KaitaiStream } = require("kaitai-struct");
 const { RxGeneric } = require("../generated/RxGeneric");
 const { queryAll, queryOne } = require("./sqlutil");
 const { Member, DataType } = require("./render");
+const { Module } = require("./elements");
+const { CATALOG_NUMBERS } = require("./catalog_numbers");
+
+const CONNECTION_TYPE_BY_CODE = new Map([
+  [5, "Input"],
+  [6, "Output"],
+  [7, "DiagnosticInput"],
+  [23, "MotionSync"],
+  [48, "StandardDataDriven"],
+]);
 
 function radixEnum(i) {
   switch (i) {
@@ -231,6 +241,251 @@ function buildDataType(db, objectId) {
 // theory it originally implemented was disproven).
 function applyDeadMemberByteCorrections(allDataTypesMap) {}
 
+// latin-1 is a lossless 1:1 byte<->codepoint mapping, so decoding a whole raw
+// record this way and then doing plain string search/regex on it is
+// equivalent to Python's raw-bytes `needle in raw` / `re.search(rb"...")`
+// checks, as long as the needle itself is pure ASCII (always true below).
+function latin1Decode(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+}
+
+function ipFromDataCollection(db, icpSlot) {
+  const needle = `Type="ICP" Addr="${icpSlot}"`;
+  const row = queryOne(db, "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1");
+  if (!row) return "";
+  const collOid = row[0];
+  const rows = queryAll(db, "SELECT record FROM comps WHERE parent_id=?", [collOid]);
+  for (const [raw] of rows) {
+    const text = latin1Decode(raw);
+    if (!text.includes(needle)) continue;
+    const m = /Type="EN" Addr="([^"]+)"/.exec(text);
+    return m ? m[1] : "";
+  }
+  return "";
+}
+
+function extractCommAndPublic(raw) {
+  const xmlStart = raw.indexOf(0x3c); // '<'
+  if (xmlStart < 0) return [null, ""];
+  const xmlText = latin1Decode(raw.subarray(xmlStart));
+  let commMethod = null;
+  const cfM = /<CF>(\d+)<\/CF>/.exec(xmlText);
+  if (cfM) commMethod = cfM[1];
+  let pubContent = "";
+  const pubStart = xmlText.indexOf("<public>");
+  if (pubStart >= 0) {
+    const afterPub = xmlText.slice(pubStart + "<public>".length);
+    const endTagM = /<\/pub/.exec(afterPub);
+    if (endTagM) {
+      pubContent = afterPub.slice(0, endTagM.index);
+    } else {
+      pubContent = afterPub.replace(/[\x00 \r\n]+$/, "");
+    }
+  }
+  return [commMethod, pubContent];
+}
+
+function commsFromDataCollection(db, icpSlot, ipAddress = "") {
+  const row = queryOne(db, "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1");
+  if (!row) return [null, ""];
+  const collOid = row[0];
+  const allRecs = queryAll(db, "SELECT record FROM comps WHERE parent_id=?", [collOid]).map((r) => r[0]);
+
+  if (icpSlot) {
+    const needle = `Type="ICP" Addr="${icpSlot}"`;
+    for (const raw of allRecs) {
+      if (latin1Decode(raw).includes(needle)) {
+        const result = extractCommAndPublic(raw);
+        if (result[0] !== null || result[1]) return result;
+      }
+    }
+  }
+
+  if (ipAddress) {
+    const ipNeedle = `Addr="${ipAddress}"`;
+    for (const raw of allRecs) {
+      if (latin1Decode(raw).includes(ipNeedle)) {
+        const result = extractCommAndPublic(raw);
+        if (result[0] !== null || result[1]) return result;
+      }
+    }
+  }
+
+  return [null, ""];
+}
+
+function chassisSizeFromDataCollection(db) {
+  const row = queryOne(db, "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1");
+  if (!row) return null;
+  const collOid = row[0];
+  const rows = queryAll(db, "SELECT record FROM comps WHERE parent_id=?", [collOid]);
+  const needle = 'Type="ICP" Addr="0"';
+  for (const [raw] of rows) {
+    const full = latin1Decode(raw);
+    if (!full.includes(needle)) continue;
+    const textStart = full.indexOf("<");
+    if (textStart < 0) continue;
+    const text = full.slice(textStart);
+    const m = /<Bus\b[^>]*\bSize="(\d+)"/.exec(text);
+    if (m) return parseInt(m[1], 10);
+  }
+  return null;
+}
+
+function buildModule(db, objectId, modidToName) {
+  const row = queryOne(db, "SELECT comp_name, object_id, record FROM comps WHERE object_id=?", [objectId]);
+  const dbName = row[0];
+  const rawRec = row[2];
+
+  const name = dbName.startsWith("$") && dbName.endsWith("$") ? "?" : dbName;
+
+  let r;
+  try {
+    r = new RxGeneric(new KaitaiStream(rawRec));
+  } catch (e) {
+    return new Module(name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false");
+  }
+
+  if (r.cipType !== 0x69) {
+    return new Module(name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false");
+  }
+
+  const exts = new Map();
+  for (const er of r.extendedRecords) exts.set(er.attributeId, er.value);
+  const e1 = exts.get(0x001) || new Uint8Array(0);
+  if (e1.length < 0x30) {
+    const majorFault = name === "Local" ? "true" : "false";
+    return new Module(name, "", 0, 0, 0, 0, 0, "Local", 1, "false", majorFault);
+  }
+
+  const d1 = dv(e1);
+  const vendor = d1.getUint16(0x02, true);
+  const productType = d1.getUint16(0x04, true);
+  const productCode = d1.getUint16(0x06, true);
+  const major = e1[0x08] & 0x7f;
+  const minor = e1[0x09];
+  const parentModid = d1.getUint32(0x16, true);
+  const parentPort = d1.getUint16(0x1a, true);
+  const slot = d1.getUint32(0x1c, true);
+
+  let effectiveProductType = productType;
+  let effectiveProductCode = productCode;
+  if (name === "?") {
+    effectiveProductType = 0;
+    effectiveProductCode = 28;
+  }
+
+  const parentName = modidToName.get(parentModid) || "Local";
+  const majorFault = parentName === name ? "true" : "false";
+  const ekeyState = e1[0] & 0x04 ? "Disabled" : "CompatibleModule";
+
+  let ipAddress = "";
+  if (e1.length > 0x32) {
+    const ipLen = d1.getUint16(0x30, true);
+    if (ipLen) {
+      let end = 0x32 + ipLen;
+      const slice = e1.subarray(0x32, end);
+      let trimEnd = slice.length;
+      while (trimEnd > 0 && slice[trimEnd - 1] === 0) trimEnd--;
+      ipAddress = latin1Decode(slice.subarray(0, trimEnd));
+    }
+  }
+  if (!ipAddress && slot) ipAddress = ipFromDataCollection(db, slot);
+
+  let backplaneSlot = null;
+  let chassisSize = null;
+  const outRow = queryOne(
+    db,
+    "SELECT o.record FROM comps coll " +
+      "JOIN comps o ON o.parent_id = coll.object_id AND o.comp_name = 'Output' " +
+      "WHERE coll.parent_id = ? AND coll.comp_name = 'RxMapConnectionCollection'",
+    [objectId],
+  );
+  if (outRow) {
+    const outRec = outRow[0];
+    if (outRec.length > 0x70) {
+      const dOut = dv(outRec);
+      backplaneSlot = dOut.getUint16(0x6e, true);
+      chassisSize = dOut.getUint16(0x4e, true);
+    }
+  }
+
+  if (chassisSize === null && slot === 0xffffffff) {
+    chassisSize = chassisSizeFromDataCollection(db);
+  }
+
+  let description = "";
+  const descRow = queryOne(db, "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1", [
+    r.commentId * 0x10000 + r.cipType,
+  ]);
+  if (descRow) description = descRow[0] || "";
+
+  let commMethod = null;
+  const connections = [];
+  let extendedProperties = "";
+  if (slot || ipAddress) {
+    [commMethod, extendedProperties] = commsFromDataCollection(db, slot, ipAddress);
+  }
+
+  const connRows = queryAll(
+    db,
+    "SELECT c2.comp_name, c2.record FROM comps c1 " +
+      "JOIN comps c2 ON c2.parent_id = c1.object_id " +
+      "WHERE c1.parent_id = ? AND c1.comp_name = 'RxMapConnectionCollection' " +
+      "AND c2.comp_name NOT IN ('Output') " +
+      "ORDER BY c2.seq_number",
+    [objectId],
+  );
+  for (const [connName, connRec] of connRows) {
+    let connType = null;
+    let code = null;
+    let rpiStr = "0";
+    if (connRec.length >= 96) {
+      const dConn = dv(connRec);
+      code = dConn.getUint16(90, true);
+      connType = CONNECTION_TYPE_BY_CODE.get(code) || null;
+      rpiStr = String(dConn.getUint32(92, true));
+    }
+    if (connType === null) {
+      const nameLower = connName.toLowerCase();
+      connType = nameLower.includes("output") || nameLower === "config" ? "Output" : "Input";
+      console.warn(
+        `Unrecognized connection type code ${code} for connection '${connName}' on module ` +
+          `'${name}' (record length ${connRec.length}) -- falling back to name heuristic, guessed ` +
+          `'${connType}'. Please report this so the code can be added to CONNECTION_TYPE_BY_CODE.`,
+      );
+    }
+    connections.push([connName, rpiStr, connType]);
+  }
+
+  return new Module(
+    name,
+    CATALOG_NUMBERS.get(`${vendor},${effectiveProductType},${effectiveProductCode}`) || "",
+    vendor,
+    effectiveProductType,
+    effectiveProductCode,
+    major,
+    minor,
+    parentName,
+    parentPort,
+    "false",
+    majorFault,
+    {
+      ekeyState,
+      slot,
+      ipAddress,
+      backplaneSlot,
+      chassisSize,
+      description,
+      commMethod,
+      connections,
+      extendedProperties,
+    },
+  );
+}
+
 module.exports = {
   radixEnum,
   externalAccessEnum,
@@ -238,4 +493,5 @@ module.exports = {
   buildMember,
   buildDataType,
   applyDeadMemberByteCorrections,
+  buildModule,
 };
