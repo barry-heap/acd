@@ -355,8 +355,70 @@ correctly end-to-end inside an actual browser page, not just under Node.
 **Scope note**: `test_browser.js`/`build.js` are dev tooling, not shipped — only
 `dist/acd-to-l5x.html` is the deliverable. `playwright` is a devDependency for this verification
 only, not needed to use the converter itself.
-- **Pipeline entry point (`api.py`'s `ConvertAcdToL5x`)**: not started.
-- **Browser UI**: not started.
+
+## Round 2: progress indication (main thread + `requestAnimationFrame`, not a Web Worker)
+
+Added `onProgress` threading through the whole pipeline (`ingestAcd`, `buildController`,
+`buildProgram`, `buildAoi`) — every builder function that loops over programs/AOIs/routines now
+takes an optional `onProgress` callback and calls it with a `{phase, ...}` event at each major
+milestone (container extraction, each `.Dat` file parsed, each datatype/tag/module/program/AOI/
+routine batch or item). Verified this threading doesn't change output at all: same 147,362-char
+`CuteLogix.ACD` baseline with `onProgress` supplied vs. omitted.
+
+**A Web Worker was tried first** (so a large project's conversion could never block the page at
+all) and then reverted after finding a real, reproducible bug: `sql.js`'s asm.js build
+(`sql-asm.js` — used deliberately instead of the wasm build so the whole converter stays one
+offline file with no separate `.wasm` fetch) crashes with `RangeError: Maximum call stack size
+exceeded` inside `ingestAcd`'s `stmt.run()` calls when run inside a Worker in real headless
+Chromium, while the exact same code works fine on the main thread (confirmed via Round 1's own
+`test_browser.js`) and in Node. Isolated with a minimal repro (a bare Worker + `sql-asm.js` +
+a multi-MB BLOB insert) to confirm it's a genuine asm.js/Worker incompatibility (most likely a
+smaller stack-size limit in some browsers' worker contexts, which Emscripten's own recursive
+internals can overflow), not a bug in this port's own code — the identical insert succeeds
+reliably in Node and on the main thread up to much larger sizes. Also discovered along the way
+that Node's plain `require("sql.js")` resolves to a *different* file (`dist/sql-wasm.js`, real
+WebAssembly) than the one this browser build actually ships (`dist/sql-asm.js`) — meaning every
+earlier Node-side ingestion test, across this whole project, had never actually exercised the
+exact code path the shipped HTML uses. `ingest.js`/`convert.js` are unaffected by this — they
+already used `require("sql.js/dist/sql-asm.js")`-equivalent loading only inside the browser
+build via `build.js`'s embedding, so this was purely a Worker-context finding, not a code bug.
+
+Given that risk, the task's own spec offered the other option explicitly (yield periodically on
+the main thread instead of using a Worker), which is what's implemented now: every builder
+function in the `onProgress` call chain is `async`, `onProgress` is `await`ed (not just called)
+at each milestone, and `ui.js`'s own `onProgress` implementation updates the DOM (progress bar/
+summary/scrolling log) and then `await`s `new Promise(requestAnimationFrame)` before returning,
+so the browser actually gets to repaint between routine builds. `build.js` was reworked to embed
+everything (kaitai/pako/sql-asm.js/shim/modules + `ui.js`) in a single main-thread `<script>`
+again (no more `<script type="text/plain" id="worker-source">`/`Blob`/`postMessage`), exposing
+`convertAcdToL5x` as a plain global via a small `RUNTIME_BOOTSTRAP` for `ui.js` to call directly.
+
+**Verified in real headless Chromium** (`test_browser.js`, all 4 local fixtures): output is still
+byte-for-byte identical to the Round 1 baseline (147,362/2,841/17,757/16,366 chars). A separate
+polling test (`page.locator("#progress-bar").evaluate(el => el.style.width)` sampled every 15ms
+during a real `CuteLogix.ACD` conversion) captured 25 distinct width values climbing smoothly from
+0% to 100% over ~270 samples — confirming the bar genuinely animates incrementally rather than
+freezing and jumping straight to 100%, which is what a synchronous (non-yielding) implementation
+would have produced.
+
+## Round 2: ST verification and dark mode — blocked
+
+- **ST routine conversion** (`stRoutineLines` in `builders.js`): by inspection this already
+  matches the Python reference (`_st_routine_lines()` in `acd/l5x/elements.py`) faithfully —
+  same breadth-first `nameless` walk, same `0x01000002` record-type filter, same
+  `0xFFFFFFFF`-sequence-number skip, same `@hexid@` resolution. **Not yet verified against real
+  ST content**: none of the 4 local fixtures contain an ST routine (confirmed in Round 1's own
+  notes above), so this logic has never actually executed against real data end-to-end, only by
+  code-reading. Blocked on the user providing a real ACD project with ST routines plus a
+  matching Studio 5000 L5X export of one of them, per the task spec's own validation
+  requirement (byte-diff against Python wherever Python has real behavior to diff against).
+- **Dark mode** (`theme.css`): implemented with a placeholder palette (see the file's own header
+  comment) as CSS custom properties specifically so swapping in the real palette later is a
+  small diff, not a rewrite. Blocked on reaching `barry-heap/plc-studio`'s actual source for its
+  real color values — `add_repo` for that repository has failed twice in this session with
+  `MCP error -32003: MCP tool call requires approval` (a permission gate, not a "repo doesn't
+  exist" error). Needs either the session's permissions adjusted to allow that repo, or the
+  palette values supplied directly some other way.
 
 ## Dependencies
 

@@ -1101,7 +1101,7 @@ function parseAoiNameless(data) {
   return result;
 }
 
-function buildAoi(db, objectId) {
+async function buildAoi(db, objectId, onProgress = null) {
   const results = queryAll(db, "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id=?", [objectId]);
   const aoiRecord = results[0][3];
   const name = results[0][0];
@@ -1180,8 +1180,9 @@ function buildAoi(db, objectId) {
   ]);
   if (routineCollRow) {
     const routineCollOid = routineCollRow[0];
-    const childOids = queryAll(db, "SELECT object_id FROM comps WHERE parent_id=?", [routineCollOid]).map((r) => r[0]);
-    for (const childOid of childOids) {
+    const routineRows = queryAll(db, "SELECT object_id, comp_name FROM comps WHERE parent_id=?", [routineCollOid]);
+    for (const [childOid, childName] of routineRows) {
+      if (onProgress) await onProgress({ phase: "routine", aoi: name, routine: childName });
       let routine;
       try {
         routine = buildRoutine(db, childOid);
@@ -1232,7 +1233,7 @@ function buildAoi(db, objectId) {
   );
 }
 
-function buildProgram(db, objectId, dataTypesMap = new Map(), redundancyEnabled = false, hexOidMap = null) {
+async function buildProgram(db, objectId, dataTypesMap = new Map(), redundancyEnabled = false, hexOidMap = null, onProgress = null) {
   const results = queryAll(db, "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id=?", [objectId]);
 
   const progRecord = results[0][3];
@@ -1274,6 +1275,7 @@ function buildProgram(db, objectId, dataTypesMap = new Map(), redundancyEnabled 
       collectionId,
     ]);
     for (const child of routineResults) {
+      if (onProgress) await onProgress({ phase: "routine", program: name, routine: child[0] });
       const routine = buildRoutine(db, child[1]);
       if (routine !== null) routines.push(routine);
     }
@@ -1389,7 +1391,7 @@ function decodeUtf16TrimNul(extendedRecords, key) {
   return KaitaiStream.bytesToStr(raw.subarray(0, raw.length - 2), "UTF-16LE");
 }
 
-function buildController(db) {
+async function buildController(db, onProgress = null) {
   const rootResults = queryAll(
     db,
     "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE parent_id=0 AND record_type=256",
@@ -1476,6 +1478,7 @@ function buildController(db) {
     [dataTypeCollId],
   );
 
+  if (onProgress) await onProgress({ phase: "datatypes", count: dtChildResults.length });
   const dataTypes = [];
   const allDataTypesMap = new Map();
   for (const result of dtChildResults) {
@@ -1502,6 +1505,7 @@ function buildController(db) {
 
   const hexOidMap = buildHexOidMap(db);
 
+  if (onProgress) await onProgress({ phase: "tags", count: tagChildResults.length });
   const tags = [];
   for (const result of tagChildResults) {
     const tagObjectId = result[1];
@@ -1632,7 +1636,8 @@ function buildController(db) {
   );
   const programs = [];
   for (const result of progChildResults) {
-    programs.push(buildProgram(db, result[1], dataTypesMap, redundancyEnabled, hexOidMap));
+    if (onProgress) await onProgress({ phase: "program", program: result[0] });
+    programs.push(await buildProgram(db, result[1], dataTypesMap, redundancyEnabled, hexOidMap, onProgress));
   }
 
   const commentIdToProgram = new Map();
@@ -1673,7 +1678,8 @@ function buildController(db) {
       [aoiCollectionObjectId],
     );
     for (const result of aoiChildResults) {
-      aois.push(buildAoi(db, result[1]));
+      if (onProgress) await onProgress({ phase: "aoi", aoi: result[0] });
+      aois.push(await buildAoi(db, result[1], onProgress));
     }
   }
 
@@ -1741,6 +1747,7 @@ function buildController(db) {
       }
     }
 
+    if (onProgress) await onProgress({ phase: "modules", count: modRows.length });
     modules = modRows.map(([, modOid]) => buildModule(db, modOid, modidToName));
 
     const childCounts = new Map();

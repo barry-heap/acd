@@ -30,12 +30,21 @@ function formatNowWeekdayString(date) {
 // identically and this avoids an XML-parsing dependency for a purely
 // cosmetic feature). Byte-for-byte identical, modulo whitespace, to
 // Python's raw (non-pretty-printed) output for the same file.
-async function convertAcdToL5x(acdBytes) {
-  const { db, rawFiles } = await ingestAcd(acdBytes);
-  const controller = buildController(db);
+// onProgress(event), if given, is awaited at each major milestone (container
+// extraction, each .Dat file parsed, each program/AOI/routine as it's built,
+// ...) -- see ingest.js/l5x/builders.js for the exact event shapes
+// ({phase, ...}). This lets a caller yield back to the browser's event loop
+// between milestones (e.g. `await new Promise(requestAnimationFrame)`) so a
+// long conversion still renders visible incremental progress on the main
+// thread. Purely a progress-reporting hook; conversion correctness/output is
+// identical whether or not one is passed.
+async function convertAcdToL5x(acdBytes, onProgress = null) {
+  const { db, rawFiles } = await ingestAcd(acdBytes, onProgress);
+  const controller = await buildController(db, onProgress);
   const quickInfoBytes = rawFiles.get("QuickInfo.XML");
   const project = buildProjectContent(quickInfoBytes, formatNowWeekdayString(new Date()));
   project.controller = controller;
+  if (onProgress) onProgress({ phase: "done" });
   return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + project.toXml();
 }
 
