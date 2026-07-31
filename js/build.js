@@ -6,6 +6,18 @@
 // existing, already-verified Node modules can be embedded completely
 // unmodified (their own require()/module.exports lines are untouched).
 //
+// The conversion runs on the main thread, not a Web Worker. A Worker was
+// tried first (so a large project's conversion couldn't freeze the page at
+// all), but sql.js's asm.js build (sql-asm.js -- deliberately used instead
+// of the wasm build so this stays a single offline file with no separate
+// .wasm fetch) crashes with `RangeError: Maximum call stack size exceeded`
+// when run inside a Worker in real headless Chromium, while the identical
+// code works fine on the main thread or in Node -- a genuine asm.js/Worker
+// incompatibility, not a bug in this port. Instead, convertAcdToL5x's
+// onProgress hook (see convert.js) is awaited at each milestone, and ui.js's
+// onProgress implementation yields via requestAnimationFrame so the browser
+// still gets to repaint between routine builds, without a Worker's fragility.
+//
 // Run: node build.js  (writes dist/acd-to-l5x.html)
 
 const fs = require("fs");
@@ -46,6 +58,15 @@ function idFor(relPath) {
   return relPath.replace(/\.js$/, "");
 }
 
+// Guards against a future embedded source accidentally containing the
+// literal substring "</script" (which would prematurely close the
+// surrounding <script> tag regardless of its type= attribute) by splitting
+// it -- harmless for JS semantics, since JS never actually parses
+// "</scr" + "ipt" as anything meaningful on its own.
+function scriptSafe(src) {
+  return src.replace(/<\/script/gi, "<\\/script");
+}
+
 function buildModulesScript() {
   const parts = [];
   for (const relPath of MODULE_FILES) {
@@ -66,7 +87,10 @@ function buildModulesScript() {
 const SHIM = `
 // Minimal CommonJS-in-the-browser shim: enough to run the existing Node
 // modules below completely unmodified. "kaitai-struct"/"pako"/"sql.js" are
-// mapped to the UMD-global runtimes loaded via <script> tags above.
+// mapped to the UMD-global runtimes loaded earlier in this same script.
+// "self" (rather than "window") is used below since it resolves the same
+// way on both the main thread and in a Worker, in case a Worker is ever
+// reintroduced for some part of this later.
 var __modules = {};
 var __cache = {};
 
@@ -84,13 +108,13 @@ function __resolveId(fromId, spec) {
 }
 
 function __require(fromId, spec) {
-  if (spec === "kaitai-struct") return { KaitaiStream: window.KaitaiStream };
-  if (spec === "kaitai-struct/KaitaiStream") return window.KaitaiStream;
-  if (spec === "pako") return window.pako;
-  if (spec === "sql.js") return window.initSqlJs;
+  if (spec === "kaitai-struct") return { KaitaiStream: self.KaitaiStream };
+  if (spec === "kaitai-struct/KaitaiStream") return self.KaitaiStream;
+  if (spec === "pako") return self.pako;
+  if (spec === "sql.js") return self.initSqlJs;
   if (spec === "fs" || spec === "path") {
     // Only reachable via Unzip.writeFiles(), a Node-only dev convenience
-    // never called from the browser UI's code path.
+    // never called from the browser build's own code path.
     throw new Error("Node-only module '" + spec + "' is not available in the browser build");
   }
   var id = __resolveId(fromId, spec);
@@ -104,19 +128,25 @@ function __require(fromId, spec) {
 }
 `;
 
-function buildHtml() {
-  const kaitaiSrc = fs.readFileSync(
-    path.join(ROOT, "node_modules/kaitai-struct/KaitaiStream.js"),
-    "utf8",
-  );
-  const pakoSrc = fs.readFileSync(
-    path.join(ROOT, "node_modules/pako/dist/browser/pako.umd.min.js"),
-    "utf8",
-  );
+// Exposes convertAcdToL5x as a plain global for ui.js (loaded right after
+// this in the same <script>, on the same main thread) to call directly.
+const RUNTIME_BOOTSTRAP = `
+var convertAcdToL5x = __require("__main__", "./convert").convertAcdToL5x;
+`;
+
+function buildRuntimeSource() {
+  const kaitaiSrc = fs.readFileSync(path.join(ROOT, "node_modules/kaitai-struct/KaitaiStream.js"), "utf8");
+  const pakoSrc = fs.readFileSync(path.join(ROOT, "node_modules/pako/dist/browser/pako.umd.min.js"), "utf8");
   const sqlAsmSrc = fs.readFileSync(path.join(ROOT, "node_modules/sql.js/dist/sql-asm.js"), "utf8");
   const modulesSrc = buildModulesScript();
+  return [kaitaiSrc, pakoSrc, sqlAsmSrc, SHIM, modulesSrc, RUNTIME_BOOTSTRAP].join("\n\n");
+}
 
+function buildHtml() {
+  const runtimeSrc = buildRuntimeSource();
   const uiSrc = fs.readFileSync(path.join(ROOT, "ui.js"), "utf8");
+  const mainScript = scriptSafe([runtimeSrc, uiSrc].join("\n\n"));
+  const cssSrc = fs.readFileSync(path.join(ROOT, "theme.css"), "utf8");
 
   return `<!doctype html>
 <html lang="en">
@@ -125,33 +155,29 @@ function buildHtml() {
 <title>ACD &rarr; L5X Converter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1.5rem; color: #1a1a1a; }
-  h1 { font-size: 1.4rem; }
-  .drop { border: 2px dashed #999; border-radius: 8px; padding: 2.5rem 1rem; text-align: center; cursor: pointer; margin: 1.5rem 0; }
-  .drop.dragover { border-color: #2563eb; background: #eff6ff; }
-  .status { margin-top: 1rem; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 0.85rem; }
-  .status.error { color: #b91c1c; }
-  .status.ok { color: #15803d; }
-  footer { margin-top: 3rem; font-size: 0.8rem; color: #666; }
+${cssSrc}
 </style>
 </head>
 <body>
+<div class="page">
 <h1>ACD &rarr; L5X Converter</h1>
-<p>Converts a Rockwell Studio 5000 <code>.ACD</code> project file to <code>.L5X</code> XML,
+<p class="lede">Converts a Rockwell Studio 5000 <code>.ACD</code> project file to <code>.L5X</code> XML,
 entirely in your browser. No file ever leaves this page.</p>
 <div id="drop" class="drop">
   <p>Drop a <code>.ACD</code> file here, or click to choose one.</p>
   <input id="file-input" type="file" accept=".ACD,.acd" style="display:none" />
 </div>
+<div id="progress-wrap" class="progress-wrap" hidden>
+  <div class="progress-bar-track"><div id="progress-bar" class="progress-bar-fill"></div></div>
+  <div id="progress-summary" class="progress-summary"></div>
+  <div id="progress-log" class="progress-log"></div>
+</div>
 <div id="status" class="status"></div>
-<footer>Read-only: produces an L5X export only, never writes back to the source .ACD.</footer>
-<script>${kaitaiSrc}</script>
-<script>${pakoSrc}</script>
-<script>${sqlAsmSrc}</script>
+<footer>Read-only: produces an L5X export only, never writes back to the source .ACD.
+FBD routines are not yet supported and export as an empty shell, matching the Python reference tool.</footer>
+</div>
 <script>
-${SHIM}
-${modulesSrc}
-${uiSrc}
+${mainScript}
 </script>
 </body>
 </html>

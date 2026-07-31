@@ -150,7 +150,7 @@ function populateRegnlink(db, files, knownObjectIds) {
 // fileOrder, idToName } -- rawFiles/fileOrder mirror ExportL5x's own
 // _raw_files/_file_order (kept for a future write-back/round-trip feature,
 // out of scope for this converter but cheap to carry through).
-async function ingestAcd(acdBytes) {
+async function ingestAcd(acdBytes, onProgress = null) {
   // In Node, point sql.js at its own package files on disk. In the browser
   // build (see build.js/ui.js), initSqlJs is the plain-JS asm.js variant
   // embedded directly in the page -- it has no separate .wasm to fetch, so
@@ -162,10 +162,12 @@ async function ingestAcd(acdBytes) {
   const db = new SQL.Database();
   for (const stmt of SCHEMA) db.run(stmt);
 
+  if (onProgress) await onProgress({ phase: "extract" });
   const unzip = new Unzip(acdBytes);
   const files = unzip.extractAll();
   const fileOrder = unzip.records.map((r) => r.filename);
 
+  if (onProgress) await onProgress({ phase: "comps" });
   const compsTuples = parseRecords(files.get("Comps.Dat"), parseCompsRecord, "Comps");
   const compsById = new Map();
   for (const t of compsTuples) {
@@ -184,6 +186,7 @@ async function ingestAcd(acdBytes) {
   populateRegionMap(db);
   populateRegnlink(db, files, new Set(compsById.keys()));
 
+  if (onProgress) await onProgress({ phase: "rungs" });
   const rungTuples = parseRecords(
     files.get("SbRegion.Dat"),
     (rec) => parseSbRegionRecord(rec, idToName),
@@ -195,6 +198,7 @@ async function ingestAcd(acdBytes) {
     stmt.free();
   }
 
+  if (onProgress) await onProgress({ phase: "comments" });
   let commentTuples = parseRecords(files.get("Comments.Dat"), parseCommentsRecord, "Comments");
   commentTuples = commentTuples.map(normalizeComment);
   const seen = new Map();
@@ -209,6 +213,7 @@ async function ingestAcd(acdBytes) {
     stmt.free();
   }
 
+  if (onProgress) await onProgress({ phase: "nameless" });
   const namelessTuples = parseRecords(files.get("Nameless.Dat"), parseNamelessRecord, "Nameless");
   {
     const stmt = db.prepare("INSERT INTO nameless VALUES (?,?,?)");
@@ -216,6 +221,7 @@ async function ingestAcd(acdBytes) {
     stmt.free();
   }
 
+  if (onProgress) await onProgress({ phase: "indexing" });
   db.run("CREATE INDEX idx_comps_object_id ON comps(object_id)");
   db.run("CREATE INDEX idx_comps_parent_id ON comps(parent_id)");
   db.run("CREATE INDEX idx_comps_parent_name ON comps(parent_id, comp_name)");
