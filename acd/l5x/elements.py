@@ -3907,12 +3907,15 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[Tuple[int, st
     that only ever have a single group, where this rule reduces to the
     original plain contiguous-index behavior.
 
-    Tag references appear as ``@hexid@`` placeholders (the referenced
-    comps object id in hex); they are batch-resolved to component names.
-    A real project also showed ``&hexid:`` module-address placeholders
-    (the same encoding rung text uses) appearing directly inside ST text
-    -- e.g. an I/O module reference like ``N2:5:I.Ch2Data`` written to
-    Nameless.Dat as ``&2a47752d:5:I.Ch2Data``. Both forms are resolved."""
+    Tag references appear as ``@hexid@`` placeholders (the referenced comps
+    object id in hex); a real project also showed ``&hexid:`` module-address
+    placeholders (the same encoding rung text uses) appearing directly
+    inside ST text -- e.g. an I/O module reference like ``N2:5:I.Ch2Data``
+    written to Nameless.Dat as ``&2a47752d:5:I.Ch2Data``. Both forms are
+    resolved together, iterated to a fixed point rather than in one pass:
+    a resolved comp name can itself still be an unresolved ``&hexid:``
+    placeholder (a composite/derived module-address reference stored that
+    way in the comps table), which a single pass would leave untouched."""
     lines: List[Tuple[int, int, str]] = []  # (parent_id, seq, text)
     frontier: List[int] = [routine_object_id]
     for _depth in range(6):
@@ -3961,9 +3964,34 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[Tuple[int, st
             local_numbers.append(i)
             texts.append(text)
 
-    # Batch-resolve @hexid@ tag references to comp names.
-    all_hex = set(re.findall(r"@([0-9a-fA-F]{1,8})@", " ".join(texts)))
-    if all_hex:
+    # Batch-resolve @hexid@ and &hexid: tag/module-address references to
+    # comp names. Both point at the same comps table by object_id; @...@ is
+    # an ordinary tag reference, &...: is used specifically for module I/O
+    # addresses (e.g. &2a47752d:5:I.Ch6Data -> N2:5:I.Ch6Data) and keeps its
+    # trailing colon on resolution, since that colon is real address
+    # syntax, not placeholder delimiter syntax the way both @ signs are.
+    #
+    # Resolution is iterated to a fixed point rather than done in one pass:
+    # some comps names are themselves still-unresolved &hexid: placeholder
+    # text (a composite/derived module-address reference stored that way in
+    # the comps table), so the name looked up for one placeholder can
+    # itself contain a further placeholder that a single pass would leave
+    # untouched. Bounded to guard against a pathological circular reference.
+    _ref_re = re.compile(r"([@&])([0-9a-fA-F]{1,8})([@:])")
+
+    def _resolve_once(line: str, id_to_name: Dict[str, str]) -> str:
+        def _repl(m: "re.Match[str]") -> str:
+            delim_open, hex_id, delim_close = m.group(1), m.group(2), m.group(3)
+            name = id_to_name.get(hex_id)
+            if name is None:
+                return m.group(0)
+            return name + delim_close if delim_open == "&" else name
+        return _ref_re.sub(_repl, line)
+
+    for _ in range(5):
+        all_hex = {m.group(2) for t in texts for m in _ref_re.finditer(t)}
+        if not all_hex:
+            break
         id_to_name: Dict[str, str] = {}
         for hex_id in all_hex:
             cur.execute(
@@ -3972,40 +4000,12 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[Tuple[int, st
             row = cur.fetchone()
             if row and row[0]:
                 id_to_name[hex_id] = row[0]
-        if id_to_name:
-            def _resolve(line: str) -> str:
-                return re.sub(
-                    r"@([0-9a-fA-F]{1,8})@",
-                    lambda m: id_to_name.get(m.group(1), m.group(0)),
-                    line,
-                )
-            texts = [_resolve(t) for t in texts]
-
-    # Batch-resolve &hexid: module-address references to comp names -- the
-    # same encoding rung text uses (see RoutineBuilder.build() above). Found
-    # via a real project's ST content: I/O module addresses inside ST (e.g.
-    # "PROC_TT_A001 := N2:5:I.Ch2Data;") are stored as "&hexid:" (the
-    # rung-text encoding), not "@hexid@" -- both placeholder forms can appear
-    # in the same ST routine (@hexid@ for tag references, &hexid: for module
-    # addresses), so both must be resolved, not just one.
-    all_hex2 = set(re.findall(r"&([0-9a-f]{8}):", " ".join(texts)))
-    if all_hex2:
-        id_to_name2: Dict[str, str] = {}
-        for hex_id in all_hex2:
-            cur.execute(
-                "SELECT comp_name FROM comps WHERE object_id=?", (int(hex_id, 16),)
-            )
-            row = cur.fetchone()
-            if row and row[0]:
-                id_to_name2[hex_id] = row[0]
-        if id_to_name2:
-            def _resolve2(line: str) -> str:
-                return re.sub(
-                    r"&([0-9a-f]{8}):",
-                    lambda m: (id_to_name2[m.group(1)] + ":") if m.group(1) in id_to_name2 else m.group(0),
-                    line,
-                )
-            texts = [_resolve2(t) for t in texts]
+        if not id_to_name:
+            break
+        new_texts = [_resolve_once(t, id_to_name) for t in texts]
+        if new_texts == texts:
+            break
+        texts = new_texts
     return list(zip(local_numbers, texts))
 
 

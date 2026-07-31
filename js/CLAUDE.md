@@ -416,8 +416,17 @@ identical fix to JS:
    documented ST tag-reference form) — but a real routine's ST source can *also* contain the
    rung-text `&hexid:` encoding directly, e.g. `PROC_TT_A001 := &2a47752d:5:I.Ch2Data;` needing
    resolution to `PROC_TT_A001 := N2:5:I.Ch2Data;`. This affected the large majority of the 57
-   real ST routines checked (any one referencing an I/O module). Fixed in both languages by adding
-   a second batch-resolve pass for `&([0-9a-f]{8}):`, identical to the one rung text already uses.
+   real ST routines checked (any one referencing an I/O module). Fixed at the time in both
+   languages by adding a second batch-resolve pass for `&([0-9a-f]{8}):`, identical to the one
+   rung text already uses. **Superseded shortly after** (still the same round, see below) by a
+   more complete fixed-point version merged in from a separate, previously-unmerged branch
+   (`fix/st-hexid-resolution` on the Python side) — see `../CLAUDE.md`'s own ST section for why the
+   simpler two-pass version here wasn't actually sufficient in general (a resolved comp name can
+   itself still be an unresolved placeholder). `stRoutineLines()`/`Routine.toXml()` in this port
+   now use the same iterated-to-a-fixed-point resolution as the Python reference, verified
+   identical against both the real project and a new synthetic nested-placeholder case (see that
+   file's `test_st_routine_lines_resolves_nested_hexid_placeholders` and the equivalent one-off
+   `verify_nested_hexid.js` check run against this JS port's own `stRoutineLines()`).
 2. **`<Line Number="...">` was rendered from an array index, not real Studio's own numbering
    rule.** Assumed (and true for 56 of 57 real routines, and every prior fixture) that Number is
    just a plain 0-based position in the routine's whole line list. One real routine

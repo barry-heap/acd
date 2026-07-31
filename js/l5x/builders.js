@@ -946,42 +946,44 @@ function stRoutineLines(db, routineObjectId) {
   const [localNumbers, texts0] = stLineLocalNumbers(lines);
   let texts = texts0;
 
-  const allHex = new Set();
-  for (const t of texts) {
-    for (const m of t.matchAll(/@([0-9a-fA-F]{1,8})@/g)) allHex.add(m[1]);
+  // Batch-resolve @hexid@ and &hexid: tag/module-address references to comp
+  // names. Both point at the same comps table by object_id; @...@ is an
+  // ordinary tag reference, &...: is used specifically for module I/O
+  // addresses (e.g. &2a47752d:5:I.Ch6Data -> N2:5:I.Ch6Data) and keeps its
+  // trailing colon on resolution, since that colon is real address syntax,
+  // not placeholder delimiter syntax the way both @ signs are.
+  //
+  // Resolution is iterated to a fixed point rather than done in one pass:
+  // some comps names are themselves still-unresolved &hexid: placeholder
+  // text (a composite/derived module-address reference stored that way in
+  // the comps table), so the name looked up for one placeholder can itself
+  // contain a further placeholder that a single pass would leave untouched.
+  // Bounded to guard against a pathological circular reference.
+  const refRe = /([@&])([0-9a-fA-F]{1,8})([@:])/g;
+
+  function resolveOnce(line, idToName) {
+    return line.replace(refRe, (m, delimOpen, hexId, delimClose) => {
+      const name = idToName.get(hexId);
+      if (name === undefined) return m;
+      return delimOpen === "&" ? name + delimClose : name;
+    });
   }
-  if (allHex.size) {
+
+  for (let pass = 0; pass < 5; pass++) {
+    const allHex = new Set();
+    for (const t of texts) {
+      for (const m of t.matchAll(refRe)) allHex.add(m[2]);
+    }
+    if (!allHex.size) break;
     const idToName = new Map();
     for (const hexId of allHex) {
       const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [parseInt(hexId, 16)]);
       if (row && row[0]) idToName.set(hexId, row[0]);
     }
-    if (idToName.size) {
-      texts = texts.map((line) => line.replace(/@([0-9a-fA-F]{1,8})@/g, (m, hex) => idToName.get(hex) || m));
-    }
-  }
-
-  // Batch-resolve &hexid: module-address references too -- the same
-  // encoding rung text uses (see buildRoutine above). Found via a real
-  // project's ST content: I/O module addresses inside ST (e.g.
-  // "PROC_TT_A001 := N2:5:I.Ch2Data;") are stored as "&hexid:" (the
-  // rung-text encoding), not "@hexid@" -- both placeholder forms can
-  // appear in the same ST routine, so both must be resolved.
-  const allHex2 = new Set();
-  for (const t of texts) {
-    for (const m of t.matchAll(/&([0-9a-f]{8}):/g)) allHex2.add(m[1]);
-  }
-  if (allHex2.size) {
-    const idToName2 = new Map();
-    for (const hexId of allHex2) {
-      const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [parseInt(hexId, 16)]);
-      if (row && row[0]) idToName2.set(hexId, row[0]);
-    }
-    if (idToName2.size) {
-      texts = texts.map((line) =>
-        line.replace(/&([0-9a-f]{8}):/g, (m, hex) => (idToName2.has(hex) ? idToName2.get(hex) + ":" : m)),
-      );
-    }
+    if (!idToName.size) break;
+    const newTexts = texts.map((t) => resolveOnce(t, idToName));
+    if (newTexts.every((t, i) => t === texts[i])) break;
+    texts = newTexts;
   }
   // Returns [localNumber, text] pairs, not bare text -- see
   // stLineLocalNumbers() above for why a routine's own raw Nameless.Dat

@@ -18,6 +18,7 @@ from acd.l5x.elements import (
     _l5k_string_padded,
     _read_tag_initial_value,
     _resolve_bit_target,
+    _st_routine_lines,
 )
 
 
@@ -435,3 +436,48 @@ def test_l5k_string_padded_escapes_non_ascii_bytes():
 def test_l5k_string_padded_still_escapes_control_chars():
     result = _l5k_string_padded("\x00\x1b", capacity=2)
     assert result == "'$00$1B'"
+
+
+def _build_st_line_record(seq: int, text: str) -> bytes:
+    """Build a synthetic Nameless.Dat ST source-line record: a 24-byte
+    header (record_type u32 at offset 4, seq u32 at offset 20) followed by
+    the line text in fffeff-encoded UTF-16 (short form, text under 255
+    UTF-16 code units)."""
+    header = bytearray(24)
+    struct.pack_into("<I", header, 4, 0x01000002)
+    struct.pack_into("<I", header, 20, seq)
+    text_bytes = text.encode("utf-16-le")
+    return bytes(header) + bytes([0xFF, 0xFE, 0xFF, len(text)]) + text_bytes
+
+
+def test_st_routine_lines_resolves_nested_hexid_placeholders():
+    # Regression test for a real, previously-separate fix (merged in from
+    # branch fix/st-hexid-resolution): a resolved comp name can itself still
+    # be an unresolved &hexid: placeholder -- a composite/derived
+    # module-address reference stored that way in the comps table -- which
+    # a single-pass resolve would leave untouched. Neither local fixture nor
+    # the one real project this was verified against happens to exercise
+    # this specific nesting, so it needs its own synthetic coverage.
+    #
+    # id_a's own comps entry is itself an unresolved @id_b@ placeholder
+    # (not yet a real name); id_b resolves to the real module name. A
+    # correct fixed-point resolve turns "&<id_a>:5:I.Ch2Data;" into
+    # "N2:5:I.Ch2Data;" over two passes.
+    id_a = 0xAAAA0001
+    id_b = 0xBBBB0002
+    routine_oid = 1000
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE nameless (object_id INTEGER, parent_id INTEGER, record BLOB)")
+    db.execute("CREATE TABLE comps (object_id INTEGER, comp_name TEXT)")
+    db.execute(
+        "INSERT INTO nameless VALUES (?, ?, ?)",
+        (2000, routine_oid, _build_st_line_record(0, f"X := &{id_a:08x}:5:I.Ch2Data;")),
+    )
+    db.execute("INSERT INTO comps VALUES (?, ?)", (id_a, f"@{id_b:08x}@"))
+    db.execute("INSERT INTO comps VALUES (?, ?)", (id_b, "N2"))
+    cur = db.cursor()
+
+    lines = _st_routine_lines(cur, routine_oid)
+
+    assert lines == [(0, "X := N2:5:I.Ch2Data;")]

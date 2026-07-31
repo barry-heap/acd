@@ -325,6 +325,58 @@ records, the remaining (real, numbered) lines were byte-for-byte identical betwe
 confirming both the fix and that the excluded records were never genuine source. Fixed by skipping
 `seq == 0xFFFFFFFF` records entirely in `_st_routine_lines()`.
 
+**Three more real bugs found verifying against a real, large ST-containing project** (the first
+one either this library or its JS port (`js/`, see `js/CLAUDE.md`) had ever been checked against —
+no local fixture has any ST content at all):
+
+1. **`&hexid:` module-address placeholders can appear directly inside ST text, not just
+   `@hexid@` tag references.** An I/O module reference written into ST (e.g.
+   `PROC_TT_A001 := N2:5:I.Ch2Data;`) is stored in Nameless.Dat as
+   `PROC_TT_A001 := &2a47752d:5:I.Ch2Data;` — the same encoding rung text uses, not the
+   `@hexid@` form this function otherwise only expected. Affected the large majority of a real
+   project's 57 ST routines (any one referencing an I/O module).
+2. **Resolution must iterate to a fixed point, not run in a single pass.** A comps entry's own
+   name can itself still be an unresolved `&hexid:` (or `@hexid@`) placeholder — a
+   composite/derived module-address reference stored that way — so the name looked up for one
+   placeholder can contain a further placeholder a single pass would leave untouched. Both forms
+   are now resolved together in one bounded (5-iteration) loop; see `test_elements_helpers.py`'s
+   `test_st_routine_lines_resolves_nested_hexid_placeholders` for a synthetic case exercising this
+   specifically, since neither local fixture nor the one real project available so far actually
+   has a nested placeholder in practice.
+3. **`<Line Number="...">` is not a flat contiguous index across a routine's whole line list.**
+   Assumed true for every real routine tested until one (`Alarms_from_Fox`) disproved it: its raw
+   Nameless.Dat line records fall into two distinct groups by their own immediate `parent_id` (the
+   "region" node directly above the line) — 92 lines under one parent (seq 1038-1129) and 93 under
+   another (seq 1130-1222), an old/new near-duplicate pair retained side by side with neither
+   marked by the `0xFFFFFFFF` sentinel above. Real Studio 5000's own native L5X renders this as two
+   back-to-back `<Line Number="...">` runs, each independently 0-based (duplicated Number values
+   across the runs) — not one contiguous index, and not each line's own raw stored `seq` either
+   (a real *single-group* routine's raw seq starts at an arbitrary project-wide offset like 1532
+   while its real Number is still plain 0-based). Fixed by grouping lines by immediate `parent_id`,
+   sorting each group by its own seq, numbering each group locally from 0, and concatenating
+   groups by ascending seq range — `_st_routine_lines()` now returns `(number, text)` pairs instead
+   of bare text, and `Routine.to_xml()` renders that number verbatim rather than re-enumerating.
+   Reduces to the original plain-index behavior for every routine with only one group (56 of the
+   57 real ones checked).
+
+Verified end-to-end after all three fixes: this project's real Studio 5000 L5X export matches our
+own output exactly across all 64 ST routine occurrences (5,026 total lines, including
+`Alarms_from_Fox`'s duplicate-Number edge case) — and separately, the whole converted document
+(not just ST) is byte-for-byte identical between this Python implementation and the `js/` port for
+the same real project, the strongest cross-language verification either has had against real
+production data. See `js/CLAUDE.md`'s own Round 2 section for the parallel JS-side fixes (plus two
+JS-only bugs — non-ASCII text decoding and a `toFixed()` magnitude quirk — found in the same pass).
+
+**Provenance note on bug 1/2 above**: bug 1 (the `&hexid:` addition) and bug 3 (local-per-group
+numbering) were found and fixed together in one session verifying the JS port against real data,
+using a simpler *non-iterating* two-pass resolve for bug 1 at the time. A separate, earlier branch
+(`fix/st-hexid-resolution`, never merged until this note) had independently found the same `&hexid:`
+gap and fixed it more completely — with the fixed-point iteration bug 2 describes, which the
+simpler two-pass version didn't have. That more complete version is what's merged in now; if you
+ever find `_st_routine_lines()` missing a resolution that should have happened, check whether it's
+because a comps name is itself still a raw placeholder (bug 2's exact scenario) before assuming a
+new root cause.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*
