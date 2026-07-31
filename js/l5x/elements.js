@@ -254,7 +254,11 @@ class Routine extends L5xElement {
       });
       if (rungXmls.length) content = `<RLLContent>${rungXmls.join("")}</RLLContent>`;
     } else if (this.type === "ST" && this._stLines.length) {
-      const lineXmls = this._stLines.map((text, i) => `<Line Number="${i}"><![CDATA[${text}]]></Line>`);
+      // Each pair's own local per-group number (already computed by
+      // stRoutineLines()/stLineLocalNumbers() in builders.js) is rendered
+      // verbatim, NOT re-enumerated here -- see those functions for why it
+      // can legitimately repeat within one routine.
+      const lineXmls = this._stLines.map(([number, text]) => `<Line Number="${number}"><![CDATA[${text}]]></Line>`);
       content = `<STContent>${lineXmls.join("")}</STContent>`;
     }
     return `<Routine Name="${escapeXmlAttr(this.name)}" Type="${this.type}">${descXml}${content}</Routine>`;

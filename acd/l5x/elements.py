@@ -2163,9 +2163,14 @@ class Module(L5xElement):
 class Routine(L5xElement):
     """`.rungs[i]` is the plain-text ladder logic for rung i (`.type` is
     usually "RLL"; "ST" routines have their text in `._st_lines` instead,
-    `.rungs` empty). `._rung_comments` maps a rung index to its comment
-    text. `._rung_ids[i]` is the integer object_id patch_rungs() needs to
-    identify rung i for a write-back edit -- NOT the same as its index i."""
+    `.rungs` empty). `._st_lines` is a list of (number, text) pairs -- each
+    `number` is the line's local, per-group L5X `<Line Number="...">` value
+    already computed by _st_routine_lines() (usually just a plain 0-based
+    index, but see that function for why it can legitimately repeat within
+    one routine), used verbatim, not renumbered again here.
+    `._rung_comments` maps a rung index to its comment text. `._rung_ids[i]`
+    is the integer object_id patch_rungs() needs to identify rung i for a
+    write-back edit -- NOT the same as its index i."""
 
     name: str
     type: str
@@ -2173,7 +2178,7 @@ class Routine(L5xElement):
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
     _description: Union[str, None] = field(default=None)
-    _st_lines: List[str] = field(default_factory=list)
+    _st_lines: List[Tuple[int, str]] = field(default_factory=list)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -2201,9 +2206,13 @@ class Routine(L5xElement):
             if rung_xmls:
                 content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
         elif self.type == "ST" and self._st_lines:
+            # Number="{number}" is each line's own local per-group number
+            # already computed by _st_routine_lines(), NOT re-enumerated
+            # here -- see that function for why it can legitimately repeat
+            # within one routine.
             line_xmls = [
-                f'<Line Number="{i}"><![CDATA[{text}]]></Line>'
-                for i, text in enumerate(self._st_lines)
+                f'<Line Number="{number}"><![CDATA[{text}]]></Line>'
+                for number, text in self._st_lines
             ]
             content = f'<STContent>{"".join(line_xmls)}</STContent>'
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
@@ -3827,7 +3836,7 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
-        st_lines: List[str] = []
+        st_lines: List[Tuple[int, str]] = []
         if routine_type == "ST":
             st_lines = _st_routine_lines(self._cur, self._object_id)
 
@@ -3859,8 +3868,8 @@ def _parse_fffeff(data: bytes, offset: int):
 _ST_LINE_RECORD_TYPE = 0x01000002
 
 
-def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
-    """Extract a Structured Text routine's source lines.
+def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[Tuple[int, str]]:
+    """Extract a Structured Text routine's source lines as (seq, text) pairs.
 
     ST bodies are not stored in SbRegion like ladder rungs; they live in
     Nameless.Dat, one record per source line. A line record carries:
@@ -3874,22 +3883,49 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
     breadth-first from the routine's object id and collect every line
     record encountered, then sort by sequence number.
 
+    Returns each line's *local* Number alongside its text (not just the
+    text) because a real project showed a routine (`SAMPLE_ROUTINE_05`) whose
+    raw Nameless.Dat line records fall into two distinct groups by their own
+    immediate nameless `parent_id` (the "region" node directly above the
+    line, one level up from the line itself in the routine -> map -> region
+    -> line tree) -- 92 lines under one parent (seq 1038-1129) and 93 under
+    another (seq 1130-1222), evidently an old/new pair of near-duplicate
+    snapshots of the same routine retained side by side, neither marked with
+    the usual 0xFFFFFFFF "stale shadow copy" sentinel. Real Studio 5000's own
+    native L5X export renders this as TWO back-to-back `<Line Number="...">`
+    runs, each independently 0-based (Number 0-91, then Number 0-92 again --
+    duplicated Number values across the two runs) -- not a single synthesized
+    contiguous 0..N-1 index across the whole routine, and not each line's own
+    raw stored seq value either (confirmed separately: a real single-group
+    routine's raw seq values start at an arbitrary project-wide offset like
+    1532, while its real Number attribute is still plain 0-based). So the
+    real rule is: group by immediate parent_id, sort each group by its own
+    seq, number each group locally from 0, and concatenate groups ordered by
+    ascending seq range -- confirmed exactly against SAMPLE_ROUTINE_05's real
+    L5X (the seq-1038-1129 group renders first, as Number 0-91, followed by
+    the seq-1130-1222 group as Number 0-92) plus 56 other real ST routines
+    that only ever have a single group, where this rule reduces to the
+    original plain contiguous-index behavior.
+
     Tag references appear as ``@hexid@`` placeholders (the referenced
-    comps object id in hex); they are batch-resolved to component names,
-    mirroring how rung text resolves ``&hexid:`` module references."""
-    lines: List[Tuple[int, str]] = []
+    comps object id in hex); they are batch-resolved to component names.
+    A real project also showed ``&hexid:`` module-address placeholders
+    (the same encoding rung text uses) appearing directly inside ST text
+    -- e.g. an I/O module reference like ``N2:5:I.Ch2Data`` written to
+    Nameless.Dat as ``&2a47752d:5:I.Ch2Data``. Both forms are resolved."""
+    lines: List[Tuple[int, int, str]] = []  # (parent_id, seq, text)
     frontier: List[int] = [routine_object_id]
     for _depth in range(6):
         if not frontier:
             break
         qmarks = ",".join("?" * len(frontier))
         cur.execute(
-            f"SELECT object_id, record FROM nameless WHERE parent_id IN ({qmarks})",
+            f"SELECT object_id, parent_id, record FROM nameless WHERE parent_id IN ({qmarks})",
             frontier,
         )
         rows = cur.fetchall()
         frontier = []
-        for oid, rec in rows:
+        for oid, parent_id, rec in rows:
             frontier.append(oid)
             if len(rec) < 24:
                 continue
@@ -3908,11 +3944,22 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
                 # routine, textually identical once these are excluded.
                 continue
             text, _ = _parse_fffeff(rec, 24)
-            lines.append((seq, text))
+            lines.append((parent_id, seq, text))
     if not lines:
         return []
-    lines.sort()
-    texts = [text for _seq, text in lines]
+
+    groups: Dict[int, List[Tuple[int, str]]] = {}
+    for parent_id, seq, text in lines:
+        groups.setdefault(parent_id, []).append((seq, text))
+    ordered_group_keys = sorted(groups.keys(), key=lambda k: min(s for s, _t in groups[k]))
+
+    local_numbers: List[int] = []
+    texts: List[str] = []
+    for key in ordered_group_keys:
+        group_lines = sorted(groups[key])
+        for i, (_seq, text) in enumerate(group_lines):
+            local_numbers.append(i)
+            texts.append(text)
 
     # Batch-resolve @hexid@ tag references to comp names.
     all_hex = set(re.findall(r"@([0-9a-fA-F]{1,8})@", " ".join(texts)))
@@ -3933,7 +3980,33 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[str]:
                     line,
                 )
             texts = [_resolve(t) for t in texts]
-    return texts
+
+    # Batch-resolve &hexid: module-address references to comp names -- the
+    # same encoding rung text uses (see RoutineBuilder.build() above). Found
+    # via a real project's ST content: I/O module addresses inside ST (e.g.
+    # "COND_TT_BKH_001 := N2:5:I.Ch2Data;") are stored as "&hexid:" (the
+    # rung-text encoding), not "@hexid@" -- both placeholder forms can appear
+    # in the same ST routine (@hexid@ for tag references, &hexid: for module
+    # addresses), so both must be resolved, not just one.
+    all_hex2 = set(re.findall(r"&([0-9a-f]{8}):", " ".join(texts)))
+    if all_hex2:
+        id_to_name2: Dict[str, str] = {}
+        for hex_id in all_hex2:
+            cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=?", (int(hex_id, 16),)
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                id_to_name2[hex_id] = row[0]
+        if id_to_name2:
+            def _resolve2(line: str) -> str:
+                return re.sub(
+                    r"&([0-9a-f]{8}):",
+                    lambda m: (id_to_name2[m.group(1)] + ":") if m.group(1) in id_to_name2 else m.group(0),
+                    line,
+                )
+            texts = [_resolve2(t) for t in texts]
+    return list(zip(local_numbers, texts))
 
 
 def _lookup_object_description(cur: Cursor, r, record: bytes) -> Union[str, None]:

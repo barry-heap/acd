@@ -1,7 +1,18 @@
-/* Placeholder palette -- swap for barry-heap/plc-studio's actual theme
-   values once that repo is reachable (see js/CLAUDE.md, "Dark mode"
-   section). Kept as CSS custom properties specifically so that swap is a
-   small diff here, not a rewrite of ui.js/build.js. */
+/* Light palette is this converter's own (PLC Studio has no light theme to
+   match). Dark palette is pulled verbatim from barry-heap/plc-studio's own
+   `<style>` block (its `:root{...}` custom properties), supplied by the
+   user as plc_studio.html, so this dark theme visually matches that app
+   family exactly rather than approximating it:
+     --bg:#0a0d12 --surface:#121922 --surface-2:#182230
+     --line:#3a4756 --line-dim:#26303c
+     --live:#2fd47a --amber:#e2a83f --fault:#e2554c
+     --ink:#cfd9e3 --ink-dim:#a0afbd --ink-bright:#eef4f9
+     --radius:2px
+   plc-studio also loads "IBM Plex Sans"/"IBM Plex Mono" from Google Fonts;
+   deliberately NOT fetched here (this converter ships as a single offline
+   file with zero network requests, see build.js) -- the font stack below
+   lists them first anyway so a machine that already has them installed
+   still gets the exact look, falling back to a system stack otherwise. */
 :root {
   --bg: #f5f6f8;
   --bg-elevated: #ffffff;
@@ -14,42 +25,45 @@
   --error: #b91c1c;
   --log-bg: #eef0f3;
   --track: #e2e5eb;
+  --radius: 8px;
 }
 
 :root[data-theme="dark"] {
-  --bg: #14161a;
-  --bg-elevated: #1b1e24;
-  --fg: #e6e8eb;
-  --fg-muted: #9aa1ac;
-  --border: #2c313a;
-  --accent: #5b8dfa;
-  --accent-fg: #0b1020;
-  --ok: #4ade80;
-  --error: #f87171;
-  --log-bg: #101318;
-  --track: #262a32;
+  --bg: #0a0d12;
+  --bg-elevated: #121922;
+  --fg: #cfd9e3;
+  --fg-muted: #a0afbd;
+  --border: #3a4756;
+  --accent: #2fd47a;
+  --accent-fg: #0a0d12;
+  --ok: #2fd47a;
+  --error: #e2554c;
+  --log-bg: #182230;
+  --track: #26303c;
+  --radius: 2px;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #14161a;
-    --bg-elevated: #1b1e24;
-    --fg: #e6e8eb;
-    --fg-muted: #9aa1ac;
-    --border: #2c313a;
-    --accent: #5b8dfa;
-    --accent-fg: #0b1020;
-    --ok: #4ade80;
-    --error: #f87171;
-    --log-bg: #101318;
-    --track: #262a32;
+    --bg: #0a0d12;
+    --bg-elevated: #121922;
+    --fg: #cfd9e3;
+    --fg-muted: #a0afbd;
+    --border: #3a4756;
+    --accent: #2fd47a;
+    --accent-fg: #0a0d12;
+    --ok: #2fd47a;
+    --error: #e2554c;
+    --log-bg: #182230;
+    --track: #26303c;
+    --radius: 2px;
   }
 }
 
 * { box-sizing: border-box; }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: var(--bg);
   color: var(--fg);
   margin: 0;
@@ -71,15 +85,16 @@ h1 {
 }
 
 code {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   background: var(--log-bg);
   padding: 0.1em 0.35em;
-  border-radius: 4px;
+  border-radius: var(--radius);
   font-size: 0.9em;
 }
 
 .drop {
   border: 2px dashed var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 2.5rem 1rem;
   text-align: center;
   cursor: pointer;
@@ -123,9 +138,9 @@ code {
   overflow-y: auto;
   background: var(--log-bg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius);
   padding: 0.5rem 0.75rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
   line-height: 1.5;
   color: var(--fg-muted);
@@ -138,7 +153,7 @@ code {
 .status {
   margin-top: 1rem;
   white-space: pre-wrap;
-  font-family: ui-monospace, monospace;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 0.85rem;
   min-height: 1.2em;
 }

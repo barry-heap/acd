@@ -69,7 +69,10 @@ def test_st_routine_content():
     assert st_routines, "fixture should contain an ST routine"
     st = st_routines[0]
     assert st._st_lines, "ST routine should have extracted source lines"
-    body = "\n".join(st._st_lines)
+    # ._st_lines is a list of (number, text) pairs -- number is each line's
+    # own local per-group L5X Number (see _st_routine_lines()), not just an
+    # array index.
+    body = "\n".join(text for _number, text in st._st_lines)
     assert ":=" in body
     assert "@" not in body, "tag references should be resolved to names"
     xml = st.to_xml()

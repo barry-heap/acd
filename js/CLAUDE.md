@@ -401,24 +401,128 @@ during a real `CuteLogix.ACD` conversion) captured 25 distinct width values clim
 freezing and jumping straight to 100%, which is what a synchronous (non-yielding) implementation
 would have produced.
 
-## Round 2: ST verification and dark mode — blocked
+## Round 2: ST verification against a real project — three real bugs found (two shared with Python)
 
-- **ST routine conversion** (`stRoutineLines` in `builders.js`): by inspection this already
-  matches the Python reference (`_st_routine_lines()` in `acd/l5x/elements.py`) faithfully —
-  same breadth-first `nameless` walk, same `0x01000002` record-type filter, same
-  `0xFFFFFFFF`-sequence-number skip, same `@hexid@` resolution. **Not yet verified against real
-  ST content**: none of the 4 local fixtures contain an ST routine (confirmed in Round 1's own
-  notes above), so this logic has never actually executed against real data end-to-end, only by
-  code-reading. Blocked on the user providing a real ACD project with ST routines plus a
-  matching Studio 5000 L5X export of one of them, per the task spec's own validation
-  requirement (byte-diff against Python wherever Python has real behavior to diff against).
-- **Dark mode** (`theme.css`): implemented with a placeholder palette (see the file's own header
-  comment) as CSS custom properties specifically so swapping in the real palette later is a
-  small diff, not a rewrite. Blocked on reaching `barry-heap/plc-studio`'s actual source for its
-  real color values — `add_repo` for that repository has failed twice in this session with
-  `MCP error -32003: MCP tool call requires approval` (a permission gate, not a "repo doesn't
-  exist" error). Needs either the session's permissions adjusted to allow that repo, or the
-  palette values supplied directly some other way.
+The user supplied a real production project (`SAMPLE_PROJECT_A.ACD`, 4.3MB, 64 ST routines)
+plus its own real Studio 5000 L5X export — the first ST-containing real data either this port or
+the Python reference had ever been checked against (no local fixture has any ST content). A
+position-by-position, whole-document diff (not just aggregate counts) against that real export
+found and fixed three real bugs, **two of them pre-existing in the Python reference itself**, not
+JS-port regressions — confirmed by reproducing each one in Python first, then porting the
+identical fix to JS:
+
+1. **`&hexid:` module-address placeholders inside ST text were never resolved.** Both
+   `_st_routine_lines()` (Python) and `stRoutineLines()` (JS) only resolved `@hexid@` (the
+   documented ST tag-reference form) — but a real routine's ST source can *also* contain the
+   rung-text `&hexid:` encoding directly, e.g. `COND_TT_BKH_001 := &2a47752d:5:I.Ch2Data;` needing
+   resolution to `COND_TT_BKH_001 := N2:5:I.Ch2Data;`. This affected the large majority of the 57
+   real ST routines checked (any one referencing an I/O module). Fixed in both languages by adding
+   a second batch-resolve pass for `&([0-9a-f]{8}):`, identical to the one rung text already uses.
+2. **`<Line Number="...">` was rendered from an array index, not real Studio's own numbering
+   rule.** Assumed (and true for 56 of 57 real routines, and every prior fixture) that Number is
+   just a plain 0-based position in the routine's whole line list. One real routine
+   (`SAMPLE_ROUTINE_05`) disproved this: its raw Nameless.Dat line records split into two distinct
+   groups by their own immediate parent_id (92 lines at seq 1038-1129, 93 lines at seq
+   1130-1222) — an old/new near-duplicate pair retained side by side, not marked with the usual
+   `0xFFFFFFFF` stale-shadow sentinel. Real Studio's own native L5X renders this as two back-to-back
+   `<Line Number="...">` runs, each independently 0-based (Number 0-91, then Number 0-92 again —
+   duplicated Number values across the runs), concatenated in ascending-seq-range order. Neither "one
+   flat contiguous index" nor "use each line's own raw stored seq value" (tried and disproven
+   first — a real *single-group* routine's raw seq starts at an arbitrary project-wide offset like
+   1532 while its real Number is still plain 0-based) is correct in general; the real rule is
+   *group by immediate parent_id, sort each group by seq, number each group locally from 0,
+   concatenate groups by ascending seq range* — which reduces to the original plain-index behavior
+   whenever a routine has only one group (the overwhelming common case). Fixed via
+   `_st_routine_lines()` returning `(number, text)` pairs instead of bare text (Python) /
+   `stRoutineLines()` returning `[number, text]` pairs via a new `stLineLocalNumbers()` helper
+   (JS), with `Routine.to_xml()`/`Routine.toXml()` rendering that number verbatim instead of
+   re-enumerating. `Routine._st_lines`'s shape changed accordingly in both languages (a test in
+   `test/test_api.py` that assumed bare strings was updated).
+3. **Non-ASCII text in `Description`/tag-comment fields was mangled to replacement characters
+   in JS specifically** (not a Python bug) — found via a whole-document diff against Python's own
+   output for the same real project: a tag description containing an en-dash (`Filter constant
+   (0.1–0.5)`) rendered correctly in Python but as `Filter constant (0.1<?><?>0.5)` in JS. Root
+   cause: `acd/generated/comments/fafa_coments.py`'s real generated Kaitai parser decodes
+   `AsciiRecord`/`Utf16Record`/`ControllerRecord`'s own `record_string` field as **UTF-8** (despite
+   the "Ascii" name) — `js/record/comments.js`'s port had it backwards, applying a strict
+   single-byte ASCII-with-replace decode (correct for the *other*, genuinely hand-parsed record
+   types — 5/6/7/8/11/15/16/17/19/21/24/29/30/37/39, which Python's own `comments.py` really does
+   `.decode("ascii", errors="replace")` for) to these three Kaitai-dispatched types too. Fixed by
+   adding `utf8DecodeStrict()` (TextDecoder with `fatal: true`, mirroring Python's un-guarded
+   `.decode("UTF-8")` raising on invalid bytes so the caller's existing outer try/catch drops the
+   record the same way) and using it for record_type 1/2/3/4/13/14/23/25 specifically, leaving
+   `asciiDecode` in place for every other type.
+
+A fourth real bug was found the same way (whole-document diff, not just ST) and is **JS-only**:
+4. **`Number.prototype.toFixed()` silently degrades to exponential notation for `abs(value) >=
+   1e21`** — an actual ECMA-262 requirement, not a browser quirk. `shortestFloat32Repr()`'s
+   brute-force decimal search (`js/l5x/render.js`, mirroring Python's `_shortest_float32_repr()`)
+   used `value.toFixed(decimals)` directly; for a REAL tag set to (approximately) float32's max
+   value (~3.4028235e38), Python's `f"{value:.0f}"` correctly produces the full 39-digit
+   fixed-point integer (confirmed to match real Studio 5000 output, per that function's own
+   docstring), while `(3.4028234663852886e+38).toFixed(0)` returns `"3.4028234663852886e+38"` (its
+   ordinary exponential `toString()`), silently producing the wrong literal shape for the
+   `Value="..."` attribute. Any double this large has no fractional part at all (its magnitude
+   already exceeds what a 52-bit mantissa can represent below the decimal point), so fixed via a
+   new `doubleToFixed(value, decimals)` that falls back to `BigInt(value).toString()` for
+   `abs(value) >= 1e21` — exact, no precision loss, and a no-op for every normal-magnitude value
+   (which still goes through native `toFixed`).
+
+**Verified end-to-end after all four fixes**: JS's converted output for this real project is
+**byte-for-byte identical** to the Python reference's own converted output for the same file
+(2,925,569 characters, zero differences, modulo `ExportDate`) — the strongest verification this
+port has had against real production data, not just the small bundled fixtures. All 57 real ST
+routines' 64 total occurrences (5,026 lines) match the real Studio L5X export exactly, including
+`SAMPLE_ROUTINE_05`'s duplicate-Number edge case. All 4 local fixtures re-verified unaffected
+(byte-identical to their established baselines) after every fix. Python's full test suite:
+105 passed, 2 skipped (up from 104/2 — one test's assumption about `_st_lines`' shape needed a
+one-line update for the new `(number, text)` tuple form; the other pre-existing 1 error is an
+unrelated missing `pytest-asyncio` plugin dependency for `test_database.py`, not caused by this
+round).
+
+**Methodological note**: bugs 1-2 were only found by comparing *every* ST routine's *exact*
+`<Line Number>`/text content against real Studio output, not just checking that some ST content
+round-trips or that aggregate line counts match — bug 2 in particular affects exactly 1 of 57 real
+routines and would be invisible to any check that doesn't diff the literal `Number` attribute
+value. Bugs 3-4 were only found by diffing the *entire* converted document against Python's own
+output for the same real file, not just the ST-specific sections — a lesson already stated
+elsewhere in both `CLAUDE.md` files but reconfirmed here: a fix that resolves the specific
+reported symptom (ST content) doesn't mean nearby, differently-triggered bugs in the same real
+document have been ruled out.
+
+## Round 2: dark mode matching plc-studio's real palette
+
+The user supplied `plc_studio.html` directly (their own app is a private repo `add_repo` couldn't
+reach — see the now-resolved blocker below). Its `<style>` block's own `:root{...}` CSS custom
+properties were pulled verbatim (`--bg:#0a0d12`, `--surface:#121922`/`--surface-2:#182230`,
+`--line:#3a4756`/`--line-dim:#26303c`, `--live:#2fd47a`, `--amber:#e2a83f`, `--fault:#e2554c`,
+`--ink:#cfd9e3`/`--ink-dim:#a0afbd`/`--ink-bright:#eef4f9`, `--radius:2px`) and mapped into this
+converter's own theme variable names in `theme.css`'s `:root[data-theme="dark"]` block (and the
+`@media (prefers-color-scheme: dark)` mirror), replacing the earlier placeholder palette. plc-
+studio's own `font-family` stack (`"IBM Plex Sans"`/`"IBM Plex Mono"`, loaded from Google Fonts in
+that app) is listed first in `body`/`code`/`.progress-log`/`.status`'s own font stacks here too,
+but the Google Fonts `<link>` itself is deliberately **not** added — this converter ships as a
+single offline file with zero network requests (see `build.js`'s own header comment), so the font
+only actually renders as IBM Plex on a machine that happens to already have it installed locally;
+everywhere else it falls through to the existing system-font fallback chain, unchanged in behavior
+from before this round. `--radius` is now a themed variable too (8px light / 2px dark, matching
+plc-studio's own consistently sharp-cornered look, used throughout `.drop`/`code`/`.progress-log`).
+
+**Verified visually**, not just by inspecting hex values: rendered `dist/acd-to-l5x.html` in real
+headless Chromium (Playwright) under both `colorScheme: "light"` and `colorScheme: "dark"`
+(`page.newPage({ colorScheme })`, no manual in-page toggle exists — this converter's dark mode is
+purely `prefers-color-scheme`-driven, same as before this round), including mid-conversion and
+completed-conversion screenshots against a real fixture (`CuteLogix.ACD`) to confirm the progress
+bar's green fill, the monospace log panel, and the "Done" success text all pick up the real
+plc-studio accent green (`#2fd47a`) and dark surface tones correctly, not just the static idle
+page.
+
+**Resolved blocker, for the record**: `add_repo` for `barry-heap/plc-studio` failed twice earlier
+in this session with `MCP error -32003: MCP tool call requires approval` (a permission gate, not a
+"repo doesn't exist" error) — never actually resolved; the user worked around it by exporting and
+attaching `plc_studio.html` directly instead of granting repo access, which turned out to be
+sufficient (and arguably better: it's the exact shipped `<style>` block, not a snapshot that could
+drift from a `.scss`/build-time source elsewhere in that repo).
 
 ## Dependencies
 

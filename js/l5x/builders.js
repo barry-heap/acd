@@ -896,27 +896,55 @@ function parseFffeff(data, offset) {
 
 const ST_LINE_RECORD_TYPE = 0x01000002;
 
+// Groups line records by their own immediate nameless parent_id (the
+// "region" node directly above the line, one level up in the routine ->
+// map -> region -> line tree), sorts each group by seq, and numbers each
+// group locally from 0 -- see the long comment above stRoutineLines's
+// return statement below for why this (not a flat global index, and not
+// each line's raw stored seq value) is what real Studio 5000 actually
+// renders as <Line Number="...">.
+function stLineLocalNumbers(lines) {
+  const groups = new Map();
+  for (const [parentId, seq, text] of lines) {
+    if (!groups.has(parentId)) groups.set(parentId, []);
+    groups.get(parentId).push([seq, text]);
+  }
+  const orderedKeys = [...groups.keys()].sort(
+    (a, b) => Math.min(...groups.get(a).map(([s]) => s)) - Math.min(...groups.get(b).map(([s]) => s)),
+  );
+  const localNumbers = [];
+  const texts = [];
+  for (const key of orderedKeys) {
+    const groupLines = groups.get(key).slice().sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+    groupLines.forEach(([, text], i) => {
+      localNumbers.push(i);
+      texts.push(text);
+    });
+  }
+  return [localNumbers, texts];
+}
+
 function stRoutineLines(db, routineObjectId) {
   const lines = [];
   let frontier = [routineObjectId];
   for (let depth = 0; depth < 6; depth++) {
     if (!frontier.length) break;
     const qmarks = frontier.map(() => "?").join(",");
-    const rows = queryAll(db, `SELECT object_id, record FROM nameless WHERE parent_id IN (${qmarks})`, frontier);
+    const rows = queryAll(db, `SELECT object_id, parent_id, record FROM nameless WHERE parent_id IN (${qmarks})`, frontier);
     frontier = [];
-    for (const [oid, rec] of rows) {
+    for (const [oid, parentId, rec] of rows) {
       frontier.push(oid);
       if (rec.length < 24) continue;
       if (dv(rec).getUint32(4, true) !== ST_LINE_RECORD_TYPE) continue;
       const seq = dv(rec).getUint32(20, true);
       if (seq === 0xffffffff) continue;
       const [text] = parseFffeff(rec, 24);
-      lines.push([seq, text]);
+      lines.push([parentId, seq, text]);
     }
   }
   if (!lines.length) return [];
-  lines.sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
-  let texts = lines.map(([, text]) => text);
+  const [localNumbers, texts0] = stLineLocalNumbers(lines);
+  let texts = texts0;
 
   const allHex = new Set();
   for (const t of texts) {
@@ -932,7 +960,37 @@ function stRoutineLines(db, routineObjectId) {
       texts = texts.map((line) => line.replace(/@([0-9a-fA-F]{1,8})@/g, (m, hex) => idToName.get(hex) || m));
     }
   }
-  return texts;
+
+  // Batch-resolve &hexid: module-address references too -- the same
+  // encoding rung text uses (see buildRoutine above). Found via a real
+  // project's ST content: I/O module addresses inside ST (e.g.
+  // "COND_TT_BKH_001 := N2:5:I.Ch2Data;") are stored as "&hexid:" (the
+  // rung-text encoding), not "@hexid@" -- both placeholder forms can
+  // appear in the same ST routine, so both must be resolved.
+  const allHex2 = new Set();
+  for (const t of texts) {
+    for (const m of t.matchAll(/&([0-9a-f]{8}):/g)) allHex2.add(m[1]);
+  }
+  if (allHex2.size) {
+    const idToName2 = new Map();
+    for (const hexId of allHex2) {
+      const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [parseInt(hexId, 16)]);
+      if (row && row[0]) idToName2.set(hexId, row[0]);
+    }
+    if (idToName2.size) {
+      texts = texts.map((line) =>
+        line.replace(/&([0-9a-f]{8}):/g, (m, hex) => (idToName2.has(hex) ? idToName2.get(hex) + ":" : m)),
+      );
+    }
+  }
+  // Returns [localNumber, text] pairs, not bare text -- see
+  // stLineLocalNumbers() above for why a routine's own raw Nameless.Dat
+  // structure can require independently-0-based numbering across more than
+  // one group, matching real Studio 5000's own native L5X output exactly
+  // (confirmed against a real project's SAMPLE_ROUTINE_05 routine, whose
+  // <Line Number="..."> genuinely repeats 0-91 across two back-to-back
+  // runs). Routine.toXml() renders this number verbatim, not re-enumerated.
+  return localNumbers.map((n, i) => [n, texts[i]]);
 }
 
 function lookupObjectDescription(db, r, record) {
