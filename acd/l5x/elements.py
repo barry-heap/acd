@@ -2184,6 +2184,7 @@ class Routine(L5xElement):
     _st_lines: List[Tuple[int, str]] = field(default_factory=list)
     _fbd_network: Union[Tuple[Dict, Dict, List], None] = field(default=None)
     _aoi_inout_order: Dict[str, List[str]] = field(default_factory=dict)
+    _fbd_bit_resolver: object = field(default=None)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -2223,7 +2224,9 @@ class Routine(L5xElement):
         elif self.type == "FBD" and self._fbd_network:
             blocks, iref_feeds, oref_writes = self._fbd_network
             if blocks or oref_writes:
-                content = _render_fbd_content(blocks, iref_feeds, oref_writes, self._aoi_inout_order)
+                content = _render_fbd_content(
+                    blocks, iref_feeds, oref_writes, self._aoi_inout_order, self._fbd_bit_resolver
+                )
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
 
 
@@ -4297,7 +4300,50 @@ def _parse_fbd_network(rungs: List[str]):
     return blocks, iref_feeds, oref_writes
 
 
-def _fbd_resolve_source(src: str, iref_feeds: Dict[str, str]) -> str:
+def _fbd_bool_field_by_index(fields: List, bit_index: int) -> Union[str, None]:
+    """Return the name of the Nth (0-based, in declaration order) BOOL-typed
+    field of a DataType's `members` or an AOI's `parameters` list -- the
+    resolution mechanism for `_fbd_resolve_source`'s bit-packed pseudo-tag
+    case (see that function's docstring). Only a real declared `BOOL` field
+    counts -- a UDT's own hidden bit-overlay backing field (typically
+    DINT/SINT) and its BIT-type pseudo-members are both a different
+    `data_type` value and so are correctly skipped by this same filter."""
+    bool_fields = [f for f in fields if f.data_type == "BOOL"]
+    if 0 <= bit_index < len(bool_fields):
+        return bool_fields[bit_index].name
+    return None
+
+
+def _fbd_make_bit_resolver(tag_dtype: Dict[str, str], aoi_by_name: Dict[str, "AOI"], data_types_map: Dict[str, "DataType"]):
+    """Build a `(member_chain, bit_index) -> friendly_name` resolver for
+    `_fbd_resolve_source`, closing over one routine's own name resolution
+    scope (`tag_dtype`: tag name -> DataType/AOI name, already merged
+    controller+program or controller+AOI per caller). `member_chain` is the
+    "Tag.BackingField" text `_fbd_resolve_source` already has in hand (the
+    backing field's own name is informational only -- not used, since the
+    resolution mechanism is purely positional -- see `_fbd_bool_field_by_index`)."""
+
+    def resolve(member_chain: str, bit_index: int) -> Union[str, None]:
+        if "." not in member_chain:
+            return None
+        tag_name, _backing_field = member_chain.rsplit(".", 1)
+        dtype = tag_dtype.get(tag_name)
+        if not dtype:
+            return None
+        aoi = aoi_by_name.get(dtype)
+        fields = aoi.parameters if aoi is not None else None
+        if fields is None:
+            dt = data_types_map.get(dtype.upper())
+            fields = dt.members if dt is not None else None
+        if fields is None:
+            return None
+        name = _fbd_bool_field_by_index(fields, bit_index)
+        return f"{tag_name}.{name}" if name is not None else None
+
+    return resolve
+
+
+def _fbd_resolve_source(src: str, iref_feeds: Dict[str, str], bit_resolver=None) -> str:
     """Resolve one wire's source expression back to its real tag.
 
     A pseudo-tag can be referenced with a trailing numeric bit-index (e.g.
@@ -4307,23 +4353,35 @@ def _fbd_resolve_source(src: str, iref_feeds: Dict[str, str]) -> str:
     fed from a tag's own hidden bit-host member, e.g.
     `MOV(TANK19_SUP.__BitHost00,__l2621AF94E947AB0D);` then
     `XIC(__l2621AF94E947AB0D.19)OTE(...)`). The base pseudo-tag resolves via
-    `iref_feeds` same as any other, but the bit INDEX itself is not further
-    resolved to its real named bit-overlay member (e.g. real Studio shows
-    `TANK19_SUP.OpenLS`, not a raw bit index) -- doing that would need the
-    feed tag's own DataType/UDT member list (which member has this bit
-    number and this backing field as its target), not available at this
-    decode layer. Left as `RealTag.__BitHost00.19` -- traceable back to a
-    real tag and a real bit position, just not the friendly member name."""
+    `iref_feeds` same as any other; the bit INDEX is then further resolved
+    to its real friendly field name (e.g. real Studio shows `TANK19_SUP.
+    OpenLS`, not a raw bit index) via `bit_resolver` (see
+    `_fbd_make_bit_resolver`), if one is supplied and the resolution
+    succeeds -- otherwise left as `RealTag.__BitHost00.19`, traceable back
+    to a real tag and a real bit position, just not the friendly name.
+
+    This is NOT specific to any one tag or DataType/AOI -- it is the general
+    mechanism for every FBD-compiled bit-packed feed found in a real
+    project (confirmed general, not a one-off, by checking whether this
+    shape reoccurs across all FBD routines in that project's `CLAUDE.md`
+    "FBD" section -- only one routine in that project happened to exercise
+    it, but the fix itself makes no assumption about which tag/DataType/AOI
+    is involved)."""
     if src in iref_feeds:
         return iref_feeds[src]
     if "." in src:
         base, suffix = src.split(".", 1)
         if base in iref_feeds:
-            return f"{iref_feeds[base]}.{suffix}"
+            resolved_base = iref_feeds[base]
+            if bit_resolver is not None and suffix.isdigit():
+                friendly = bit_resolver(resolved_base, int(suffix))
+                if friendly is not None:
+                    return friendly
+            return f"{resolved_base}.{suffix}"
     return src
 
 
-def _fbd_resolve_wires(blocks: Dict[str, Dict], iref_feeds: Dict[str, str]) -> List[Tuple[str, str]]:
+def _fbd_resolve_wires(blocks: Dict[str, Dict], iref_feeds: Dict[str, str], bit_resolver=None) -> List[Tuple[str, str]]:
     """Flatten every block's own wires_in into (source, "Op.Pin") pairs,
     resolving pseudo-tags back to their real feeder source. `dst` is
     already the fully-qualified "BlockOperand.Pin" form (it appeared
@@ -4331,7 +4389,7 @@ def _fbd_resolve_wires(blocks: Dict[str, Dict], iref_feeds: Dict[str, str]) -> L
     resolved = []
     for _block_operand, info in blocks.items():
         for dst, src in info["wires_in"].items():
-            resolved.append((_fbd_resolve_source(src, iref_feeds), dst))
+            resolved.append((_fbd_resolve_source(src, iref_feeds, bit_resolver), dst))
     return resolved
 
 
@@ -4355,6 +4413,7 @@ def _render_fbd_content(
     iref_feeds: Dict[str, str],
     oref_writes: List[Tuple[str, str]],
     aoi_inout_order: Union[Dict[str, List[str]], None] = None,
+    bit_resolver=None,
 ) -> str:
     """Render a decoded FBD block/wire graph as <FBDContent><Sheet>...
     XML. IDs are assigned deterministically (sorted by operand/tag name
@@ -4375,7 +4434,7 @@ def _render_fbd_content(
     a real project's ground truth), a completely different L5X shape from
     a built-in instruction's plain <Block>/<Wire> pin wiring."""
     aoi_inout_order = aoi_inout_order or {}
-    wires = _fbd_resolve_wires(blocks, iref_feeds)
+    wires = _fbd_resolve_wires(blocks, iref_feeds, bit_resolver)
 
     block_pins_seen: Dict[str, List[str]] = {}
     for _src, dst in wires:
@@ -5317,6 +5376,36 @@ class ControllerBuilder(L5xElementBuilder):
                 _attach_aoi_inout_order(_prog.routines)
             for _aoi in aois:
                 _attach_aoi_inout_order(_aoi.routines)
+
+        # Same post-hoc-attachment reason as _aoi_inout_order above: an FBD
+        # routine's compiled form can pack several BOOL fields into one
+        # shared word-sized feed (see _fbd_resolve_source's docstring), and
+        # resolving a packed bit index back to its real friendly field name
+        # needs each referenced tag's own DataType/AOI field list -- not
+        # available yet when RoutineBuilder first runs. `_aoi_by_name` and
+        # `all_data_types_map` are shared across every routine; only the
+        # tag-name -> DataType/AOI-name lookup needs to be scoped per
+        # program (program tags shadow same-named controller tags, standard
+        # Logix bare-name resolution) or per AOI (an AOI's own Parameters/
+        # LocalTags, plus controller tags).
+        _aoi_by_name = {aoi.name: aoi for aoi in aois}
+        _controller_tag_dtype = {t.name: t.data_type for t in tags if t.data_type}
+
+        def _attach_fbd_bit_resolver(routine_list: List[Routine], tag_dtype: Dict[str, str]) -> None:
+            resolver = _fbd_make_bit_resolver(tag_dtype, _aoi_by_name, all_data_types_map)
+            for _routine in routine_list:
+                if _routine.type == "FBD" and _routine._fbd_network:
+                    _routine._fbd_bit_resolver = resolver
+
+        for _prog in programs:
+            _prog_tag_dtype = dict(_controller_tag_dtype)
+            _prog_tag_dtype.update({t.name: t.data_type for t in _prog.tags if t.data_type})
+            _attach_fbd_bit_resolver(_prog.routines, _prog_tag_dtype)
+        for _aoi in aois:
+            _aoi_tag_dtype = dict(_controller_tag_dtype)
+            _aoi_tag_dtype.update({p.name: p.data_type for p in _aoi.parameters if p.data_type})
+            _aoi_tag_dtype.update({lt.name: lt.data_type for lt in _aoi.local_tags if lt.data_type})
+            _attach_fbd_bit_resolver(_aoi.routines, _aoi_tag_dtype)
 
         _aoi_param_names = {
             aoi.name.upper(): {p.name for p in aoi.parameters} for aoi in aois

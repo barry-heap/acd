@@ -662,3 +662,17 @@ documents for this attribute). Also re-verified the two small local fixtures
 identical `<Routine>` output between Python and JS. Full `npm test` (extract/parse/records/ingest
 verification) and the full Python `pytest` suite both still pass with no regressions after this
 change.
+
+**Round 3 follow-up: ported the `UNIT_STATUS` bit-index-resolution fix too** (see root `CLAUDE.md`'s
+"FBD" section for the full investigation — the fix turned out to be a positional lookup among an
+AOI's own BOOL-typed `Parameter`s, not the UDT bit-overlay mechanism originally assumed).
+`fbdBoolFieldByIndex()`/`fbdMakeBitResolver()` (`js/l5x/elements.js`) mirror `_fbd_bool_field_by_
+index()`/`_fbd_make_bit_resolver()` exactly; `fbdResolveSource()`/`fbdResolveWires()`/
+`renderFbdContent()` all thread an extra `bitResolver` parameter through, same shape as Python's.
+`buildController()` (`js/l5x/builders.js`) attaches `_fbdBitResolver` per program/AOI right after
+the existing `aoiInoutOrder` attachment block, scoped the same way (program tags shadow controller
+tags; an AOI's own `parameters`/`localTags` plus controller tags). Re-verified the full real
+project end to end after this fix: all 28 FBD routines (including `UNIT_STATUS` itself, now
+resolving to `TANK19_SUP.OpenLS` etc. instead of `TANK19_SUP.__BitHost00.19`) and the entire
+full-project L5X document are byte-for-byte identical between Python and JS once more (again
+modulo the expected per-run `ExportDate`). `npm test` still passes with no regressions.

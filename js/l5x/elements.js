@@ -220,32 +220,83 @@ class Module extends L5xElement {
   }
 }
 
+// Return the name of the Nth (0-based, in declaration order) BOOL-typed
+// field of a DataType's `members` or an AOI's `parameters` array -- the
+// resolution mechanism for fbdResolveSource's bit-packed pseudo-tag case
+// (see that function's comment). Only a real declared BOOL field counts --
+// a UDT's own hidden bit-overlay backing field (typically DINT/SINT) and
+// its BIT-type pseudo-members are both a different dataType value and so
+// are correctly skipped by this same filter. Verified against a real
+// project (RefProjA_V33_R17_4.ACD): an AOI-instance tag's compiled FBD
+// feed's bit index N is the Nth BOOL-typed Parameter of that AOI, counting
+// only BOOL fields -- e.g. AOI_VALVE's bit 19/20/27/11/17 are its
+// OpenLS/CloseLS/Mismatch/Opening/Closing parameters respectively, only
+// once non-BOOL parameters (DINT/INT/FBD_TIMER) are excluded from the count.
+function fbdBoolFieldByIndex(fields, bitIndex) {
+  const boolFields = fields.filter((f) => f.dataType === "BOOL");
+  return bitIndex >= 0 && bitIndex < boolFields.length ? boolFields[bitIndex].name : null;
+}
+
+// Build a (memberChain, bitIndex) -> friendlyName resolver for
+// fbdResolveSource, closing over one routine's own name resolution scope
+// (tagDtype: tag name -> DataType/AOI name, already merged controller+
+// program or controller+AOI per caller). memberChain is the "Tag.
+// BackingField" text fbdResolveSource already has in hand (the backing
+// field's own name is informational only -- not used, since the
+// resolution mechanism is purely positional, see fbdBoolFieldByIndex).
+function fbdMakeBitResolver(tagDtype, aoiByName, dataTypesMap) {
+  return function resolve(memberChain, bitIndex) {
+    const lastDot = memberChain.lastIndexOf(".");
+    if (lastDot < 0) return null;
+    const tagName = memberChain.slice(0, lastDot);
+    const dtype = tagDtype.get(tagName);
+    if (!dtype) return null;
+    const aoi = aoiByName.get(dtype);
+    let fields = aoi ? aoi.parameters : null;
+    if (!fields) {
+      const dt = dataTypesMap.get(dtype.toUpperCase());
+      fields = dt ? dt.members : null;
+    }
+    if (!fields) return null;
+    const name = fbdBoolFieldByIndex(fields, bitIndex);
+    return name !== null ? `${tagName}.${name}` : null;
+  };
+}
+
 // Resolve one FBD wire's source expression back to its real tag. A
 // pseudo-tag can be referenced with a trailing numeric bit-index (e.g.
 // "__l2621AF94E947AB0D.19") when several boolean IRefs are packed into one
 // word-sized feed -- the base pseudo-tag resolves via irefFeeds same as any
-// other, but the bit INDEX itself is not further resolved to its real named
-// bit-overlay member (that would need the feed tag's own DataType/UDT
-// member list, not available at this decode layer). See CLAUDE.md's "FBD"
-// section for the full explanation and the one known routine this affects.
-function fbdResolveSource(src, irefFeeds) {
+// other; the bit INDEX is then further resolved to its real friendly field
+// name via bitResolver (see fbdMakeBitResolver), if one is supplied and the
+// resolution succeeds -- otherwise left as "RealTag.__BitHost00.19",
+// traceable back to a real tag and a real bit position, just not the
+// friendly name. See CLAUDE.md's "FBD" section for the full explanation.
+function fbdResolveSource(src, irefFeeds, bitResolver) {
   if (irefFeeds.has(src)) return irefFeeds.get(src);
   if (src.includes(".")) {
     const dotIdx = src.indexOf(".");
     const base = src.slice(0, dotIdx);
     const suffix = src.slice(dotIdx + 1);
-    if (irefFeeds.has(base)) return `${irefFeeds.get(base)}.${suffix}`;
+    if (irefFeeds.has(base)) {
+      const resolvedBase = irefFeeds.get(base);
+      if (bitResolver && /^\d+$/.test(suffix)) {
+        const friendly = bitResolver(resolvedBase, parseInt(suffix, 10));
+        if (friendly !== null) return friendly;
+      }
+      return `${resolvedBase}.${suffix}`;
+    }
   }
   return src;
 }
 
 // Flatten every block's own wiresIn into [source, "Op.Pin"] pairs,
 // resolving pseudo-tags back to their real feeder source.
-function fbdResolveWires(blocks, irefFeeds) {
+function fbdResolveWires(blocks, irefFeeds, bitResolver) {
   const resolved = [];
   for (const info of blocks.values()) {
     for (const [dst, src] of info.wiresIn) {
-      resolved.push([fbdResolveSource(src, irefFeeds), dst]);
+      resolved.push([fbdResolveSource(src, irefFeeds, bitResolver), dst]);
     }
   }
   return resolved;
@@ -282,9 +333,9 @@ function fbdSplitPinRef(ref, blocks) {
 // <InOutParameter Name="..." Argument="..."/> children, a completely
 // different L5X shape from a built-in instruction's plain <Block>/<Wire>
 // pin wiring.
-function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder) {
+function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder, bitResolver) {
   aoiInoutOrder = aoiInoutOrder || new Map();
-  const wires = fbdResolveWires(blocks, irefFeeds);
+  const wires = fbdResolveWires(blocks, irefFeeds, bitResolver);
 
   const blockPinsSeen = new Map();
   for (const [, dst] of wires) {
@@ -399,6 +450,7 @@ class Routine extends L5xElement {
     this._stLines = opts.stLines || [];
     this._fbdNetwork = opts.fbdNetwork || null;
     this._aoiInoutOrder = opts.aoiInoutOrder || new Map();
+    this._fbdBitResolver = opts.fbdBitResolver || null;
   }
 
   toXml() {
@@ -432,7 +484,7 @@ class Routine extends L5xElement {
     } else if (this.type === "FBD" && this._fbdNetwork) {
       const { blocks, irefFeeds, orefWrites } = this._fbdNetwork;
       if (blocks.size || orefWrites.length) {
-        content = renderFbdContent(blocks, irefFeeds, orefWrites, this._aoiInoutOrder);
+        content = renderFbdContent(blocks, irefFeeds, orefWrites, this._aoiInoutOrder, this._fbdBitResolver);
       }
     }
     return `<Routine Name="${escapeXmlAttr(this.name)}" Type="${this.type}">${descXml}${content}</Routine>`;
@@ -637,6 +689,8 @@ module.exports = {
   Parameter,
   Module,
   Routine,
+  fbdBoolFieldByIndex,
+  fbdMakeBitResolver,
   fbdResolveSource,
   fbdResolveWires,
   fbdSplitPinRef,

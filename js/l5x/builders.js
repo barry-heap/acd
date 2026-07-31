@@ -11,6 +11,7 @@ const { Module } = require("./elements");
 const { CATALOG_NUMBERS } = require("./catalog_numbers");
 const { Tag } = require("./tag");
 const { Parameter, LocalTag, Routine, AOI, Program, Task, EventInfo, ScheduledProgram, Controller, RSLogix5000Content } = require("./elements");
+const { fbdMakeBitResolver } = require("./elements");
 const { decodeUdtInitialValue } = require("./render");
 const { readTagInitialValue, countArrayElements, SKIP_DECORATED } = require("./render");
 
@@ -1962,6 +1963,37 @@ async function buildController(db, onProgress = null) {
     };
     for (const p of programs) attachAoiInoutOrder(p.routines);
     for (const aoi of aois) attachAoiInoutOrder(aoi.routines);
+  }
+
+  // Same post-hoc-attachment reason as aoiInoutOrder above: an FBD
+  // routine's compiled form can pack several BOOL fields into one shared
+  // word-sized feed (see fbdResolveSource's comment in elements.js), and
+  // resolving a packed bit index back to its real friendly field name needs
+  // each referenced tag's own DataType/AOI field list -- not available yet
+  // when buildRoutine() first runs. aoiByName and dataTypesMap are shared
+  // across every routine; only the tag-name -> DataType/AOI-name lookup
+  // needs to be scoped per program (program tags shadow same-named
+  // controller tags, standard Logix bare-name resolution) or per AOI (an
+  // AOI's own Parameters/LocalTags, plus controller tags).
+  const aoiByName = new Map(aois.map((aoi) => [aoi.name, aoi]));
+  const controllerTagDtype = new Map(tags.filter((t) => t.dataType).map((t) => [t.name, t.dataType]));
+
+  const attachFbdBitResolver = (routineList, tagDtype) => {
+    const resolver = fbdMakeBitResolver(tagDtype, aoiByName, dataTypesMap);
+    for (const routine of routineList) {
+      if (routine.type === "FBD" && routine._fbdNetwork) routine._fbdBitResolver = resolver;
+    }
+  };
+  for (const p of programs) {
+    const progTagDtype = new Map(controllerTagDtype);
+    for (const t of p.tags) if (t.dataType) progTagDtype.set(t.name, t.dataType);
+    attachFbdBitResolver(p.routines, progTagDtype);
+  }
+  for (const aoi of aois) {
+    const aoiTagDtype = new Map(controllerTagDtype);
+    for (const p of aoi.parameters) if (p.dataType) aoiTagDtype.set(p.name, p.dataType);
+    for (const lt of aoi.localTags) if (lt.dataType) aoiTagDtype.set(lt.name, lt.dataType);
+    attachFbdBitResolver(aoi.routines, aoiTagDtype);
   }
 
   const devCollRow = queryOne(db, "SELECT object_id FROM comps WHERE parent_id=? AND comp_name='RxMapDeviceCollection'", [

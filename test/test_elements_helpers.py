@@ -4,6 +4,8 @@ import struct
 from datetime import datetime
 from xml.dom import minidom
 
+from types import SimpleNamespace
+
 from acd.l5x.elements import (
     DataType,
     Member,
@@ -12,6 +14,9 @@ from acd.l5x.elements import (
     _decode_string_family_value,
     _decorated_real_literal,
     _escape_xml_attr,
+    _fbd_bool_field_by_index,
+    _fbd_make_bit_resolver,
+    _fbd_resolve_source,
     _filetime_to_iso,
     _get_type_size,
     _l5k_real_literal,
@@ -481,3 +486,65 @@ def test_st_routine_lines_resolves_nested_hexid_placeholders():
     lines = _st_routine_lines(cur, routine_oid)
 
     assert lines == [(0, "X := N2:5:I.Ch2Data;")]
+
+
+def _fld(name, data_type):
+    return SimpleNamespace(name=name, data_type=data_type)
+
+
+def test_fbd_bool_field_by_index_counts_only_bool_fields():
+    # Regression test for the UNIT_STATUS FBD bit-resolution gap: real
+    # Studio 5000 ground truth for a real project (RefProjA_V33_R17_4.ACD)
+    # showed a compiled FBD feed's bit index N corresponds to the Nth
+    # (0-based) BOOL-typed field in declaration order, NOT the field's own
+    # position among ALL fields -- verified against a real AOI (AOI_VALVE)
+    # with 38 parameters, only some of which are BOOL, where every one of 5
+    # real bit-index/name pairs (11->Opening, 17->Closing, 19->OpenLS,
+    # 20->CloseLS, 27->Mismatch) only lines up when non-BOOL fields
+    # (DINT/INT/FBD_TIMER) are excluded from the count first.
+    fields = [
+        _fld("EnableIn", "BOOL"),  # 0
+        _fld("STATE", "DINT"),  # not counted
+        _fld("Opening", "BOOL"),  # 1
+        _fld("TOC", "DINT"),  # not counted
+        _fld("Closing", "BOOL"),  # 2
+        _fld("Timer", "FBD_TIMER"),  # not counted
+        _fld("OpenLS", "BOOL"),  # 3
+    ]
+    assert _fbd_bool_field_by_index(fields, 0) == "EnableIn"
+    assert _fbd_bool_field_by_index(fields, 1) == "Opening"
+    assert _fbd_bool_field_by_index(fields, 2) == "Closing"
+    assert _fbd_bool_field_by_index(fields, 3) == "OpenLS"
+    assert _fbd_bool_field_by_index(fields, 4) is None  # out of range
+
+
+def test_fbd_make_bit_resolver_resolves_aoi_instance_tag():
+    # End-to-end (resolver + _fbd_resolve_source) regression for the general
+    # mechanism: any AOI-instance-typed tag's compiled bit-packed feed
+    # resolves through the tag's own DataType (an AOI name here) to that
+    # AOI's own Nth BOOL parameter -- not hardcoded to any one tag/AOI name.
+    aoi = SimpleNamespace(
+        parameters=[
+            _fld("EnableIn", "BOOL"),
+            _fld("STATE", "DINT"),
+            _fld("OpenLS", "BOOL"),
+            _fld("CloseLS", "BOOL"),
+        ]
+    )
+    resolver = _fbd_make_bit_resolver({"TANK16_SUP": "AOI_VALVE"}, {"AOI_VALVE": aoi}, {})
+    assert resolver("TANK16_SUP.__BitHost00", 2) == "TANK16_SUP.CloseLS"
+    assert resolver("TANK16_SUP.__BitHost00", 0) == "TANK16_SUP.EnableIn"
+    # Unknown tag / no matching AOI or DataType -> caller falls back to the
+    # raw bit-index form rather than guessing.
+    assert resolver("UNKNOWN_TAG.__BitHost00", 0) is None
+
+
+def test_fbd_resolve_source_uses_bit_resolver_when_available():
+    iref_feeds = {"__lHEX": "TANK16_SUP.__BitHost00"}
+    aoi = SimpleNamespace(parameters=[_fld("OpenLS", "BOOL"), _fld("CloseLS", "BOOL")])
+    resolver = _fbd_make_bit_resolver({"TANK16_SUP": "AOI_VALVE"}, {"AOI_VALVE": aoi}, {})
+    assert _fbd_resolve_source("__lHEX.1", iref_feeds, resolver) == "TANK16_SUP.CloseLS"
+    # No resolver (or resolution fails) -> falls back to the raw, still-
+    # traceable bit-index form rather than raising or guessing.
+    assert _fbd_resolve_source("__lHEX.1", iref_feeds, None) == "TANK16_SUP.__BitHost00.1"
+    assert _fbd_resolve_source("__lHEX.99", iref_feeds, resolver) == "TANK16_SUP.__BitHost00.99"

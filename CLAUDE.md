@@ -283,11 +283,11 @@ a hard error since callers mostly only care whether IO is input-like or output-l
   `.description` **Python property** (`Member.description`/`Tag.description`) still
   deliberately collapses to one line — that's documented, existing convenience-API behavior,
   separate from XML fidelity.
-- FBD and SFC routine content is still not decoded — only `RLL` (ladder, via `SbRegion.Dat`) and
-  `ST` (structured text, via `Nameless.Dat`, see below) routine bodies are exported; an FBD/SFC
-  routine still exports as an empty `<Routine Type="FBD"/>`/`<Routine Type="SFC"/>` with no
-  `<SheetContent>`/`<STContent>`-equivalent — nobody has reverse-engineered their storage format
-  yet (adapted from an upstream `hutcheb/acd` PR that only covered ST).
+- SFC routine content is still not decoded — only `RLL` (ladder, via `SbRegion.Dat`), `ST`
+  (structured text, via `Nameless.Dat`, see below), and `FBD` (Function Block Diagram, see the
+  "FBD" section below) routine bodies are exported; an SFC routine still exports as an empty
+  `<Routine Type="SFC"/>` with no `<SheetContent>`-equivalent — nobody has reverse-engineered its
+  storage format yet.
 
 ## Structured Text (ST) routine content (`_st_routine_lines`)
 
@@ -454,19 +454,51 @@ rungs to recover.
 (`programs[*].routines` + `aois[*].routines`) in the real 28-routine project, matched each
 against its own real Studio 5000 L5X export (disambiguating same-named routines by
 Program/AOI scope, since e.g. multiple AOIs each have a routine literally named "Logic"), and
-diffed blocks/wires/oref-writes/InOutParameter sets programmatically (not by eye) — **27/28
-routines match exactly**. Confirmed **zero multi-sheet FBD routines exist anywhere in this
+diffed blocks/wires/oref-writes/InOutParameter sets programmatically (not by eye) — **28/28
+routines match exactly** (see the `UNIT_STATUS` bit-index gap below for the one that initially
+missed and how it was closed). Confirmed **zero multi-sheet FBD routines exist anywhere in this
 project** (every one of the 28 has exactly one `<Sheet>`) — multi-sheet handling is therefore
 **untested**, not proven to work; treat it as an open risk if a future project has one, don't
 assume the single-sheet renderer generalizes.
 
-**Known gap (1 routine, fully understood, not mysterious)**: `UNIT_STATUS` is the sole mismatch.
-Its wires resolve to `RealTag.__BitHost00.N` (a bit index into the pseudo-tag's own hidden
-bit-host member) where real Studio shows the friendly bit-overlay member name instead (e.g.
-`TANK19_SUP.OpenLS`). Fixing this needs the fed tag's own DataType/UDT member list (which member
-has this bit number and this backing field as its target) cross-referenced at this decode layer,
-which `_fbd_resolve_source()` doesn't have access to today — left as a documented limitation
-rather than guessed at.
+**`UNIT_STATUS` bit-index gap — SOLVED (was the sole mismatch, now 28/28 exact).** Its wires
+resolved to `RealTag.__BitHost00.N` (a bit index into the pseudo-tag's own packed feed) where real
+Studio shows a friendly field name instead (e.g. `TANK19_SUP.OpenLS`). Investigated two scope
+questions before fixing, per explicit ask, rather than assuming either answer:
+
+- **Is this a `UNIT_STATUS`/one-tag special case, or general?** General — and NOT the UDT
+  bit-overlay mechanism (TIMER/COUNTER's `EN`/`TT`/`DN`-style hidden-backing-field/`bit_number`/
+  `target` triple) this was originally assumed to need. The referenced tags (`TANK16_SUP`,
+  `TANK16_RET`, `TANK19_SUP`, `TANK19_RET`) all turned out to be **AOI-instance** tags (`data_type ==
+  "AOI_VALVE"`), and `Parameter` objects (an AOI's own declared fields) have no `bit_number`/
+  `target` at all — confirming the UDT mechanism literally can't apply here. Cross-referencing
+  every real `(bit_index -> friendly_name)` pair against `AOI_VALVE`'s own declared `parameters` list
+  found the actual rule: **the bit index is the field's own 0-based position among that type's
+  BOOL-typed fields only** (skipping DINT/INT/FBD_TIMER fields) — verified exactly for all 5 real
+  pairs (`11→Opening, 17→Closing, 19→OpenLS, 20→CloseLS, 27→Mismatch`), which only line up once
+  non-BOOL fields are excluded from the count first. Implemented generically
+  (`_fbd_bool_field_by_index()` counts BOOL-typed entries in either a `DataType`'s `members` or an
+  AOI's `parameters`, keyed off whichever the tag's own `data_type` resolves to via
+  `_fbd_make_bit_resolver()`) — not special-cased to `AOI_VALVE`/`UNIT_STATUS` by name. The UDT-member
+  path (`dt.members`) is included in the same generic function for when a future project's tag
+  happens to be UDT-typed instead of AOI-typed, but is **unverified** — only the AOI-instance case
+  has real ground truth backing it; treat the UDT branch as inferred-by-analogy until a real UDT
+  case is found and checked.
+- **Is `UNIT_STATUS` the only routine affected in this project, or just the first one it surfaced
+  on?** Scanned every one of the 28 FBD routines' resolved wire sources for the same
+  `Tag.BackingField.N` (bit-suffixed, unresolved) shape — `UNIT_STATUS` is the **only** one in this
+  project that exercises it; every other routine's 27/28 exact match was never masking a
+  same-class miss elsewhere.
+
+Resolution needs each referenced tag's own DataType/AOI scope, not available when `RoutineBuilder`
+first runs — attached post-hoc in `ControllerBuilder.build()` (`_fbd_bit_resolver`, the same
+after-the-fact pattern as `_aoi_inout_order`), scoped per program (program tags shadow same-named
+controller tags) or per AOI (that AOI's own `parameters`/`local_tags`, plus controller tags).
+Re-verified all 28 FBD routines after the fix: **28/28 exact match**, confirming no regression on
+the 27 that already passed. Synthetic unit tests (`test_fbd_bool_field_by_index_counts_only_bool_
+fields`, `test_fbd_make_bit_resolver_resolves_aoi_instance_tag`,
+`test_fbd_resolve_source_uses_bit_resolver_when_available`) lock in the mechanism independent of
+any real ACD fixture, since neither local fixture has an AOI-instance tag with a packed bit feed.
 
 **A second, distinct instruction convention found via broader fixture testing (NOT the main
 verified project)**: re-running the pre-existing small repo fixtures `ACDTestsWithAOI.ACD`/
@@ -1845,7 +1877,24 @@ just documented accurately somewhere in the file.
 - Some AB module DataType names contain `:` (e.g. `CHANNEL_DI_TIMESTAMP:O:0`), which is invalid
   in Windows paths — anything that turns a comp name into a filename/directory (see
   `DumpCompsRecords` in `elements.py`) needs to sanitize it first.
-- The full suite (`pytest` from repo root) should show `77 passed, 2 skipped, 0 failed`. If you
-  see `FileNotFoundError`s or `PermissionError`s across many unrelated test files, first check
-  you're not missing the `conftest.py` chdir behavior or that a previous test crashed and left
-  a locked SQLite file/build artifact behind.
+- The full suite (`pytest` from repo root) should show all real tests passing and 2 skipped (the
+  exact passed count grows as tests are added — as of this writing, 109). If you see
+  `FileNotFoundError`s or `PermissionError`s across many unrelated test files, first check you're
+  not missing the `conftest.py` chdir behavior or that a previous test crashed and left a locked
+  SQLite file/build artifact behind.
+- **One test, `test_database.py::test_open_file`, errors in this dev container specifically —
+  confirmed pre-existing and environmental, not a code bug.** It errors with `'test_open_file'
+  requested an async fixture 'sample_acd', with no plugin or hook that handled it`. Root cause,
+  confirmed rather than assumed: `sample_acd`/`sbregion_dat` (both `async def` fixtures, needing no
+  `await` at all — plain synchronous `Unzip(...)`/`DbExtract(...)` calls, likely an authoring
+  mistake) were introduced together with this test file itself (commit `1c57142`), and that same
+  commit's `setup.py` already lists `pytest-asyncio` as a required dev dependency for exactly this
+  reason — but `pytest-asyncio` isn't actually installed in this environment (`pip show
+  pytest-asyncio` finds nothing), so pytest has no plugin to run an async fixture through. This is
+  an environment-provisioning gap (this container wasn't set up via the documented `pip install -e
+  ".[dev]"`), not a defect in the fixtures or the code under test — installing `pytest-asyncio`
+  would make it pass as originally intended. Confirmed narrow scope: only this one test function
+  uses those two fixtures; nothing else in the suite depends on them, and no other test's outcome
+  is affected. Already independently identified once before (see `js/CLAUDE.md`'s Round 2 section),
+  so this isn't a new finding — re-documented here since it keeps resurfacing in every fresh
+  `pytest` run's output and is worth not re-investigating from scratch each time.
