@@ -456,10 +456,82 @@ against its own real Studio 5000 L5X export (disambiguating same-named routines 
 Program/AOI scope, since e.g. multiple AOIs each have a routine literally named "Logic"), and
 diffed blocks/wires/oref-writes/InOutParameter sets programmatically (not by eye) — **28/28
 routines match exactly** (see the `UNIT_STATUS` bit-index gap below for the one that initially
-missed and how it was closed). Confirmed **zero multi-sheet FBD routines exist anywhere in this
-project** (every one of the 28 has exactly one `<Sheet>`) — multi-sheet handling is therefore
-**untested**, not proven to work; treat it as an open risk if a future project has one, don't
-assume the single-sheet renderer generalizes.
+missed and how it was closed). That project has **zero multi-sheet FBD routines** (every one of
+the 28 has exactly one `<Sheet>`) — see the "Multi-sheet FBD" section below for that case, solved
+and verified separately against a different real project.
+
+## Multi-sheet FBD — SOLVED, verified against a real 2-sheet project
+
+A genuinely multi-sheet FBD routine (`FBDLevelControlSimulation.ACD`/`.L5X`, a Rockwell sample
+project, 2 sheets: "Level_control_and_simulation" and "Agitator_control") answered the open
+question above. **The compiled ladder-equivalent network is one continuous flat pool spanning
+every sheet, with zero trace of any sheet boundary in it at all** — confirmed directly: a real
+cross-sheet link (block `HLL_01` on sheet 1 feeding block `GRT_01` on sheet 2, via a
+user-named `OCon`/`ICon` connector pair called `"TankLevel"` in the FBD editor) compiles down to
+one ordinary direct rung (`MOV(HLL_01.Out,GRT_01.SourceA);`) — the connector name never appears
+anywhere in the compiled rung text. `_fbd_shadow_region()`/`_parse_fbd_network()` therefore need
+**zero changes** for multi-sheet routines; they already recover every block/wire correctly
+regardless of sheet, exactly as they did for the single-sheet case.
+
+Sheet **membership** and connector **identity** are a wholly separate, parallel metadata tree
+(`_fbd_decode_sheets()`), hanging off `shadow_oid`'s own nameless `parent_id` (not the
+compiled-rung subtree). Reverse-engineered structure, verified byte-for-byte against the real
+2-sheet ground truth (every block/IRef/ORef/connector's resolved name AND its real X/Y position
+matched exactly, though X/Y is unused, still out of scope):
+- One "sheet description" node per sheet: `record_type` `0x01000002`, a flag `u32` at offset 16
+  equal to exactly `0x00010003` (the discriminator that distinguishes a genuine sheet-description
+  node from an ordinary per-element node that also happens to have its own child and an fffeff
+  string of its own — e.g. a `DEDT` block's own `StorageArray` array-reference child, or a `PIDE`
+  block's own extra metadata child — both initially false-positive-matched a looser filter before
+  this exact flag value was found), an fffeff-encoded description string (same encoding ST source
+  lines use), and a `u32` at offset 20 giving this sheet's own seq value — ascending seq order is
+  real Sheet Number order (verified exact: seq 0 → Sheet 1, seq 20 → Sheet 2).
+- Each sheet-description node has two meaningful children (plus occasional empty/unused reserved
+  container slots, safely ignored):
+  - an **elements** container: one child per `IRef`/`ORef`/`OCon`/`ICon`/`Block`/
+    `AddOnInstruction` on that sheet. A plain tagref element (`record_type` `0x01000002`) carries
+    an fffeff string, either a literal (`"20"`) or an `@hexid@` tag reference resolved the same
+    way rung/ST text is. A connector element (`record_type` `0x01000000`) has no string of its
+    own — its own trailing 4 bytes are the object_id of a *shared* leaf fffeff-string node (0
+    children) holding the connector's Name, the same node its partner element on the other sheet
+    also points to, which is how an `OCon` and its `ICon` are correlated as the same named
+    connector.
+  - a **wires** container: one child per `Wire`/`FeedbackWire` on that sheet, each a fixed
+    40-byte record whose own flag `u32` at offset 16 has high word `7` (`0x0007xxxx`) — the
+    reliable discriminator between this and the (variably-sized) elements container. `u32`s at
+    offsets 24/32 are the FROM/TO element's own object_id (matched back to the elements list by
+    identity, not by the numeric per-block-type pin "code" also present at offsets 28/36 — that
+    code is a Rockwell-internal per-instruction-TYPE pin enumeration, not a byte offset or member
+    index, and is **not** decoded at all: the real pin NAME for rendering always comes from the
+    already-verified flat compiled-rung decode, this tree is only consulted for sheet membership
+    and connector identity). The flag's low word distinguishes a real `<FeedbackWire>` (`0x12`)
+    from a plain `<Wire>` (`0x11`) — verified against the same ground truth's two genuine feedback
+    connections (e.g. `LevelController.CVEU` feeding back into `DEDT_01.In`, an upstream block it
+    also feeds forward into elsewhere).
+
+**Rendering** (`_render_fbd_content()`'s `sheet_layout` parameter): classifies every decoded wire/
+oref-write as same-sheet (one ordinary `<Wire>`/`<FeedbackWire>`) or cross-sheet (needs an
+`OCon`/`ICon` pair instead) purely from `operand_to_sheet` — the compiled network itself has no
+notion of sheet at all, so this decision comes entirely from the separate metadata tree above. A
+cross-sheet wire is matched to its real connector Name by object-identity correlation
+(`connector_feed`'s recorded feeder/consumer operand pair), not by guessing from sheet numbers
+alone — this stays correct even if a future project has multiple different connectors spanning
+the same two sheets. There is deliberately only **one** rendering implementation, not two parallel
+single-sheet/multi-sheet code paths: when `sheet_layout` is `None` (or a routine's layout metadata
+can't be found), everything reduces to one `<Sheet Number="1">` with no description and every wire
+classified "same-sheet" — mathematically identical to this function's original single-sheet-only
+behavior, confirmed byte-for-byte unaffected by re-running the full 28-routine RefProjA project after
+this change (still 28/28 exact, and the whole-project L5X output is byte-for-byte identical to
+before this round save for the expected per-run `ExportDate`).
+
+**Verified end-to-end** against the real 2-sheet ground truth: both sheets' own `<Description>`,
+every `Block`/`IRef`/`AddOnInstruction`, every `Wire`/`FeedbackWire` (11 `Wire` + 2 `FeedbackWire`,
+matching real counts exactly), and the one `OCon`/`ICon` connector pair (`Name="TankLevel"`) all
+match exactly — checked via element-count comparison, not just presence, so a silently-dropped
+duplicate or a wrongly-tagged `Wire`/`FeedbackWire` would have been caught. This project also
+provided real ground truth for `PIDE`/`ADD`/`SUB`/`MUL`/`DEDT`/`LDLG`/`HLL`/`GRT`/`D2SD` block
+types (none seen in the RefProjA project's `ALMA`/`BNOT`/`RLIM`/`TONR`/AOI-instance mix), confirming
+block rendering stays generic rather than accidentally coupled to the specific types seen first.
 
 **`UNIT_STATUS` bit-index gap — SOLVED (was the sole mismatch, now 28/28 exact).** Its wires
 resolved to `RealTag.__BitHost00.N` (a bit index into the pseudo-tag's own packed feed) where real

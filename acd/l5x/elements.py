@@ -2185,6 +2185,7 @@ class Routine(L5xElement):
     _fbd_network: Union[Tuple[Dict, Dict, List], None] = field(default=None)
     _aoi_inout_order: Dict[str, List[str]] = field(default_factory=dict)
     _fbd_bit_resolver: object = field(default=None)
+    _fbd_sheet_layout: object = field(default=None)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -2225,7 +2226,8 @@ class Routine(L5xElement):
             blocks, iref_feeds, oref_writes = self._fbd_network
             if blocks or oref_writes:
                 content = _render_fbd_content(
-                    blocks, iref_feeds, oref_writes, self._aoi_inout_order, self._fbd_bit_resolver
+                    blocks, iref_feeds, oref_writes, self._aoi_inout_order, self._fbd_bit_resolver,
+                    self._fbd_sheet_layout,
                 )
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
 
@@ -3853,15 +3855,19 @@ class RoutineBuilder(L5xElementBuilder):
             st_lines = _st_routine_lines(self._cur, self._object_id)
 
         fbd_network = None
+        fbd_sheet_layout = None
         if routine_type == "FBD":
             shadow_oid = _fbd_shadow_region(self._cur, self._object_id)
             if shadow_oid is not None:
                 fbd_rungs = _fbd_compiled_rungs(self._cur, shadow_oid)
                 fbd_network = _parse_fbd_network(fbd_rungs)
+                fbd_sheet_layout = _fbd_decode_sheets(self._cur, shadow_oid)
 
-        return Routine(
+        routine = Routine(
             name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines, fbd_network
         )
+        routine._fbd_sheet_layout = fbd_sheet_layout
+        return routine
 
 
 def _parse_fffeff(data: bytes, offset: int):
@@ -4184,6 +4190,286 @@ def _fbd_compiled_rungs(cur: Cursor, shadow_oid: int) -> List[str]:
     return [rung for _seq, rung in cur.fetchall() if rung is not None]
 
 
+# --- FBD multi-sheet layout ----------------------------------------------
+#
+# A multi-sheet FBD routine's compiled ladder-equivalent network (above) is
+# ONE continuous flat pool spanning every sheet -- confirmed against a real
+# 2-sheet project (`FBDLevelControlSimulation.ACD`/`.L5X`): a cross-sheet
+# link (block A on sheet 1 feeding block B on sheet 2 via a named
+# OCon/ICon connector pair in the FBD editor) compiles down to one
+# ordinary direct wire (`MOV(A.Out,B.SourceA)`) with ZERO trace of the
+# connector or the sheet boundary anywhere in the compiled rung text.
+# `_parse_fbd_network`/`_fbd_shadow_region` therefore need no changes at
+# all for multi-sheet routines -- they already correctly recover every
+# block/wire regardless of sheet.
+#
+# Sheet MEMBERSHIP and connector identity are a wholly separate, parallel
+# metadata tree, hanging off the *same* nameless parent as the shadow
+# region found by `_fbd_shadow_region` (i.e. `shadow_oid`'s own nameless
+# `parent_id`) -- not the compiled-rung subtree itself. Reverse-engineered
+# structure, verified byte-for-byte against the real 2-sheet ground truth
+# above (every block/IRef/ORef/connector's resolved name AND its real X/Y
+# position matched exactly, though X/Y is unused -- out of scope per this
+# round's own brief):
+#
+#   shadow_parent (nameless parent_id of shadow_oid)
+#     -> one "sheet description" node per sheet (record_type 0x01000002,
+#        flag u32 at offset 16 == 0x00010003 -- this exact flag is what
+#        distinguishes a genuine sheet-description node from an ordinary
+#        per-element node that also happens to have its own child, e.g. a
+#        DEDT block's own "StorageArray" array reference or a PIDE block's
+#        own extra metadata child, both of which ALSO carry an fffeff
+#        string + children and would otherwise false-positive-match; a u32
+#        at offset 20 is this sheet's own seq value, ascending seq order
+#        giving real Sheet Number order -- verified exact: seq 0 -> Sheet
+#        1, seq 20 -> Sheet 2 in the ground truth project.
+#     -> each sheet-description node has exactly two meaningful children
+#        (plus occasional empty/unused reserved container slots, safely
+#        ignored):
+#        - an "elements" container: one child per IRef/ORef/OCon/ICon/
+#          Block/AddOnInstruction on that sheet. A plain tagref element
+#          (record_type 0x01000002) carries an fffeff-encoded string at
+#          the same offset ST lines use, either a literal (`"20"`) or an
+#          `@hexid@` tag-reference resolved the same way rung/ST text is;
+#          a u32 at offset 20 is this element's own seq (ascending within
+#          a sheet, used only to recover sheet order here, not emitted).
+#          A connector element (OCon/ICon; record_type 0x01000000) has NO
+#          embedded string of its own -- its own last 4 bytes are the
+#          object_id of a *shared* leaf fffeff-string node (0 children)
+#          holding the connector's Name, the same node referenced by its
+#          partner element on the other sheet, which is how an OCon and
+#          its ICon are correlated as the same named connector.
+#        - a "wires" container: one child per Wire/FeedbackWire on that
+#          sheet, each a fixed 40-byte record whose own flag u32 at offset
+#          16 has high word 7 (0x0007xxxx) -- verified as the reliable
+#          discriminator between this and the (variably-sized) elements
+#          container. u32s at offsets 24/32 are the FROM/TO element's own
+#          object_id (matched back to the elements list above by identity,
+#          not by the numeric per-block-type pin "code" also present at
+#          offsets 28/36 -- that code is a Rockwell-internal per-instruction
+#          -TYPE pin enumeration, not a byte offset or member index, and is
+#          NOT decoded here: the real pin NAME for rendering always comes
+#          from the already-verified flat compiled-rung decode above, this
+#          tree is only consulted for sheet membership and connector
+#          identity/pairing). The flag's low word distinguishes a
+#          FeedbackWire (0x12) from a plain Wire (0x11) -- unused by this
+#          decode (both classify as an ordinary same-sheet wire, or an
+#          OCon/ICon pair if cross-sheet; `_render_fbd_content` doesn't
+#          need to know which is which, since it only cares about the
+#          compiled network's own OTL/OTU-derived value, not the
+#          FeedbackWire/Wire distinction itself).
+#
+# See `_fbd_decode_sheets()` for the actual extraction and
+# `_render_fbd_content()`'s `sheet_layout` parameter for how it's used.
+
+_FBD_SHEET_DESC_FLAG = 0x00010003
+
+
+def _fbd_bfs_subtree(cur: Cursor, root_object_id: int, max_depth: int = 10) -> Dict[int, Tuple[int, bytes]]:
+    """Collect every {object_id: (parent_id, record)} pair in a nameless
+    subtree rooted at root_object_id, fanning out breadth-first (not a
+    fixed hop count) up to max_depth levels -- same general BFS pattern as
+    `_fbd_shadow_region`'s own subtree walk, just collecting every node
+    instead of only counting region_map ownership."""
+    nodes: Dict[int, Tuple[int, bytes]] = {}
+    seen: set = set()
+    frontier = [root_object_id]
+    for _depth in range(max_depth):
+        frontier = [o for o in frontier if o not in seen]
+        if not frontier:
+            break
+        seen.update(frontier)
+        qmarks = ",".join("?" * len(frontier))
+        cur.execute(
+            f"SELECT object_id, parent_id, record FROM nameless WHERE object_id IN ({qmarks})",
+            frontier,
+        )
+        for oid, parent_id, rec in cur.fetchall():
+            nodes[oid] = (parent_id, rec)
+        cur.execute(f"SELECT object_id FROM nameless WHERE parent_id IN ({qmarks})", frontier)
+        frontier = [row[0] for row in cur.fetchall()]
+    return nodes
+
+
+def _fbd_resolve_element_text(cur: Cursor, text: str) -> str:
+    """Resolve `@hexid@` tag references in one FBD sheet-element's own
+    text to comp names, iterated to a fixed point -- same reasoning as
+    `_st_routine_lines`'s own resolution: a resolved name can itself still
+    be an unresolved placeholder."""
+    ref_re = re.compile(r"@([0-9a-fA-F]{1,8})@")
+    for _ in range(5):
+        hex_ids = {m.group(1) for m in ref_re.finditer(text)}
+        if not hex_ids:
+            break
+        resolved_any = False
+        for hex_id in hex_ids:
+            cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (int(hex_id, 16),))
+            row = cur.fetchone()
+            if row and row[0]:
+                text = text.replace(f"@{hex_id}@", row[0])
+                resolved_any = True
+        if not resolved_any:
+            break
+    return text
+
+
+def _fbd_decode_sheets(cur: Cursor, shadow_oid: int):
+    """Decode an FBD routine's per-sheet layout metadata (see the module
+    comment above this section for the full mechanism). Returns None if
+    this routine has no such metadata (e.g. an older save format, or the
+    correlation didn't turn up anything) -- callers should fall back to
+    plain single-`<Sheet Number="1">` rendering with no per-sheet
+    description.
+
+    Returns (sheets, operand_to_sheet, connector_feed, feedback_pairs):
+      sheets: [{"number": int, "description": Union[str, None]}, ...] in
+        real Sheet Number order.
+      operand_to_sheet: {operand_name: sheet_number} for every real
+        block/IRef/ORef operand found in the layout metadata.
+      connector_feed: {connector_name: {"feeder_operand", "feeder_sheet",
+        "consumer_operand", "consumer_sheet"}} -- the real operand/sheet on
+        each side of a named OCon/ICon connector pair, found via this
+        tree's own per-sheet wire topology (object-identity matched, not
+        by name -- a connector's own Name is never resolvable to a real
+        tag/block by lexical matching alone, since it doesn't appear
+        anywhere in the compiled rung text at all).
+      feedback_pairs: {(from_operand, to_operand), ...} -- which specific
+        connections real Studio 5000 renders as <FeedbackWire> rather than
+        a plain <Wire> (verified: a level-control loop's genuine feedback
+        connections, e.g. a PIDE block's own CV output feeding back into
+        an upstream block it also feeds forward into)."""
+    cur.execute("SELECT parent_id FROM nameless WHERE object_id=?", (shadow_oid,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    shadow_parent = row[0]
+
+    nodes = _fbd_bfs_subtree(cur, shadow_parent)
+    children_index: Dict[int, List[int]] = {}
+    for oid, (parent_id, _rec) in nodes.items():
+        children_index.setdefault(parent_id, []).append(oid)
+
+    def children_of(oid: int) -> List[int]:
+        return children_index.get(oid, [])
+
+    def leaf_name(oid: int) -> Union[str, None]:
+        entry = nodes.get(oid)
+        if entry is None:
+            return None
+        _parent_id, rec = entry
+        if len(rec) < 8 or struct.unpack_from("<I", rec, 4)[0] != _FBD_COMPILED_BLOB_RECORD_TYPE:
+            return None
+        idx = rec.find(b"\xff\xfe\xff")
+        if idx < 0:
+            return None
+        if children_of(oid):
+            return None
+        text, _ = _parse_fffeff(rec, idx)
+        return text
+
+    sheet_desc_candidates = []
+    for oid, (_parent_id, rec) in nodes.items():
+        if len(rec) < 24 or struct.unpack_from("<I", rec, 4)[0] != _FBD_COMPILED_BLOB_RECORD_TYPE:
+            continue
+        if struct.unpack_from("<I", rec, 16)[0] != _FBD_SHEET_DESC_FLAG:
+            continue
+        idx = rec.find(b"\xff\xfe\xff")
+        if idx < 0:
+            continue
+        kids = children_of(oid)
+        if not kids:
+            continue
+        seq = struct.unpack_from("<I", rec, 20)[0]
+        desc, _ = _parse_fffeff(rec, idx)
+        sheet_desc_candidates.append((seq, oid, desc, kids))
+    if not sheet_desc_candidates:
+        return None
+    sheet_desc_candidates.sort(key=lambda c: c[0])
+
+    sheets = []
+    operand_to_sheet: Dict[str, int] = {}
+    oid_to_operand: Dict[int, str] = {}
+    connector_oid_to_name: Dict[int, str] = {}
+    sheet_wires: List[Tuple[int, int, int]] = []  # (sheet_number, from_oid, to_oid)
+
+    for sheet_number, (_seq, _oid, desc, kids) in enumerate(sheet_desc_candidates, start=1):
+        elements_container = None
+        wires_container = None
+        for kid in kids:
+            grandkids = children_of(kid)
+            if not grandkids:
+                continue
+            sample_rec = nodes[grandkids[0]][1]
+            if len(sample_rec) < 20:
+                continue
+            flag = struct.unpack_from("<I", sample_rec, 16)[0]
+            if (flag >> 16) == 7:
+                wires_container = kid
+            else:
+                elements_container = kid
+
+        for el_oid in (children_of(elements_container) if elements_container else []):
+            _parent_id, rec = nodes[el_oid]
+            if len(rec) < 8:
+                continue
+            rtype = struct.unpack_from("<I", rec, 4)[0]
+            if rtype == 0x01000000:
+                if len(rec) < 36:
+                    continue
+                name_oid = struct.unpack_from("<I", rec, 32)[0]
+                name = leaf_name(name_oid)
+                if name is not None:
+                    connector_oid_to_name[el_oid] = name
+            else:
+                idx = rec.find(b"\xff\xfe\xff")
+                if idx < 0:
+                    continue
+                text, _ = _parse_fffeff(rec, idx)
+                operand = _fbd_resolve_element_text(cur, text)
+                operand_to_sheet[operand] = sheet_number
+                oid_to_operand[el_oid] = operand
+
+        for w_oid in (children_of(wires_container) if wires_container else []):
+            _parent_id, rec = nodes[w_oid]
+            if len(rec) < 36:
+                continue
+            from_oid = struct.unpack_from("<I", rec, 24)[0]
+            to_oid = struct.unpack_from("<I", rec, 32)[0]
+            # Low word of the flag u32 at offset 16 distinguishes a real
+            # Studio 5000 <FeedbackWire> (0x12) from a plain <Wire> (0x11)
+            # -- verified against real ground truth: a level-control loop's
+            # two genuine feedback connections (e.g. a PIDE block's own
+            # CVEU output feeding back into an upstream DEDT block's In)
+            # render as <FeedbackWire>, every other same-shape connection
+            # as plain <Wire>. High word 7 was already used above to find
+            # this container in the first place.
+            is_feedback = struct.unpack_from("<I", rec, 16)[0] & 0xFFFF == 0x12
+            sheet_wires.append((sheet_number, from_oid, to_oid, is_feedback))
+
+        sheets.append({"number": sheet_number, "description": desc or None})
+
+    connector_feed: Dict[str, Dict[str, object]] = {}
+    feedback_pairs: set = set()
+    for sheet_number, from_oid, to_oid, is_feedback in sheet_wires:
+        to_name = connector_oid_to_name.get(to_oid)
+        if to_name is not None:
+            entry = connector_feed.setdefault(to_name, {})
+            entry["feeder_operand"] = oid_to_operand.get(from_oid)
+            entry["feeder_sheet"] = sheet_number
+        from_name = connector_oid_to_name.get(from_oid)
+        if from_name is not None:
+            entry = connector_feed.setdefault(from_name, {})
+            entry["consumer_operand"] = oid_to_operand.get(to_oid)
+            entry["consumer_sheet"] = sheet_number
+        if is_feedback:
+            from_operand = oid_to_operand.get(from_oid)
+            to_operand = oid_to_operand.get(to_oid)
+            if from_operand is not None and to_operand is not None:
+                feedback_pairs.add((from_operand, to_operand))
+
+    return sheets, operand_to_sheet, connector_feed, feedback_pairs
+
+
 def _parse_fbd_network(rungs: List[str]):
     """Parse compiled ladder-equivalent rungs into an FBD block/wire graph.
 
@@ -4414,6 +4700,7 @@ def _render_fbd_content(
     oref_writes: List[Tuple[str, str]],
     aoi_inout_order: Union[Dict[str, List[str]], None] = None,
     bit_resolver=None,
+    sheet_layout=None,
 ) -> str:
     """Render a decoded FBD block/wire graph as <FBDContent><Sheet>...
     XML. IDs are assigned deterministically (sorted by operand/tag name
@@ -4432,7 +4719,18 @@ def _render_fbd_content(
     `extra_args` entry, in order, paired with that AOI's own declared
     InOut parameter names in declaration order -- verified exactly against
     a real project's ground truth), a completely different L5X shape from
-    a built-in instruction's plain <Block>/<Wire> pin wiring."""
+    a built-in instruction's plain <Block>/<Wire> pin wiring.
+
+    `sheet_layout`, when given, is the `(sheets, operand_to_sheet,
+    connector_feed)` tuple from `_fbd_decode_sheets()` -- see that
+    function's docstring and the module comment above it for the full
+    multi-sheet mechanism. When None (or when a routine's layout metadata
+    couldn't be found), everything renders onto a single `<Sheet
+    Number="1">` with no description, byte-identical to this function's
+    original single-sheet-only behavior -- the multi-sheet code path below
+    reduces to exactly that when there is only one sheet and no operand is
+    assigned to any other, so there is deliberately only one implementation
+    of the element/wire rendering logic, not two parallel ones."""
     aoi_inout_order = aoi_inout_order or {}
     wires = _fbd_resolve_wires(blocks, iref_feeds, bit_resolver)
 
@@ -4459,46 +4757,54 @@ def _render_fbd_content(
     oref_operands = sorted({dst for _src, dst in oref_writes})
     block_operands = sorted(blocks.keys())
 
+    if sheet_layout is not None:
+        sheets_meta, operand_to_sheet, connector_feed, feedback_pairs = sheet_layout
+    else:
+        sheets_meta, operand_to_sheet, connector_feed, feedback_pairs = [{"number": 1, "description": None}], {}, {}, set()
+    default_sheet = sheets_meta[0]["number"]
+
+    def sheet_of(op: str) -> int:
+        return operand_to_sheet.get(op, default_sheet)
+
     id_map: Dict[str, int] = {}
     next_id = 0
     for op in iref_operands + oref_operands + block_operands:
         id_map[op] = next_id
         next_id += 1
 
-    elements_xml = []
-    x = 100
-    for op in iref_operands:
-        elements_xml.append(f'<IRef ID="{id_map[op]}" X="{x}" Y="100" Operand="{_escape_xml_attr(op)}" HideDesc="false"/>')
-        x += 120
-    x = 100
-    for op in oref_operands:
-        elements_xml.append(f'<ORef ID="{id_map[op]}" X="{x}" Y="700" Operand="{_escape_xml_attr(op)}" HideDesc="false"/>')
-        x += 120
-    x = 100
-    for op in block_operands:
-        info = blocks[op]
-        inout_names = aoi_inout_order.get(info["type"].upper())
-        if inout_names is not None:
-            extra_args = info.get("extra_args", [])
-            inout_xml = "".join(
-                f'<InOutParameter Name="{_escape_xml_attr(pname)}" Argument="{_escape_xml_attr(arg)}"/>'
-                for pname, arg in zip(inout_names, extra_args)
-            )
-            visible_pins = " ".join(block_pins_seen.get(op, []) + inout_names)
-            elements_xml.append(
-                f'<AddOnInstruction Name="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
-                f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}">'
-                f'{inout_xml}</AddOnInstruction>'
-            )
-        else:
-            visible_pins = " ".join(block_pins_seen.get(op, []))
-            elements_xml.append(
-                f'<Block Type="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
-                f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}" HideDesc="false"/>'
-            )
-        x += 200
+    # Each named connector needs two DIFFERENT rendered elements (an OCon
+    # on its feeder's sheet, an ICon on its consumer's sheet) sharing one
+    # Name but each its own ID -- keyed internally as f"__conn__{name}__
+    # {role}" so it can never collide with a real operand name (which is
+    # always a bare tag/literal, never containing this prefix).
+    connector_instances: List[Tuple[str, str, str, int]] = []  # (key, name, role, sheet_number)
+    for name, feed in connector_feed.items():
+        feeder_sheet = feed.get("feeder_sheet")
+        consumer_sheet = feed.get("consumer_sheet")
+        if feeder_sheet is None or consumer_sheet is None:
+            log.warning(f"_render_fbd_content: connector {name!r} missing its feeder or consumer side; skipping")
+            continue
+        for role, sheet_number in (("OCon", feeder_sheet), ("ICon", consumer_sheet)):
+            key = f"__conn__{name}__{role}"
+            id_map[key] = next_id
+            next_id += 1
+            connector_instances.append((key, name, role, sheet_number))
 
-    wires_xml = []
+    def connector_for(src_op: str, dst_op) -> Union[str, None]:
+        for name, feed in connector_feed.items():
+            if feed.get("feeder_operand") == src_op and feed.get("consumer_operand") == dst_op:
+                return name
+        log.warning(
+            f"_render_fbd_content: no connector found linking sheet-crossing "
+            f"{src_op!r} -> {dst_op!r}; dropping wire"
+        )
+        return None
+
+    # Classify every wire/oref-write as same-sheet (one ordinary <Wire>) or
+    # cross-sheet (needs an OCon/ICon pair instead) -- the compiled network
+    # itself has no notion of "sheet" at all (see the module comment), so
+    # this decision comes entirely from `operand_to_sheet`.
+    per_sheet_wires_xml: Dict[int, List[str]] = {s["number"]: [] for s in sheets_meta}
     for src, dst in wires:
         dst_op, dst_pin = _fbd_split_pin_ref(dst, blocks)
         to_id = id_map.get(dst_op)
@@ -4515,7 +4821,30 @@ def _render_fbd_content(
         if from_id is None:
             continue
         from_param_xml = f' FromParam="{_escape_xml_attr(src_pin)}"' if src_pin else ""
-        wires_xml.append(f'<Wire FromID="{from_id}"{from_param_xml} ToID="{to_id}" ToParam="{_escape_xml_attr(dst_pin)}"/>')
+        src_sheet, dst_sheet = sheet_of(src_op), sheet_of(dst_op)
+        # A genuine feedback loop (verified: e.g. a PIDE block's own CV
+        # output feeding back into an upstream block it also feeds forward
+        # into) renders as <FeedbackWire>, not <Wire> -- real Studio 5000
+        # distinguishes these at the compiled-network level (see
+        # _fbd_decode_sheets' own feedback_pairs), applied here to both
+        # halves of a cross-sheet split too since no ground truth exists
+        # yet for that specific combination.
+        wire_tag = "FeedbackWire" if (src_op, dst_op) in feedback_pairs else "Wire"
+        if src_sheet == dst_sheet:
+            per_sheet_wires_xml[src_sheet].append(
+                f'<{wire_tag} FromID="{from_id}"{from_param_xml} ToID="{to_id}" ToParam="{_escape_xml_attr(dst_pin)}"/>'
+            )
+            continue
+        name = connector_for(src_op, dst_op)
+        if name is None:
+            continue
+        ocon_id, icon_id = id_map.get(f"__conn__{name}__OCon"), id_map.get(f"__conn__{name}__ICon")
+        if ocon_id is None or icon_id is None:
+            continue
+        per_sheet_wires_xml[src_sheet].append(f'<{wire_tag} FromID="{from_id}"{from_param_xml} ToID="{ocon_id}"/>')
+        per_sheet_wires_xml[dst_sheet].append(
+            f'<{wire_tag} FromID="{icon_id}" ToID="{to_id}" ToParam="{_escape_xml_attr(dst_pin)}"/>'
+        )
     for src, dst in oref_writes:
         to_id = id_map.get(dst)
         if to_id is None:
@@ -4525,10 +4854,76 @@ def _render_fbd_content(
         if from_id is None:
             continue
         from_param_xml = f' FromParam="{_escape_xml_attr(src_pin)}"' if src_pin else ""
-        wires_xml.append(f'<Wire FromID="{from_id}"{from_param_xml} ToID="{to_id}"/>')
+        src_sheet, dst_sheet = sheet_of(src_op), sheet_of(dst)
+        wire_tag = "FeedbackWire" if (src_op, dst) in feedback_pairs else "Wire"
+        if src_sheet == dst_sheet:
+            per_sheet_wires_xml[src_sheet].append(f'<{wire_tag} FromID="{from_id}"{from_param_xml} ToID="{to_id}"/>')
+            continue
+        name = connector_for(src_op, dst)
+        if name is None:
+            continue
+        ocon_id, icon_id = id_map.get(f"__conn__{name}__OCon"), id_map.get(f"__conn__{name}__ICon")
+        if ocon_id is None or icon_id is None:
+            continue
+        per_sheet_wires_xml[src_sheet].append(f'<{wire_tag} FromID="{from_id}"{from_param_xml} ToID="{ocon_id}"/>')
+        per_sheet_wires_xml[dst_sheet].append(f'<{wire_tag} FromID="{icon_id}" ToID="{to_id}"/>')
 
-    sheet_xml = "".join(elements_xml) + "".join(wires_xml)
-    return f'<FBDContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="Landscape"><Sheet Number="1">{sheet_xml}</Sheet></FBDContent>'
+    sheets_xml = []
+    for sheet_meta in sheets_meta:
+        sheet_number = sheet_meta["number"]
+        elements_xml = []
+        x = 100
+        for op in iref_operands:
+            if sheet_of(op) != sheet_number:
+                continue
+            elements_xml.append(f'<IRef ID="{id_map[op]}" X="{x}" Y="100" Operand="{_escape_xml_attr(op)}" HideDesc="false"/>')
+            x += 120
+        x = 100
+        for op in oref_operands:
+            if sheet_of(op) != sheet_number:
+                continue
+            elements_xml.append(f'<ORef ID="{id_map[op]}" X="{x}" Y="700" Operand="{_escape_xml_attr(op)}" HideDesc="false"/>')
+            x += 120
+        x = 100
+        for key, name, role, conn_sheet in connector_instances:
+            if conn_sheet != sheet_number:
+                continue
+            tag_name = "OCon" if role == "OCon" else "ICon"
+            elements_xml.append(f'<{tag_name} ID="{id_map[key]}" X="{x}" Y="{280 if role == "OCon" else 140}" Name="{_escape_xml_attr(name)}"/>')
+            x += 120
+        x = 100
+        for op in block_operands:
+            if sheet_of(op) != sheet_number:
+                continue
+            info = blocks[op]
+            inout_names = aoi_inout_order.get(info["type"].upper())
+            if inout_names is not None:
+                extra_args = info.get("extra_args", [])
+                inout_xml = "".join(
+                    f'<InOutParameter Name="{_escape_xml_attr(pname)}" Argument="{_escape_xml_attr(arg)}"/>'
+                    for pname, arg in zip(inout_names, extra_args)
+                )
+                visible_pins = " ".join(block_pins_seen.get(op, []) + inout_names)
+                elements_xml.append(
+                    f'<AddOnInstruction Name="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
+                    f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}">'
+                    f'{inout_xml}</AddOnInstruction>'
+                )
+            else:
+                visible_pins = " ".join(block_pins_seen.get(op, []))
+                elements_xml.append(
+                    f'<Block Type="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
+                    f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}" HideDesc="false"/>'
+                )
+            x += 200
+
+        desc_xml = ""
+        if sheet_meta.get("description"):
+            desc_xml = f'<Description>\n<![CDATA[{sheet_meta["description"]}]]>\n</Description>'
+        body = "".join(elements_xml) + "".join(per_sheet_wires_xml[sheet_number])
+        sheets_xml.append(f'<Sheet Number="{sheet_number}">{desc_xml}{body}</Sheet>')
+
+    return f'<FBDContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="Landscape">{"".join(sheets_xml)}</FBDContent>'
 
 
 def _lookup_object_description(cur: Cursor, r, record: bytes) -> Union[str, None]:

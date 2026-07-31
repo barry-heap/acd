@@ -15,13 +15,16 @@ from acd.l5x.elements import (
     _decorated_real_literal,
     _escape_xml_attr,
     _fbd_bool_field_by_index,
+    _fbd_decode_sheets,
     _fbd_make_bit_resolver,
     _fbd_resolve_source,
+    _fbd_split_pin_ref,
     _filetime_to_iso,
     _get_type_size,
     _l5k_real_literal,
     _l5k_string_padded,
     _read_tag_initial_value,
+    _render_fbd_content,
     _resolve_bit_target,
     _st_routine_lines,
 )
@@ -548,3 +551,135 @@ def test_fbd_resolve_source_uses_bit_resolver_when_available():
     # traceable bit-index form rather than raising or guessing.
     assert _fbd_resolve_source("__lHEX.1", iref_feeds, None) == "TANK16_SUP.__BitHost00.1"
     assert _fbd_resolve_source("__lHEX.99", iref_feeds, resolver) == "TANK16_SUP.__BitHost00.99"
+
+
+def _fffeff_bytes(s):
+    return bytes([0xFF, 0xFE, 0xFF, len(s)]) + s.encode("utf-16-le")
+
+
+def _build_fbd_meta_record(rtype, parent_id, self_oid, flag, seq, extra=b""):
+    rec = bytearray(24) + bytearray(extra)
+    struct.pack_into("<I", rec, 0, len(rec) - 4)
+    struct.pack_into("<I", rec, 4, rtype)
+    struct.pack_into("<I", rec, 8, parent_id)
+    struct.pack_into("<I", rec, 12, self_oid)
+    struct.pack_into("<I", rec, 16, flag)
+    struct.pack_into("<I", rec, 20, seq)
+    return bytes(rec)
+
+
+def test_fbd_decode_sheets_two_sheets_with_cross_sheet_connector_and_feedback():
+    # Regression test for the multi-sheet FBD layout mechanism (verified
+    # against a real 2-sheet project, FBDLevelControlSimulation.ACD): sheet
+    # membership and named OCon/ICon connector pairing live in a nameless
+    # tree wholly separate from the compiled ladder-equivalent network,
+    # hanging off shadow_oid's own nameless parent_id. Neither local
+    # fixture nor the main RefProjA project (0 multi-sheet routines) exercises
+    # this, so it needs its own synthetic coverage.
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE nameless (object_id INTEGER, parent_id INTEGER, record BLOB)")
+    rows = []
+
+    SHADOW_OID, SHADOW_PARENT = 9000, 100
+    rows.append((SHADOW_OID, SHADOW_PARENT, b"\x00" * 8))
+
+    # Sheet 1: "Sheet1Desc" -- elements {TagA, TagC, connector->Conn1},
+    # wires {TagA -> Conn1 (plain), TagA -> TagC (feedback)}. The feedback
+    # wire deliberately does NOT touch the connector, since a connector
+    # element never resolves to a real operand name (oid_to_operand only
+    # covers tagref elements) -- feedback_pairs is only ever keyed by two
+    # real operand names.
+    rows.append((200, SHADOW_PARENT, _build_fbd_meta_record(0x01000002, SHADOW_PARENT, 200, 0x10003, 0, _fffeff_bytes("Sheet1Desc"))))
+    rows.append((210, 200, _build_fbd_meta_record(0x01000000, 200, 210, 0, 0)))  # elements container
+    rows.append((211, 210, _build_fbd_meta_record(0x01000002, 210, 211, 0x20002, 1, _fffeff_bytes("TagA"))))
+    conn_rec = bytearray(_build_fbd_meta_record(0x01000000, 210, 212, 0x10010, 2, b"\x00" * 12))
+    struct.pack_into("<I", conn_rec, 32, 213)  # points at the shared name node
+    rows.append((212, 210, bytes(conn_rec)))
+    rows.append((214, 210, _build_fbd_meta_record(0x01000002, 210, 214, 0x20002, 4, _fffeff_bytes("TagC"))))
+    rows.append((220, 200, _build_fbd_meta_record(0x01000000, 200, 220, 0, 0)))  # wires container
+    wire_rec = bytearray(_build_fbd_meta_record(0x01000000, 220, 221, 0x70011, 3, b"\x00" * 20))  # plain Wire
+    struct.pack_into("<I", wire_rec, 24, 211)  # from TagA
+    struct.pack_into("<I", wire_rec, 32, 212)  # to the OCon
+    rows.append((221, 220, bytes(wire_rec)))
+    wire_rec3 = bytearray(_build_fbd_meta_record(0x01000000, 220, 222, 0x70012, 5, b"\x00" * 20))  # 0x12 = FeedbackWire
+    struct.pack_into("<I", wire_rec3, 24, 211)  # from TagA
+    struct.pack_into("<I", wire_rec3, 32, 214)  # to TagC
+    rows.append((222, 220, bytes(wire_rec3)))
+
+    # Sheet 2: "Sheet2Desc" -- elements {TagB, connector->Conn1}, wires {Conn1 -> TagB}
+    rows.append((300, SHADOW_PARENT, _build_fbd_meta_record(0x01000002, SHADOW_PARENT, 300, 0x10003, 10, _fffeff_bytes("Sheet2Desc"))))
+    rows.append((310, 300, _build_fbd_meta_record(0x01000000, 300, 310, 0, 0)))
+    rows.append((311, 310, _build_fbd_meta_record(0x01000002, 310, 311, 0x20002, 1, _fffeff_bytes("TagB"))))
+    conn_rec2 = bytearray(_build_fbd_meta_record(0x01000000, 310, 312, 0x10010, 2, b"\x00" * 12))
+    struct.pack_into("<I", conn_rec2, 32, 213)  # same shared name node as sheet 1's connector
+    rows.append((312, 310, bytes(conn_rec2)))
+    rows.append((320, 300, _build_fbd_meta_record(0x01000000, 300, 320, 0, 0)))
+    wire_rec2 = bytearray(_build_fbd_meta_record(0x01000000, 320, 321, 0x70011, 3, b"\x00" * 20))  # plain Wire
+    struct.pack_into("<I", wire_rec2, 24, 312)  # from the ICon
+    struct.pack_into("<I", wire_rec2, 32, 311)  # to TagB
+    rows.append((321, 320, bytes(wire_rec2)))
+
+    # The connector's own shared name node ("Conn1"), reachable via a
+    # separate branch (record_type 0x01000000, so it's never mistaken for
+    # a sheet-description candidate itself) -- not nested under either
+    # sheet's own elements container, matching how real data keeps it
+    # under a wholly different part of the tree.
+    rows.append((400, SHADOW_PARENT, _build_fbd_meta_record(0x01000000, SHADOW_PARENT, 400, 0, 0)))
+    rows.append((213, 400, _build_fbd_meta_record(0x01000002, 400, 213, 0, 0, _fffeff_bytes("Conn1"))))
+
+    db.executemany("INSERT INTO nameless VALUES (?, ?, ?)", rows)
+    cur = db.cursor()
+
+    result = _fbd_decode_sheets(cur, SHADOW_OID)
+    assert result is not None
+    sheets, operand_to_sheet, connector_feed, feedback_pairs = result
+
+    assert sheets == [
+        {"number": 1, "description": "Sheet1Desc"},
+        {"number": 2, "description": "Sheet2Desc"},
+    ]
+    assert operand_to_sheet == {"TagA": 1, "TagC": 1, "TagB": 2}
+    assert connector_feed == {
+        "Conn1": {
+            "feeder_operand": "TagA",
+            "feeder_sheet": 1,
+            "consumer_operand": "TagB",
+            "consumer_sheet": 2,
+        }
+    }
+    assert feedback_pairs == {("TagA", "TagC")}
+
+
+def test_render_fbd_content_multi_sheet_splits_cross_sheet_wire_via_oconicon():
+    # Regression test for _render_fbd_content's sheet_layout-aware
+    # rendering: a wire whose source and destination operands live on
+    # different sheets must render as an OCon (on the source's sheet) and
+    # an ICon (on the destination's sheet) sharing one Name, each
+    # producing its own same-sheet <Wire>, rather than one direct
+    # cross-sheet wire -- verified against real ground truth (a real
+    # cross-sheet link compiles to one flat wire with zero trace of the
+    # sheet boundary at all, so this decision comes entirely from
+    # sheet_layout, not from the block/wire graph itself).
+    blocks = {
+        "BLK1": {"type": "FOO", "wires_in": {}, "extra_args": []},
+        "BLK2": {"type": "BAR", "wires_in": {"BLK2.In": "BLK1.Out"}, "extra_args": []},
+    }
+    sheet_layout = (
+        [{"number": 1, "description": "Sheet1"}, {"number": 2, "description": "Sheet2"}],
+        {"BLK1": 1, "BLK2": 2},
+        {"XLINK": {"feeder_operand": "BLK1", "feeder_sheet": 1, "consumer_operand": "BLK2", "consumer_sheet": 2}},
+        set(),
+    )
+
+    xml = _render_fbd_content(blocks, {}, [], sheet_layout=sheet_layout)
+
+    assert xml.count('<Sheet Number="1">') == 1
+    assert xml.count('<Sheet Number="2">') == 1
+    assert '<OCon' in xml and 'Name="XLINK"' in xml
+    assert '<ICon' in xml and xml.count('Name="XLINK"') == 2
+    # No direct BLK1->BLK2 wire; instead BLK1.Out feeds the OCon on sheet 1
+    # and the ICon feeds BLK2.In on sheet 2.
+    sheet1_xml = xml.split('<Sheet Number="1">')[1].split("</Sheet>")[0]
+    sheet2_xml = xml.split('<Sheet Number="2">')[1].split("</Sheet>")[0]
+    assert 'FromParam="Out"' in sheet1_xml and "ToParam=" not in sheet1_xml.split("<Wire")[1]
+    assert 'ToParam="In"' in sheet2_xml and "FromParam=" not in sheet2_xml.split("<Wire")[1]
