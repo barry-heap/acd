@@ -168,6 +168,31 @@ code {
 .status.error { color: var(--error); }
 .status.ok { color: var(--ok); }
 
+.reset-btn {
+  display: inline-block;
+  margin-top: 0.75rem;
+  padding: 0.5rem 1rem;
+  font: inherit;
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--fg);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+
+.reset-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.reset-btn:active {
+  transform: translateY(1px);
+}
+
 footer {
   margin-top: 3rem;
   font-size: 0.8rem;
@@ -191,6 +216,7 @@ entirely in your browser. No file ever leaves this page.</p>
   <div id="progress-log" class="progress-log"></div>
 </div>
 <div id="status" class="status"></div>
+<button id="reset-btn" class="reset-btn" type="button" hidden>Try another file</button>
 <footer>Read-only: produces an L5X export only, never writes back to the source .ACD.
 FBD routines are not yet supported and export as an empty shell, matching the Python reference tool.</footer>
 </div>
@@ -7392,6 +7418,7 @@ var convertAcdToL5x = __require("__main__", "./convert").convertAcdToL5x;
   var progressBar = document.getElementById("progress-bar");
   var progressSummary = document.getElementById("progress-summary");
   var progressLog = document.getElementById("progress-log");
+  var resetBtn = document.getElementById("reset-btn");
 
   var PHASE_LABELS = {
     extract: "Extracting archive…",
@@ -7432,6 +7459,25 @@ var convertAcdToL5x = __require("__main__", "./convert").convertAcdToL5x;
     }
   }
 
+  // Clears any error/progress state left over from a previous attempt and
+  // returns to the initial file-picker UI, without a page reload. Covers
+  // every failure path (bad magic bytes, empty/truncated file, a real .ACD
+  // that fails partway through parsing, ...) since they all funnel through
+  // handleFile's single .catch() below -- there's exactly one place that
+  // needs to show this button, not one per failure mode.
+  function resetUI() {
+    setStatus("");
+    resetBtn.hidden = true;
+    progressWrap.hidden = true;
+    progressLog.textContent = "";
+    progressBar.style.width = "0%";
+    progressSummary.textContent = "";
+    // Clearing the input's value (not just relying on the "change" event)
+    // means picking the exact same file again still fires "change" -- some
+    // browsers don't re-fire it for an unchanged file list otherwise.
+    input.value = "";
+  }
+
   function downloadText(filename, text) {
     var blob = new Blob([text], { type: "application/xml" });
     var url = URL.createObjectURL(blob);
@@ -7461,6 +7507,7 @@ var convertAcdToL5x = __require("__main__", "./convert").convertAcdToL5x;
 
   function handleFile(file) {
     setStatus("");
+    resetBtn.hidden = true;
     progressWrap.hidden = false;
     progressLog.textContent = "";
     progressBar.style.width = "0%";
@@ -7521,7 +7568,9 @@ var convertAcdToL5x = __require("__main__", "./convert").convertAcdToL5x;
         setStatus("Done — " + outName + " (" + xml.length.toLocaleString() + " characters) downloaded.", "ok");
       })
       .catch(function (err) {
+        progressWrap.hidden = true;
         setStatus("Error: " + ((err && err.message) || String(err)), "error");
+        resetBtn.hidden = false;
         console.error(err);
       });
   }
@@ -7544,6 +7593,7 @@ var convertAcdToL5x = __require("__main__", "./convert").convertAcdToL5x;
     drop.classList.remove("dragover");
     if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
   });
+  resetBtn.addEventListener("click", resetUI);
 })();
 
 </script>
