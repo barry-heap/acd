@@ -621,3 +621,44 @@ before this round. Re-confirmed the reset-button fix: it's `display: none` (not 
 "should be hidden") on a pristine load and stays that way after toggling the theme, only ever
 becoming visible on a real error. All 4 local fixtures and the error-recovery flow re-verified
 unaffected.
+
+## Round 3: FBD (Function Block Diagram) routine content — ported from Python, byte-identical
+
+Ported the Python side's FBD decode/render mechanism (see the root `CLAUDE.md`'s "FBD" section
+for the full reverse-engineered mechanism/grammar this mirrors field-for-field) straight across,
+following the same reference-then-port discipline as the ST round above:
+- `js/l5x/builders.js`: `fbdShadowRegion()` (BFS from the routine's own comps extended-record
+  reference down its nameless subtree, same as `stRoutineLines()`'s own subtree walk, picking the
+  descendant that owns the most `region_map` rows), `fbdCompiledRungs()`, and `parseFbdNetwork()`
+  (the compiled-rung instruction grammar — block execution, wiring pairs, IRef feeders, ORef
+  writers, mid-rung `OTL`/`OTU` literal-constant wires, and the `start_block`/`end_block`-wrapped
+  shared-dot-prefix math-instruction shape) — called from `buildRoutine()` exactly where
+  `stRoutineLines()` is, storing the result as `Routine._fbdNetwork` (`{blocks, irefFeeds,
+  orefWrites}`, using `Map`s where Python uses `dict`s).
+- `js/l5x/elements.js`: `fbdResolveSource()`/`fbdResolveWires()`/`fbdSplitPinRef()`/
+  `renderFbdContent()` (the rendering-side helpers, placed here rather than in `builders.js` since
+  they need `escapeXmlAttr`, already imported in this file for `Routine.toXml()`) plus a new FBD
+  branch in `Routine.toXml()`, mirroring Python's `Routine.to_xml()`/`_render_fbd_content()`
+  exactly, including the same synthetic sequential-ID/grid-layout approach (Studio's own layout
+  and element numbering are explicitly out of scope, same as the Python side) and the same
+  defensive guard against a `null` pin ever leaking into a rendered `Wire`'s `ToParam`.
+- `js/l5x/builders.js`'s `buildController()`: attaches `_aoiInoutOrder` (a `Map`, AOI name
+  upper-cased → ordered InOut parameter names) onto every FBD routine post-hoc, in the same
+  after-the-AOI-list-exists spot `aoiParamNames`/`stripAoiBindingComments` already use, mirroring
+  Python's `ControllerBuilder.build()` attachment of `_aoi_inout_order`.
+
+**Verified end-to-end, not just structurally**: ran the full real project
+(`RefProjA_V33_R17_4.ACD`, the same 28-FBD-routine project the Python side was verified against,
+including the one FBD routine embedded inside an AOI definition) through both `acd.api.
+ConvertAcdToL5x` (Python) and `convertAcdToL5x()` (JS) and diffed the two full-project L5X outputs
+directly against each other (not against the real Studio 5000 export a second time — the Python
+side already did that; this round only needs to prove the JS port reproduces Python's own output).
+**Every one of the 28 `<Routine Type="FBD">` elements is byte-for-byte identical** between the two
+outputs, and the two *entire* ~2.95MB L5X documents are identical except for the single expected
+`ExportDate="..."` timestamp attribute (each run stamps the real wall-clock time it ran at, not
+something to diff for parity — same caveat `convert.js`'s own top-of-file comment already
+documents for this attribute). Also re-verified the two small local fixtures
+(`ACDTestsWithAOI.ACD`'s `FBDRoutine`, containing the AND/BAND/BOR math-block shape) produce
+identical `<Routine>` output between Python and JS. Full `npm test` (extract/parse/records/ingest
+verification) and the full Python `pytest` suite both still pass with no regressions after this
+change.

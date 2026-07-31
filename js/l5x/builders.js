@@ -995,6 +995,166 @@ function stRoutineLines(db, routineObjectId) {
   return localNumbers.map((n, i) => [n, texts[i]]);
 }
 
+// FBD (Function Block Diagram) routines compile down to an equivalent
+// ladder-logic ("compiled neutral text") program at save time, the same
+// way ST source lines are stored -- see stRoutineLines() above and
+// js/CLAUDE.md / CLAUDE.md's own "FBD" section for the full mechanism.
+const FBD_SHADOW_RECORD_TYPE = 0x01000002;
+
+// Find the synthetic (no Comps.Dat object of its own) region_map parent_id
+// that owns an FBD routine's compiled ladder-equivalent rungs. Returns null
+// if this routine has no compiled FBD content to find (a genuinely empty
+// FBD routine, or the correlation didn't turn up anything) -- callers
+// should fall back to the empty-shell rendering rather than throw.
+function fbdShadowRegion(db, routineObjectId) {
+  const row = queryOne(db, "SELECT record FROM comps WHERE object_id=?", [routineObjectId]);
+  if (!row) return null;
+  let r;
+  try {
+    r = new RxGeneric(new KaitaiStream(row[0]));
+  } catch (e) {
+    return null;
+  }
+
+  const candidateChildren = [];
+  for (const er of r.extendedRecords) {
+    if (er.value.length === 4) candidateChildren.push(dv(er.value).getUint32(0, true));
+  }
+
+  let compiledBlobOid = null;
+  for (const oid of candidateChildren) {
+    const nrow = queryOne(db, "SELECT record FROM nameless WHERE object_id=?", [oid]);
+    if (!nrow || nrow[0].length < 8) continue;
+    if (dv(nrow[0]).getUint32(4, true) === FBD_SHADOW_RECORD_TYPE) {
+      compiledBlobOid = oid;
+      break;
+    }
+  }
+  if (compiledBlobOid === null) return null;
+
+  let frontier = [compiledBlobOid];
+  let bestOid = null;
+  let bestCount = 0;
+  const seen = new Set();
+  for (let depth = 0; depth < 6; depth++) {
+    frontier = frontier.filter((o) => !seen.has(o));
+    if (!frontier.length) break;
+    for (const o of frontier) seen.add(o);
+    const qmarks = frontier.map(() => "?").join(",");
+    const counts = queryAll(db, `SELECT parent_id, COUNT(*) FROM region_map WHERE parent_id IN (${qmarks}) GROUP BY parent_id`, frontier);
+    for (const [oid, count] of counts) {
+      if (count > bestCount) {
+        bestOid = oid;
+        bestCount = count;
+      }
+    }
+    frontier = queryAll(db, `SELECT object_id FROM nameless WHERE parent_id IN (${qmarks})`, frontier).map((row2) => row2[0]);
+  }
+  return bestOid;
+}
+
+// Ordered compiled ladder-equivalent rung texts for an FBD routine's shadow
+// region -- same query shape buildRoutine() already uses for real RLL rungs
+// (ORDER BY the region_map `unknown` column).
+function fbdCompiledRungs(db, shadowOid) {
+  const rows = queryAll(
+    db,
+    "SELECT rm.unknown, r.rung FROM region_map rm LEFT JOIN rungs r ON r.object_id = rm.object_id WHERE rm.parent_id=? ORDER BY rm.unknown",
+    [shadowOid],
+  );
+  return rows.filter((row) => row[1] !== null).map((row) => row[1]);
+}
+
+const FBD_PLUMBING_INSTR = new Set(["OTL", "OTU", "MOV", "XIC", "OTE", "ATI"]);
+
+// [A-Z0-9_]* (not just [A-Z0-9]*) -- an AOI instance called from within an
+// FBD network keeps its own full definition name as the compiled
+// instruction mnemonic (e.g. "AOI_VESSEL(...)"), which almost always
+// contains an underscore by real-world naming convention. The narrower
+// character class would silently truncate "AOI_VESSEL" to "TANK".
+const FBD_INSTR_RE = /([A-Z][A-Z0-9_]*)\(([^()]*)\)/g;
+
+// Parse compiled ladder-equivalent rungs into an FBD block/wire graph.
+// Returns {blocks, irefFeeds, orefWrites}:
+//   blocks: Map<operand, {type, wiresIn: Map<"Op.Pin", src>, extraArgs: []}>
+//   irefFeeds: Map<pseudoTagOrRealTag, sourceRealTag> (feeder rungs)
+//   orefWrites: [[sourceExpr, destRealTag], ...]
+// See CLAUDE.md's "FBD" section for the exact rung shapes this recognizes,
+// including the start_block/end_block-wrapped math-instruction shape
+// handled by the finalPrefixes check below.
+function parseFbdNetwork(rungs) {
+  const blocks = new Map();
+  const irefFeeds = new Map();
+  const orefWrites = [];
+
+  for (let text of rungs) {
+    text = (text || "").replace(/;+$/, "");
+    const calls = [...text.matchAll(FBD_INSTR_RE)].map((m) => [m[1], m[2]]);
+    if (!calls.length) continue;
+    const mnemonics = calls.map((c) => c[0]);
+
+    if (mnemonics[0] === "OTL" && !FBD_PLUMBING_INSTR.has(mnemonics[mnemonics.length - 1])) {
+      const blockType = mnemonics[mnemonics.length - 1];
+      const finalArgs = calls[calls.length - 1][1].split(",").map((a) => a.trim());
+      const finalPrefixes = finalArgs.filter((a) => a.includes(".")).map((a) => a.split(".", 1)[0]);
+      let blockOperand;
+      let extraArgs;
+      if (finalPrefixes.length === finalArgs.length && new Set(finalPrefixes).size === 1) {
+        blockOperand = finalPrefixes[0];
+        extraArgs = [];
+      } else {
+        blockOperand = finalArgs[0];
+        extraArgs = finalArgs.slice(1);
+      }
+      if (!blocks.has(blockOperand)) blocks.set(blockOperand, { type: blockType, wiresIn: new Map(), extraArgs });
+      const block = blocks.get(blockOperand);
+      let i = 1;
+      while (i < calls.length - 1) {
+        const [mnem, args] = calls[i];
+        if (mnem === "MOV") {
+          const commaIdx = args.indexOf(",");
+          const src = args.slice(0, commaIdx).trim();
+          const dst = args.slice(commaIdx + 1).trim();
+          block.wiresIn.set(dst, src);
+          i += 1;
+        } else if (mnem === "XIC") {
+          const src = args.trim();
+          if (i + 1 < calls.length && calls[i + 1][0] === "OTE") {
+            const dst = calls[i + 1][1].trim();
+            block.wiresIn.set(dst, src);
+            i += 2;
+            if (i < calls.length && calls[i][0] === "ATI") i += 1;
+            continue;
+          }
+          i += 1;
+        } else if (mnem === "OTL" || mnem === "OTU") {
+          const dst = args.trim();
+          block.wiresIn.set(dst, mnem === "OTL" ? "1" : "0");
+          i += 1;
+        } else {
+          i += 1;
+        }
+      }
+      continue;
+    }
+
+    if (mnemonics.length === 1 && mnemonics[0] === "MOV") {
+      const commaIdx = calls[0][1].indexOf(",");
+      const src = calls[0][1].slice(0, commaIdx).trim();
+      const dst = calls[0][1].slice(commaIdx + 1).trim();
+      if (dst.startsWith("__l")) irefFeeds.set(dst, src);
+      else orefWrites.push([src, dst]);
+    } else if (mnemonics.length >= 2 && mnemonics[0] === "XIC" && mnemonics[1] === "OTE") {
+      const src = calls[0][1].trim();
+      const dst = calls[1][1].trim();
+      if (dst.startsWith("__l")) irefFeeds.set(dst, src);
+      else orefWrites.push([src, dst]);
+    }
+  }
+
+  return { blocks, irefFeeds, orefWrites };
+}
+
 function lookupObjectDescription(db, r, record) {
   try {
     const ownScopeId = record.length >= 18 ? dv(record).getUint16(16, true) : 0;
@@ -1108,7 +1268,13 @@ function buildRoutine(db, objectId) {
   let stLines = [];
   if (routineType === "ST") stLines = stRoutineLines(db, objectId);
 
-  return new Routine(name, routineType, rungs, { rungIds, rungComments, description, stLines });
+  let fbdNetwork = null;
+  if (routineType === "FBD") {
+    const shadowOid = fbdShadowRegion(db, objectId);
+    if (shadowOid !== null) fbdNetwork = parseFbdNetwork(fbdCompiledRungs(db, shadowOid));
+  }
+
+  return new Routine(name, routineType, rungs, { rungIds, rungComments, description, stLines, fbdNetwork });
 }
 
 function filetimeToIso(ft) {
@@ -1776,6 +1942,28 @@ async function buildController(db, onProgress = null) {
     for (const p of programs) stripAoiBindingComments(p.tags);
   }
 
+  // Attached post-hoc (mirroring tag._dataTypesMap above) since buildRoutine
+  // runs before this controller-level AOI list exists -- an FBD routine's
+  // AOI-instance blocks need each AOI's own declared InOut parameter order
+  // to render <AddOnInstruction>/<InOutParameter> correctly (see the "FBD"
+  // section of CLAUDE.md).
+  const aoiInoutOrder = new Map();
+  for (const aoi of aois) {
+    aoiInoutOrder.set(
+      aoi.name.toUpperCase(),
+      aoi.parameters.filter((p) => p.usage === "InOut").map((p) => p.name),
+    );
+  }
+  if (aoiInoutOrder.size) {
+    const attachAoiInoutOrder = (routineList) => {
+      for (const routine of routineList) {
+        if (routine.type === "FBD" && routine._fbdNetwork) routine._aoiInoutOrder = aoiInoutOrder;
+      }
+    };
+    for (const p of programs) attachAoiInoutOrder(p.routines);
+    for (const aoi of aois) attachAoiInoutOrder(aoi.routines);
+  }
+
   const devCollRow = queryOne(db, "SELECT object_id FROM comps WHERE parent_id=? AND comp_name='RxMapDeviceCollection'", [
     controllerObjectId,
   ]);
@@ -1894,6 +2082,9 @@ module.exports = {
   routineTypeEnum,
   parseFffeff,
   stRoutineLines,
+  fbdShadowRegion,
+  fbdCompiledRungs,
+  parseFbdNetwork,
   lookupObjectDescription,
   buildRoutine,
   buildParameter,

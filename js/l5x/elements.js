@@ -220,6 +220,173 @@ class Module extends L5xElement {
   }
 }
 
+// Resolve one FBD wire's source expression back to its real tag. A
+// pseudo-tag can be referenced with a trailing numeric bit-index (e.g.
+// "__l2621AF94E947AB0D.19") when several boolean IRefs are packed into one
+// word-sized feed -- the base pseudo-tag resolves via irefFeeds same as any
+// other, but the bit INDEX itself is not further resolved to its real named
+// bit-overlay member (that would need the feed tag's own DataType/UDT
+// member list, not available at this decode layer). See CLAUDE.md's "FBD"
+// section for the full explanation and the one known routine this affects.
+function fbdResolveSource(src, irefFeeds) {
+  if (irefFeeds.has(src)) return irefFeeds.get(src);
+  if (src.includes(".")) {
+    const dotIdx = src.indexOf(".");
+    const base = src.slice(0, dotIdx);
+    const suffix = src.slice(dotIdx + 1);
+    if (irefFeeds.has(base)) return `${irefFeeds.get(base)}.${suffix}`;
+  }
+  return src;
+}
+
+// Flatten every block's own wiresIn into [source, "Op.Pin"] pairs,
+// resolving pseudo-tags back to their real feeder source.
+function fbdResolveWires(blocks, irefFeeds) {
+  const resolved = [];
+  for (const info of blocks.values()) {
+    for (const [dst, src] of info.wiresIn) {
+      resolved.push([fbdResolveSource(src, irefFeeds), dst]);
+    }
+  }
+  return resolved;
+}
+
+// Split a wire endpoint into [operand, pin]. A dot alone doesn't mean
+// "block pin" -- an IRef/ORef's own Operand can legitimately be a
+// tag.member reference (e.g. "TANK16_RET.CloseLS"), which must stay intact.
+// Only split at the LAST dot, and only when the part before it is a name
+// already known to be a block operand; otherwise the whole string is the
+// operand with no pin at all.
+function fbdSplitPinRef(ref, blocks) {
+  const lastDot = ref.lastIndexOf(".");
+  if (lastDot >= 0) {
+    const op = ref.slice(0, lastDot);
+    const pin = ref.slice(lastDot + 1);
+    if (blocks.has(op)) return [op, pin];
+  }
+  return [ref, null];
+}
+
+// Render a decoded FBD block/wire graph as <FBDContent><Sheet>... XML. IDs
+// are assigned deterministically (sorted by operand/tag name within each
+// element kind) since Studio's own arbitrary numbering isn't recoverable;
+// X/Y positions are a simple synthetic grid, not Studio's own layout --
+// exact sheet layout fidelity and Studio's own element IDs are explicitly
+// out of scope (see CLAUDE.md's "FBD" section). VisiblePins lists only the
+// pins this decode actually observed wired, plus (for an AOI instance) its
+// own InOut parameter names.
+//
+// A block whose own mnemonic matches a real project AOI's name (looked up
+// in aoiInoutOrder, keyed upper-case) is an AOI instance, not a built-in
+// FBD instruction -- rendered as <AddOnInstruction Name="..."> with
+// <InOutParameter Name="..." Argument="..."/> children, a completely
+// different L5X shape from a built-in instruction's plain <Block>/<Wire>
+// pin wiring.
+function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder) {
+  aoiInoutOrder = aoiInoutOrder || new Map();
+  const wires = fbdResolveWires(blocks, irefFeeds);
+
+  const blockPinsSeen = new Map();
+  for (const [, dst] of wires) {
+    const [op, pin] = fbdSplitPinRef(dst, blocks);
+    if (pin === null) continue;
+    if (!blockPinsSeen.has(op)) blockPinsSeen.set(op, []);
+    if (!blockPinsSeen.get(op).includes(pin)) blockPinsSeen.get(op).push(pin);
+  }
+
+  const orefDsts = new Set(orefWrites.map(([, dst]) => dst));
+  const allWireEndpoints = [
+    ...wires.map(([src]) => src),
+    ...wires.map(([, dst]) => dst),
+    ...orefWrites.map(([src]) => src),
+    ...orefWrites.map(([, dst]) => dst),
+  ];
+  const irefOperands = [
+    ...new Set(
+      allWireEndpoints
+        .map((ref) => fbdSplitPinRef(ref, blocks)[0])
+        .filter((op) => !blocks.has(op) && !orefDsts.has(op)),
+    ),
+  ].sort();
+  const orefOperands = [...orefDsts].sort();
+  const blockOperands = [...blocks.keys()].sort();
+
+  const idMap = new Map();
+  let nextId = 0;
+  for (const op of [...irefOperands, ...orefOperands, ...blockOperands]) {
+    idMap.set(op, nextId);
+    nextId += 1;
+  }
+
+  const elementsXml = [];
+  let x = 100;
+  for (const op of irefOperands) {
+    elementsXml.push(`<IRef ID="${idMap.get(op)}" X="${x}" Y="100" Operand="${escapeXmlAttr(op)}" HideDesc="false"/>`);
+    x += 120;
+  }
+  x = 100;
+  for (const op of orefOperands) {
+    elementsXml.push(`<ORef ID="${idMap.get(op)}" X="${x}" Y="700" Operand="${escapeXmlAttr(op)}" HideDesc="false"/>`);
+    x += 120;
+  }
+  x = 100;
+  for (const op of blockOperands) {
+    const info = blocks.get(op);
+    const inoutNames = aoiInoutOrder.get(info.type.toUpperCase());
+    if (inoutNames !== undefined) {
+      const extraArgs = info.extraArgs || [];
+      const inoutXml = inoutNames
+        .map((pname, i) => (i < extraArgs.length ? [pname, extraArgs[i]] : null))
+        .filter(Boolean)
+        .map(([pname, arg]) => `<InOutParameter Name="${escapeXmlAttr(pname)}" Argument="${escapeXmlAttr(arg)}"/>`)
+        .join("");
+      const visiblePins = [...(blockPinsSeen.get(op) || []), ...inoutNames].join(" ");
+      elementsXml.push(
+        `<AddOnInstruction Name="${escapeXmlAttr(info.type)}" ID="${idMap.get(op)}" X="${x}" Y="400" ` +
+          `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}">${inoutXml}</AddOnInstruction>`,
+      );
+    } else {
+      const visiblePins = (blockPinsSeen.get(op) || []).join(" ");
+      elementsXml.push(
+        `<Block Type="${escapeXmlAttr(info.type)}" ID="${idMap.get(op)}" X="${x}" Y="400" ` +
+          `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}" HideDesc="false"/>`,
+      );
+    }
+    x += 200;
+  }
+
+  const wiresXml = [];
+  for (const [src, dst] of wires) {
+    const [dstOp, dstPin] = fbdSplitPinRef(dst, blocks);
+    const toId = idMap.has(dstOp) ? idMap.get(dstOp) : null;
+    // A block-input wire's own dst is always "Op.Pin" text taken verbatim
+    // from the compiled rung, so dstPin should never be null here; guard
+    // anyway so a not-yet-understood instruction shape degrades to a
+    // dropped wire rather than a literal "null" string leaking into XML.
+    if (toId === null || dstPin === null) {
+      console.warn(`renderFbdContent: could not resolve block-input wire destination ${JSON.stringify(dst)}; dropping wire`);
+      continue;
+    }
+    const [srcOp, srcPin] = fbdSplitPinRef(src, blocks);
+    const fromId = idMap.has(srcOp) ? idMap.get(srcOp) : null;
+    if (fromId === null) continue;
+    const fromParamXml = srcPin ? ` FromParam="${escapeXmlAttr(srcPin)}"` : "";
+    wiresXml.push(`<Wire FromID="${fromId}"${fromParamXml} ToID="${toId}" ToParam="${escapeXmlAttr(dstPin)}"/>`);
+  }
+  for (const [src, dst] of orefWrites) {
+    const toId = idMap.has(dst) ? idMap.get(dst) : null;
+    if (toId === null) continue;
+    const [srcOp, srcPin] = fbdSplitPinRef(src, blocks);
+    const fromId = idMap.has(srcOp) ? idMap.get(srcOp) : null;
+    if (fromId === null) continue;
+    const fromParamXml = srcPin ? ` FromParam="${escapeXmlAttr(srcPin)}"` : "";
+    wiresXml.push(`<Wire FromID="${fromId}"${fromParamXml} ToID="${toId}"/>`);
+  }
+
+  const sheetXml = elementsXml.join("") + wiresXml.join("");
+  return `<FBDContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="Landscape"><Sheet Number="1">${sheetXml}</Sheet></FBDContent>`;
+}
+
 class Routine extends L5xElement {
   constructor(name, type, rungs, opts = {}) {
     super();
@@ -230,6 +397,8 @@ class Routine extends L5xElement {
     this._rungComments = opts.rungComments || new Map();
     this._description = opts.description ?? null;
     this._stLines = opts.stLines || [];
+    this._fbdNetwork = opts.fbdNetwork || null;
+    this._aoiInoutOrder = opts.aoiInoutOrder || new Map();
   }
 
   toXml() {
@@ -260,6 +429,11 @@ class Routine extends L5xElement {
       // can legitimately repeat within one routine.
       const lineXmls = this._stLines.map(([number, text]) => `<Line Number="${number}"><![CDATA[${text}]]></Line>`);
       content = `<STContent>${lineXmls.join("")}</STContent>`;
+    } else if (this.type === "FBD" && this._fbdNetwork) {
+      const { blocks, irefFeeds, orefWrites } = this._fbdNetwork;
+      if (blocks.size || orefWrites.length) {
+        content = renderFbdContent(blocks, irefFeeds, orefWrites, this._aoiInoutOrder);
+      }
     }
     return `<Routine Name="${escapeXmlAttr(this.name)}" Type="${this.type}">${descXml}${content}</Routine>`;
   }
@@ -463,6 +637,10 @@ module.exports = {
   Parameter,
   Module,
   Routine,
+  fbdResolveSource,
+  fbdResolveWires,
+  fbdSplitPinRef,
+  renderFbdContent,
   AOI,
   Program,
   ScheduledProgram,
