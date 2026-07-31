@@ -333,7 +333,17 @@ function fbdSplitPinRef(ref, blocks) {
 // <InOutParameter Name="..." Argument="..."/> children, a completely
 // different L5X shape from a built-in instruction's plain <Block>/<Wire>
 // pin wiring.
-function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder, bitResolver) {
+// sheetLayout, when given, is the {sheets, operandToSheet, connectorFeed,
+// feedbackPairs} object from fbdDecodeSheets() (js/l5x/builders.js) -- see
+// that function's comment and CLAUDE.md's "Multi-sheet FBD" section for
+// the full mechanism. When undefined/null (or a routine's layout metadata
+// couldn't be found), everything renders onto a single <Sheet Number="1">
+// with no description, identical to this function's original single-
+// sheet-only behavior -- the multi-sheet code path below reduces to
+// exactly that when there is only one sheet and no operand is assigned to
+// any other, so there is deliberately only one implementation of the
+// element/wire rendering logic, not two parallel ones.
+function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder, bitResolver, sheetLayout) {
   aoiInoutOrder = aoiInoutOrder || new Map();
   const wires = fbdResolveWires(blocks, irefFeeds, bitResolver);
 
@@ -362,6 +372,13 @@ function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder, bitResol
   const orefOperands = [...orefDsts].sort();
   const blockOperands = [...blocks.keys()].sort();
 
+  const sheetsMeta = sheetLayout ? sheetLayout.sheets : [{ number: 1, description: null }];
+  const operandToSheet = sheetLayout ? sheetLayout.operandToSheet : new Map();
+  const connectorFeed = sheetLayout ? sheetLayout.connectorFeed : new Map();
+  const feedbackPairs = sheetLayout ? sheetLayout.feedbackPairs : new Set();
+  const defaultSheet = sheetsMeta[0].number;
+  const sheetOf = (op) => (operandToSheet.has(op) ? operandToSheet.get(op) : defaultSheet);
+
   const idMap = new Map();
   let nextId = 0;
   for (const op of [...irefOperands, ...orefOperands, ...blockOperands]) {
@@ -369,51 +386,42 @@ function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder, bitResol
     nextId += 1;
   }
 
-  const elementsXml = [];
-  let x = 100;
-  for (const op of irefOperands) {
-    elementsXml.push(`<IRef ID="${idMap.get(op)}" X="${x}" Y="100" Operand="${escapeXmlAttr(op)}" HideDesc="false"/>`);
-    x += 120;
-  }
-  x = 100;
-  for (const op of orefOperands) {
-    elementsXml.push(`<ORef ID="${idMap.get(op)}" X="${x}" Y="700" Operand="${escapeXmlAttr(op)}" HideDesc="false"/>`);
-    x += 120;
-  }
-  x = 100;
-  for (const op of blockOperands) {
-    const info = blocks.get(op);
-    const inoutNames = aoiInoutOrder.get(info.type.toUpperCase());
-    if (inoutNames !== undefined) {
-      const extraArgs = info.extraArgs || [];
-      const inoutXml = inoutNames
-        .map((pname, i) => (i < extraArgs.length ? [pname, extraArgs[i]] : null))
-        .filter(Boolean)
-        .map(([pname, arg]) => `<InOutParameter Name="${escapeXmlAttr(pname)}" Argument="${escapeXmlAttr(arg)}"/>`)
-        .join("");
-      const visiblePins = [...(blockPinsSeen.get(op) || []), ...inoutNames].join(" ");
-      elementsXml.push(
-        `<AddOnInstruction Name="${escapeXmlAttr(info.type)}" ID="${idMap.get(op)}" X="${x}" Y="400" ` +
-          `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}">${inoutXml}</AddOnInstruction>`,
-      );
-    } else {
-      const visiblePins = (blockPinsSeen.get(op) || []).join(" ");
-      elementsXml.push(
-        `<Block Type="${escapeXmlAttr(info.type)}" ID="${idMap.get(op)}" X="${x}" Y="400" ` +
-          `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}" HideDesc="false"/>`,
-      );
+  // Each named connector needs two DIFFERENT rendered elements (an OCon on
+  // its feeder's sheet, an ICon on its consumer's sheet) sharing one Name
+  // but each its own ID -- keyed internally as "__conn__<name>__<role>" so
+  // it can never collide with a real operand name.
+  const connectorInstances = []; // [key, name, role, sheetNumber]
+  for (const [name, feed] of connectorFeed) {
+    const feederSheet = feed.feederSheet;
+    const consumerSheet = feed.consumerSheet;
+    if (feederSheet === undefined || consumerSheet === undefined) {
+      console.warn(`renderFbdContent: connector ${JSON.stringify(name)} missing its feeder or consumer side; skipping`);
+      continue;
     }
-    x += 200;
+    for (const [role, sheetNumber] of [["OCon", feederSheet], ["ICon", consumerSheet]]) {
+      const key = `__conn__${name}__${role}`;
+      idMap.set(key, nextId);
+      nextId += 1;
+      connectorInstances.push([key, name, role, sheetNumber]);
+    }
   }
 
-  const wiresXml = [];
+  const connectorFor = (srcOp, dstOp) => {
+    for (const [name, feed] of connectorFeed) {
+      if (feed.feederOperand === srcOp && feed.consumerOperand === dstOp) return name;
+    }
+    console.warn(`renderFbdContent: no connector found linking sheet-crossing ${JSON.stringify(srcOp)} -> ${JSON.stringify(dstOp)}; dropping wire`);
+    return null;
+  };
+
+  // Classify every wire/oref-write as same-sheet (one ordinary <Wire>/
+  // <FeedbackWire>) or cross-sheet (needs an OCon/ICon pair instead) --
+  // the compiled network itself has no notion of "sheet" at all, so this
+  // decision comes entirely from operandToSheet.
+  const perSheetWiresXml = new Map(sheetsMeta.map((s) => [s.number, []]));
   for (const [src, dst] of wires) {
     const [dstOp, dstPin] = fbdSplitPinRef(dst, blocks);
     const toId = idMap.has(dstOp) ? idMap.get(dstOp) : null;
-    // A block-input wire's own dst is always "Op.Pin" text taken verbatim
-    // from the compiled rung, so dstPin should never be null here; guard
-    // anyway so a not-yet-understood instruction shape degrades to a
-    // dropped wire rather than a literal "null" string leaking into XML.
     if (toId === null || dstPin === null) {
       console.warn(`renderFbdContent: could not resolve block-input wire destination ${JSON.stringify(dst)}; dropping wire`);
       continue;
@@ -422,7 +430,20 @@ function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder, bitResol
     const fromId = idMap.has(srcOp) ? idMap.get(srcOp) : null;
     if (fromId === null) continue;
     const fromParamXml = srcPin ? ` FromParam="${escapeXmlAttr(srcPin)}"` : "";
-    wiresXml.push(`<Wire FromID="${fromId}"${fromParamXml} ToID="${toId}" ToParam="${escapeXmlAttr(dstPin)}"/>`);
+    const srcSheet = sheetOf(srcOp);
+    const dstSheet = sheetOf(dstOp);
+    const wireTag = feedbackPairs.has(`${srcOp} ${dstOp}`) ? "FeedbackWire" : "Wire";
+    if (srcSheet === dstSheet) {
+      perSheetWiresXml.get(srcSheet).push(`<${wireTag} FromID="${fromId}"${fromParamXml} ToID="${toId}" ToParam="${escapeXmlAttr(dstPin)}"/>`);
+      continue;
+    }
+    const name = connectorFor(srcOp, dstOp);
+    if (name === null) continue;
+    const oconId = idMap.get(`__conn__${name}__OCon`);
+    const iconId = idMap.get(`__conn__${name}__ICon`);
+    if (oconId === undefined || iconId === undefined) continue;
+    perSheetWiresXml.get(srcSheet).push(`<${wireTag} FromID="${fromId}"${fromParamXml} ToID="${oconId}"/>`);
+    perSheetWiresXml.get(dstSheet).push(`<${wireTag} FromID="${iconId}" ToID="${toId}" ToParam="${escapeXmlAttr(dstPin)}"/>`);
   }
   for (const [src, dst] of orefWrites) {
     const toId = idMap.has(dst) ? idMap.get(dst) : null;
@@ -431,11 +452,81 @@ function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder, bitResol
     const fromId = idMap.has(srcOp) ? idMap.get(srcOp) : null;
     if (fromId === null) continue;
     const fromParamXml = srcPin ? ` FromParam="${escapeXmlAttr(srcPin)}"` : "";
-    wiresXml.push(`<Wire FromID="${fromId}"${fromParamXml} ToID="${toId}"/>`);
+    const srcSheet = sheetOf(srcOp);
+    const dstSheet = sheetOf(dst);
+    const wireTag = feedbackPairs.has(`${srcOp} ${dst}`) ? "FeedbackWire" : "Wire";
+    if (srcSheet === dstSheet) {
+      perSheetWiresXml.get(srcSheet).push(`<${wireTag} FromID="${fromId}"${fromParamXml} ToID="${toId}"/>`);
+      continue;
+    }
+    const name = connectorFor(srcOp, dst);
+    if (name === null) continue;
+    const oconId = idMap.get(`__conn__${name}__OCon`);
+    const iconId = idMap.get(`__conn__${name}__ICon`);
+    if (oconId === undefined || iconId === undefined) continue;
+    perSheetWiresXml.get(srcSheet).push(`<${wireTag} FromID="${fromId}"${fromParamXml} ToID="${oconId}"/>`);
+    perSheetWiresXml.get(dstSheet).push(`<${wireTag} FromID="${iconId}" ToID="${toId}"/>`);
   }
 
-  const sheetXml = elementsXml.join("") + wiresXml.join("");
-  return `<FBDContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="Landscape"><Sheet Number="1">${sheetXml}</Sheet></FBDContent>`;
+  const sheetsXml = [];
+  for (const sheetMeta of sheetsMeta) {
+    const sheetNumber = sheetMeta.number;
+    const elementsXml = [];
+    let x = 100;
+    for (const op of irefOperands) {
+      if (sheetOf(op) !== sheetNumber) continue;
+      elementsXml.push(`<IRef ID="${idMap.get(op)}" X="${x}" Y="100" Operand="${escapeXmlAttr(op)}" HideDesc="false"/>`);
+      x += 120;
+    }
+    x = 100;
+    for (const op of orefOperands) {
+      if (sheetOf(op) !== sheetNumber) continue;
+      elementsXml.push(`<ORef ID="${idMap.get(op)}" X="${x}" Y="700" Operand="${escapeXmlAttr(op)}" HideDesc="false"/>`);
+      x += 120;
+    }
+    x = 100;
+    for (const [key, name, role, connSheet] of connectorInstances) {
+      if (connSheet !== sheetNumber) continue;
+      const tagName = role === "OCon" ? "OCon" : "ICon";
+      elementsXml.push(`<${tagName} ID="${idMap.get(key)}" X="${x}" Y="${role === "OCon" ? 280 : 140}" Name="${escapeXmlAttr(name)}"/>`);
+      x += 120;
+    }
+    x = 100;
+    for (const op of blockOperands) {
+      if (sheetOf(op) !== sheetNumber) continue;
+      const info = blocks.get(op);
+      const inoutNames = aoiInoutOrder.get(info.type.toUpperCase());
+      if (inoutNames !== undefined) {
+        const extraArgs = info.extraArgs || [];
+        const inoutXml = inoutNames
+          .map((pname, i) => (i < extraArgs.length ? [pname, extraArgs[i]] : null))
+          .filter(Boolean)
+          .map(([pname, arg]) => `<InOutParameter Name="${escapeXmlAttr(pname)}" Argument="${escapeXmlAttr(arg)}"/>`)
+          .join("");
+        const visiblePins = [...(blockPinsSeen.get(op) || []), ...inoutNames].join(" ");
+        elementsXml.push(
+          `<AddOnInstruction Name="${escapeXmlAttr(info.type)}" ID="${idMap.get(op)}" X="${x}" Y="400" ` +
+            `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}">${inoutXml}</AddOnInstruction>`,
+        );
+      } else {
+        const visiblePins = (blockPinsSeen.get(op) || []).join(" ");
+        elementsXml.push(
+          `<Block Type="${escapeXmlAttr(info.type)}" ID="${idMap.get(op)}" X="${x}" Y="400" ` +
+            `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}" HideDesc="false"/>`,
+        );
+      }
+      x += 200;
+    }
+
+    let descXml = "";
+    if (sheetMeta.description) {
+      descXml = `<Description>\n<![CDATA[${sheetMeta.description}]]>\n</Description>`;
+    }
+    const body = elementsXml.join("") + perSheetWiresXml.get(sheetNumber).join("");
+    sheetsXml.push(`<Sheet Number="${sheetNumber}">${descXml}${body}</Sheet>`);
+  }
+
+  return `<FBDContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="Landscape">${sheetsXml.join("")}</FBDContent>`;
 }
 
 class Routine extends L5xElement {
@@ -451,6 +542,7 @@ class Routine extends L5xElement {
     this._fbdNetwork = opts.fbdNetwork || null;
     this._aoiInoutOrder = opts.aoiInoutOrder || new Map();
     this._fbdBitResolver = opts.fbdBitResolver || null;
+    this._fbdSheetLayout = opts.fbdSheetLayout || null;
   }
 
   toXml() {
@@ -484,7 +576,7 @@ class Routine extends L5xElement {
     } else if (this.type === "FBD" && this._fbdNetwork) {
       const { blocks, irefFeeds, orefWrites } = this._fbdNetwork;
       if (blocks.size || orefWrites.length) {
-        content = renderFbdContent(blocks, irefFeeds, orefWrites, this._aoiInoutOrder, this._fbdBitResolver);
+        content = renderFbdContent(blocks, irefFeeds, orefWrites, this._aoiInoutOrder, this._fbdBitResolver, this._fbdSheetLayout);
       }
     }
     return `<Routine Name="${escapeXmlAttr(this.name)}" Type="${this.type}">${descXml}${content}</Routine>`;

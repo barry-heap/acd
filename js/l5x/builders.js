@@ -1002,6 +1002,17 @@ function stRoutineLines(db, routineObjectId) {
 // js/CLAUDE.md / CLAUDE.md's own "FBD" section for the full mechanism.
 const FBD_SHADOW_RECORD_TYPE = 0x01000002;
 
+// Find the byte offset of the first "FF FE FF" fffeff marker in rec (the
+// 3-byte pattern parseFffeff expects at its own offset argument), or -1 if
+// none exists -- mirrors Python's bytes.find(b"\xff\xfe\xff"), scanning
+// for the exact 3-byte sequence rather than a lone 0xFF byte.
+function findFffeffMarker(rec) {
+  for (let i = 0; i + 2 < rec.length; i++) {
+    if (rec[i] === 0xff && rec[i + 1] === 0xfe && rec[i + 2] === 0xff) return i;
+  }
+  return -1;
+}
+
 // Find the synthetic (no Comps.Dat object of its own) region_map parent_id
 // that owns an FBD routine's compiled ladder-equivalent rungs. Returns null
 // if this routine has no compiled FBD content to find (a genuinely empty
@@ -1064,6 +1075,200 @@ function fbdCompiledRungs(db, shadowOid) {
     [shadowOid],
   );
   return rows.filter((row) => row[1] !== null).map((row) => row[1]);
+}
+
+// --- FBD multi-sheet layout ------------------------------------------
+//
+// A multi-sheet FBD routine's compiled ladder-equivalent network (above)
+// is ONE continuous flat pool spanning every sheet -- confirmed against a
+// real 2-sheet project (FBDLevelControlSimulation.ACD/.L5X): a cross-sheet
+// link compiles down to one ordinary direct wire with ZERO trace of the
+// sheet boundary or connector name anywhere in the compiled rung text.
+// fbdShadowRegion()/parseFbdNetwork() therefore need no changes at all for
+// multi-sheet routines. Sheet MEMBERSHIP and connector identity are a
+// wholly separate, parallel metadata tree hanging off shadowOid's own
+// nameless parentId -- see CLAUDE.md's "Multi-sheet FBD" section for the
+// full reverse-engineered byte layout this mirrors field-for-field.
+
+const FBD_SHEET_DESC_FLAG = 0x00010003;
+
+// Collect every {objectId: [parentId, record]} pair in a nameless subtree
+// rooted at rootObjectId, fanning out breadth-first up to maxDepth levels
+// -- same general BFS pattern as fbdShadowRegion's own subtree walk, just
+// collecting every node instead of only counting region_map ownership.
+function fbdBfsSubtree(db, rootObjectId, maxDepth = 10) {
+  const nodes = new Map();
+  const seen = new Set();
+  let frontier = [rootObjectId];
+  for (let depth = 0; depth < maxDepth; depth++) {
+    frontier = frontier.filter((o) => !seen.has(o));
+    if (!frontier.length) break;
+    for (const o of frontier) seen.add(o);
+    const qmarks = frontier.map(() => "?").join(",");
+    const rows = queryAll(db, `SELECT object_id, parent_id, record FROM nameless WHERE object_id IN (${qmarks})`, frontier);
+    for (const [oid, parentId, rec] of rows) nodes.set(oid, [parentId, rec]);
+    frontier = queryAll(db, `SELECT object_id FROM nameless WHERE parent_id IN (${qmarks})`, frontier).map((r) => r[0]);
+  }
+  return nodes;
+}
+
+// Resolve @hexid@ tag references in one FBD sheet-element's own text to
+// comp names, iterated to a fixed point -- same reasoning as
+// stRoutineLines' own resolution: a resolved name can itself still be an
+// unresolved placeholder.
+function fbdResolveElementText(db, text) {
+  const refRe = /@([0-9a-fA-F]{1,8})@/g;
+  for (let pass = 0; pass < 5; pass++) {
+    const hexIds = new Set([...text.matchAll(refRe)].map((m) => m[1]));
+    if (!hexIds.size) break;
+    let resolvedAny = false;
+    for (const hexId of hexIds) {
+      const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [parseInt(hexId, 16)]);
+      if (row && row[0]) {
+        text = text.split(`@${hexId}@`).join(row[0]);
+        resolvedAny = true;
+      }
+    }
+    if (!resolvedAny) break;
+  }
+  return text;
+}
+
+// Decode an FBD routine's per-sheet layout metadata (see the module
+// comment above and CLAUDE.md's "Multi-sheet FBD" section for the full
+// mechanism). Returns null if this routine has no such metadata (e.g. an
+// older save format, or the correlation didn't turn up anything) --
+// callers should fall back to plain single-Sheet-1 rendering with no
+// per-sheet description.
+//
+// Returns {sheets, operandToSheet, connectorFeed, feedbackPairs}:
+//   sheets: [{number, description}, ...] in real Sheet Number order.
+//   operandToSheet: Map<operandName, sheetNumber>.
+//   connectorFeed: Map<connectorName, {feederOperand, feederSheet,
+//     consumerOperand, consumerSheet}>.
+//   feedbackPairs: Set<"fromOperand toOperand"> -- which specific
+//     connections real Studio 5000 renders as <FeedbackWire> rather than
+//     a plain <Wire>.
+function fbdDecodeSheets(db, shadowOid) {
+  const parentRow = queryOne(db, "SELECT parent_id FROM nameless WHERE object_id=?", [shadowOid]);
+  if (!parentRow) return null;
+  const shadowParent = parentRow[0];
+
+  const nodes = fbdBfsSubtree(db, shadowParent);
+  const childrenIndex = new Map();
+  for (const [oid, [parentId]] of nodes) {
+    if (!childrenIndex.has(parentId)) childrenIndex.set(parentId, []);
+    childrenIndex.get(parentId).push(oid);
+  }
+  const childrenOf = (oid) => childrenIndex.get(oid) || [];
+
+  const leafName = (oid) => {
+    const entry = nodes.get(oid);
+    if (!entry) return null;
+    const rec = entry[1];
+    if (rec.length < 8 || dv(rec).getUint32(4, true) !== FBD_SHADOW_RECORD_TYPE) return null;
+    const idx = findFffeffMarker(rec);
+    if (idx < 0) return null;
+    if (childrenOf(oid).length) return null;
+    const [text] = parseFffeff(rec, idx);
+    return text;
+  };
+
+  const sheetDescCandidates = [];
+  for (const [oid, [, rec]] of nodes) {
+    if (rec.length < 24 || dv(rec).getUint32(4, true) !== FBD_SHADOW_RECORD_TYPE) continue;
+    if (dv(rec).getUint32(16, true) !== FBD_SHEET_DESC_FLAG) continue;
+    const idx = findFffeffMarker(rec);
+    if (idx < 0) continue;
+    const kids = childrenOf(oid);
+    if (!kids.length) continue;
+    const seq = dv(rec).getUint32(20, true);
+    const [desc] = parseFffeff(rec, idx);
+    sheetDescCandidates.push([seq, oid, desc, kids]);
+  }
+  if (!sheetDescCandidates.length) return null;
+  sheetDescCandidates.sort((a, b) => a[0] - b[0]);
+
+  const sheets = [];
+  const operandToSheet = new Map();
+  const oidToOperand = new Map();
+  const connectorOidToName = new Map();
+  const sheetWires = []; // [sheetNumber, fromOid, toOid, isFeedback]
+
+  sheetDescCandidates.forEach(([, , desc, kids], idx0) => {
+    const sheetNumber = idx0 + 1;
+    let elementsContainer = null;
+    let wiresContainer = null;
+    for (const kid of kids) {
+      const grandkids = childrenOf(kid);
+      if (!grandkids.length) continue;
+      const sampleRec = nodes.get(grandkids[0])[1];
+      if (sampleRec.length < 20) continue;
+      const flag = dv(sampleRec).getUint32(16, true);
+      if (flag >>> 16 === 7) wiresContainer = kid;
+      else elementsContainer = kid;
+    }
+
+    for (const elOid of elementsContainer ? childrenOf(elementsContainer) : []) {
+      const rec = nodes.get(elOid)[1];
+      if (rec.length < 8) continue;
+      const rtype = dv(rec).getUint32(4, true);
+      if (rtype === 0x01000000) {
+        if (rec.length < 36) continue;
+        const nameOid = dv(rec).getUint32(32, true);
+        const name = leafName(nameOid);
+        if (name !== null) connectorOidToName.set(elOid, name);
+      } else {
+        const idx = findFffeffMarker(rec);
+        if (idx < 0) continue;
+        const [text] = parseFffeff(rec, idx);
+        const operand = fbdResolveElementText(db, text);
+        operandToSheet.set(operand, sheetNumber);
+        oidToOperand.set(elOid, operand);
+      }
+    }
+
+    for (const wOid of wiresContainer ? childrenOf(wiresContainer) : []) {
+      const rec = nodes.get(wOid)[1];
+      if (rec.length < 36) continue;
+      const fromOid = dv(rec).getUint32(24, true);
+      const toOid = dv(rec).getUint32(32, true);
+      // Low word of the flag u32 at offset 16 distinguishes a real Studio
+      // 5000 <FeedbackWire> (0x12) from a plain <Wire> (0x11).
+      const isFeedback = (dv(rec).getUint32(16, true) & 0xffff) === 0x12;
+      sheetWires.push([sheetNumber, fromOid, toOid, isFeedback]);
+    }
+
+    sheets.push({ number: sheetNumber, description: desc || null });
+  });
+
+  const connectorFeed = new Map();
+  const feedbackPairs = new Set();
+  for (const [sheetNumber, fromOid, toOid, isFeedback] of sheetWires) {
+    const toName = connectorOidToName.get(toOid);
+    if (toName !== undefined) {
+      if (!connectorFeed.has(toName)) connectorFeed.set(toName, {});
+      const entry = connectorFeed.get(toName);
+      entry.feederOperand = oidToOperand.get(fromOid);
+      entry.feederSheet = sheetNumber;
+    }
+    const fromName = connectorOidToName.get(fromOid);
+    if (fromName !== undefined) {
+      if (!connectorFeed.has(fromName)) connectorFeed.set(fromName, {});
+      const entry = connectorFeed.get(fromName);
+      entry.consumerOperand = oidToOperand.get(toOid);
+      entry.consumerSheet = sheetNumber;
+    }
+    if (isFeedback) {
+      const fromOperand = oidToOperand.get(fromOid);
+      const toOperand = oidToOperand.get(toOid);
+      if (fromOperand !== undefined && toOperand !== undefined) {
+        feedbackPairs.add(`${fromOperand} ${toOperand}`);
+      }
+    }
+  }
+
+  return { sheets, operandToSheet, connectorFeed, feedbackPairs };
 }
 
 const FBD_PLUMBING_INSTR = new Set(["OTL", "OTU", "MOV", "XIC", "OTE", "ATI"]);
@@ -1270,12 +1475,18 @@ function buildRoutine(db, objectId) {
   if (routineType === "ST") stLines = stRoutineLines(db, objectId);
 
   let fbdNetwork = null;
+  let fbdSheetLayout = null;
   if (routineType === "FBD") {
     const shadowOid = fbdShadowRegion(db, objectId);
-    if (shadowOid !== null) fbdNetwork = parseFbdNetwork(fbdCompiledRungs(db, shadowOid));
+    if (shadowOid !== null) {
+      fbdNetwork = parseFbdNetwork(fbdCompiledRungs(db, shadowOid));
+      fbdSheetLayout = fbdDecodeSheets(db, shadowOid);
+    }
   }
 
-  return new Routine(name, routineType, rungs, { rungIds, rungComments, description, stLines, fbdNetwork });
+  const routine = new Routine(name, routineType, rungs, { rungIds, rungComments, description, stLines, fbdNetwork });
+  routine._fbdSheetLayout = fbdSheetLayout;
+  return routine;
 }
 
 function filetimeToIso(ft) {
@@ -2117,6 +2328,7 @@ module.exports = {
   fbdShadowRegion,
   fbdCompiledRungs,
   parseFbdNetwork,
+  fbdDecodeSheets,
   lookupObjectDescription,
   buildRoutine,
   buildParameter,

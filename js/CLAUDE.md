@@ -676,3 +676,27 @@ project end to end after this fix: all 28 FBD routines (including `UNIT_STATUS` 
 resolving to `TANK19_SUP.OpenLS` etc. instead of `TANK19_SUP.__BitHost00.19`) and the entire
 full-project L5X document are byte-for-byte identical between Python and JS once more (again
 modulo the expected per-run `ExportDate`). `npm test` still passes with no regressions.
+
+**Round 3 follow-up: ported multi-sheet FBD support too** (see root `CLAUDE.md`'s "Multi-sheet
+FBD" section for the full investigation against a real 2-sheet Rockwell sample project,
+`FBDLevelControlSimulation.ACD`/`.L5X`). `fbdBfsSubtree()`/`fbdResolveElementText()`/
+`fbdDecodeSheets()` (`js/l5x/builders.js`) mirror `_fbd_bfs_subtree()`/`_fbd_resolve_element_text()`/
+`_fbd_decode_sheets()` exactly — the compiled ladder-equivalent network needs no changes at all for
+multi-sheet routines (a cross-sheet link compiles down to one ordinary direct wire with zero trace
+of the sheet boundary), so only a new, wholly separate metadata-tree decode was needed for sheet
+membership and named `OCon`/`ICon` connector pairing. `renderFbdContent()` (`js/l5x/elements.js`)
+takes an extra `sheetLayout` parameter and reduces to its original single-sheet behavior when it's
+absent — one rendering implementation, not two parallel single/multi-sheet paths, same as the
+Python side. `buildRoutine()` calls `fbdDecodeSheets()` right alongside `parseFbdNetwork()` and
+attaches the result as `routine._fbdSheetLayout` (no post-hoc attachment needed here, unlike
+`aoiInoutOrder`/`fbdBitResolver`, since both `db` and `shadowOid` are already in scope at that
+point).
+
+**Verified end-to-end**: ran the real 2-sheet project through both `acd.api.ConvertAcdToL5x`
+(Python) and `convertAcdToL5x()` (JS) and diffed the two outputs directly — the `MainFBD` routine's
+XML (both sheets, all blocks, all `Wire`/`FeedbackWire` entries, and the one `OCon`/`ICon`
+`"TankLevel"` connector pair) is byte-for-byte identical, and the whole document matches too
+(again modulo `ExportDate`). Re-verified the original 28-routine RefProjA project is still
+byte-for-byte identical between Python and JS after this change (single-sheet routines are
+unaffected, confirming the "one rendering implementation" design actually holds in both
+languages, not just Python). `npm test` still passes with no regressions.
