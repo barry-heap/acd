@@ -714,7 +714,7 @@ Python on both real projects after the fix.
 **Round 4: automated the PLC-Studio render check that originally caught the `VisiblePins` bug.**
 That bug was only ever found by a manual, one-off load into `plc_studio.html` (the user's separate
 Studio-5000-like L5X viewer) — this session persists that tool in-repo
-(`js/reference/plc_studio.html`) and drives it headlessly via `js/test_plc_studio_fbd.js`
+(`js/plc_studio.html`) and drives it headlessly via `js/test_plc_studio_fbd.js`
 (Playwright, same pattern as `test_browser.js`): upload a converted `.L5X`, resolve each named
 routine's internal `routineId` through the app's own in-page model and call `openRoutine()`
 directly, then check `#tabContent` for the exact fallback text (`"...not yet supported by this

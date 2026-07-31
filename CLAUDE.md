@@ -713,7 +713,7 @@ actual PLC-Studio render-check is still the outstanding confirmation step for th
 **That outstanding confirmation step is now automated.** `plc_studio.html` (the external
 Studio-5000-like L5X viewer/simulator the user built separately, repo `barry-heap/plc-studio`,
 not accessible via cross-repo GitHub access from this codebase's own sessions) is committed at
-`js/reference/plc_studio.html` specifically so it's available to every future session without
+`js/plc_studio.html` specifically so it's available to every future session without
 being re-pasted. `js/test_plc_studio_fbd.js` drives it headlessly (same Playwright +
 pre-installed-Chromium approach as `js/test_browser.js`): load the page, upload a converted
 `.L5X` via `#fileInput`, wait for `#fileLabel`'s text to match the uploaded file's own basename

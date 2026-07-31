@@ -31,7 +31,7 @@ async function main() {
     process.exit(2);
   }
 
-  const htmlPath = path.join(__dirname, "reference", "plc_studio.html");
+  const htmlPath = path.join(__dirname, "plc_studio.html");
   const browser = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
   const page = await browser.newPage();
 
