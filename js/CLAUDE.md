@@ -568,3 +568,47 @@ hides -> click it -> status/progress fully clear, button hides again -> pick a v
 same file input -> converts and downloads normally -> trigger a second error afterward -> button
 correctly reappears. All 4 local fixtures re-verified byte-identical to their established
 baselines afterward (this change only touches error-path UI, not the conversion pipeline).
+
+## Manual light/dark theme toggle
+
+Dark mode had been purely `prefers-color-scheme`-driven (see the Round 2 dark-mode section
+above) -- the user pointed out real confusion this caused: a screenshot taken with the theme
+forced to dark (for verification) looked completely different from what they actually saw in
+their own browser, which was reporting a light preference. Asked directly whether the page should
+always be dark (matching plc-studio, which has no light theme at all), stay system-driven, or get
+an explicit toggle; the user chose a toggle.
+
+Added a `<button id="theme-toggle">` in a new `.page-header` flex row next to the `<h1>` (styled
+in `theme.css`), cycling `document.documentElement`'s `data-theme` attribute between `"light"` and
+`"dark"` -- the CSS for this already existed from the earlier dark-mode round
+(`:root[data-theme="dark"]` / the `@media (prefers-color-scheme: dark)` block explicitly excludes
+`:root[data-theme="light"]`), it just had no UI ever setting that attribute. The choice persists
+across reloads via `localStorage` (key `THEME_STORAGE_KEY`, injected as a shared global by
+`build.js` right before `ui.js`'s own source in the bundled `<script>`, so the constant can't drift
+between the two places that need it). A tiny separate inline `<script>` in `<head>`
+(`THEME_INIT_SCRIPT` in `build.js`) reads that saved value and sets `data-theme` *before* the
+stylesheet paints -- without this, the page would flash the system-preference theme first, then
+jump to the saved override once the large bottom-of-body bundle finishes parsing.
+
+**A real, pre-existing bug found while testing this** (not introduced by the toggle, but only
+actually exercised by it): `.reset-btn`'s own CSS (added in the error-recovery-affordance round
+above) had an explicit `display: inline-block`, which -- at equal CSS specificity, this
+stylesheet loading after the UA stylesheet -- silently overrode the browser's own
+`[hidden] { display: none }` rule. The reset button was therefore visible on the page at all
+times regardless of its `hidden` attribute; every previous test happened to trigger an error
+before checking the button (where it's meant to be visible anyway), so this was never actually
+caught until a screenshot taken right after a theme-toggle click (no error involved at all) showed
+it sitting on the page uninvited. Fixed by removing the redundant `display` declaration entirely
+(a `<button>`'s UA-default display, `inline-block`, was already correct) -- the general lesson,
+worth remembering for any future CSS touching an element that's toggled via the `hidden`
+attribute: never give that element's own class an explicit `display` value, since it can silently
+win the cascade over `[hidden]` at equal specificity.
+
+**Verified** via Playwright: toggling flips the theme and updates the button's own label ("Dark
+mode" when currently light, "Light mode" when currently dark); reloading the page after a manual
+toggle keeps the chosen theme even when it now disagrees with the system's own preference; a
+fresh page load with no saved preference still just follows the system preference, unchanged from
+before this round. Re-confirmed the reset-button fix: it's `display: none` (not just logically
+"should be hidden") on a pristine load and stays that way after toggling the theme, only ever
+becoming visible on a real error. All 4 local fixtures and the error-recovery flow re-verified
+unaffected.
