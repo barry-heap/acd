@@ -15,6 +15,47 @@
   var progressSummary = document.getElementById("progress-summary");
   var progressLog = document.getElementById("progress-log");
   var resetBtn = document.getElementById("reset-btn");
+  var themeToggle = document.getElementById("theme-toggle");
+
+  // Manual light/dark toggle. THEME_STORAGE_KEY is a global injected by
+  // build.js (shared with the tiny anti-FOUC inline script in <head> that
+  // applies a saved override before first paint -- see build.js for why
+  // that has to run separately/earlier than this bundle). A page-level
+  // data-theme attribute wins over the system's prefers-color-scheme (see
+  // theme.css); with no attribute set at all, the page just follows the
+  // system preference, same as before this toggle existed.
+  function systemPrefersDark() {
+    return typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+
+  function currentTheme() {
+    var explicit = document.documentElement.getAttribute("data-theme");
+    if (explicit === "light" || explicit === "dark") return explicit;
+    return systemPrefersDark() ? "dark" : "light";
+  }
+
+  function updateThemeToggleLabel() {
+    var active = currentTheme();
+    themeToggle.textContent = active === "dark" ? "Light mode" : "Dark mode";
+    themeToggle.setAttribute("aria-label", "Switch to " + (active === "dark" ? "light" : "dark") + " mode");
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch (e) {
+      // Storage unavailable (private browsing, sandboxed frame, ...) -- the
+      // toggle still works for the rest of this page load, it just won't
+      // be remembered next time.
+    }
+    updateThemeToggleLabel();
+  }
+
+  themeToggle.addEventListener("click", function () {
+    applyTheme(currentTheme() === "dark" ? "light" : "dark");
+  });
+  updateThemeToggleLabel();
 
   var PHASE_LABELS = {
     extract: "Extracting archive…",

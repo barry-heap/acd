@@ -142,10 +142,35 @@ function buildRuntimeSource() {
   return [kaitaiSrc, pakoSrc, sqlAsmSrc, SHIM, modulesSrc, RUNTIME_BOOTSTRAP].join("\n\n");
 }
 
+// localStorage key for the manual light/dark override (read by both the
+// early anti-FOUC inline script below and ui.js's toggle button handler --
+// shared here so the two can never drift out of sync).
+const THEME_STORAGE_KEY = "acd-l5x-theme";
+
+// Runs synchronously in <head>, before the stylesheet/body paint, so a
+// previously-saved manual theme choice applies immediately -- without this,
+// the page would always render with the system-preference theme first (a
+// visible flash), then jump to the saved override once ui.js's bundle
+// finishes parsing at the very bottom of body.
+const THEME_INIT_SCRIPT = `
+(function () {
+  try {
+    var saved = localStorage.getItem(${JSON.stringify(THEME_STORAGE_KEY)});
+    if (saved === "light" || saved === "dark") {
+      document.documentElement.setAttribute("data-theme", saved);
+    }
+  } catch (e) {}
+})();
+`;
+
 function buildHtml() {
   const runtimeSrc = buildRuntimeSource();
+  // ui.js references THEME_STORAGE_KEY as an already-defined global rather
+  // than hardcoding the string itself, so this injected line is the one
+  // place that constant is spelled out for the toggle-button code path too.
+  const themeKeyDecl = `var THEME_STORAGE_KEY = ${JSON.stringify(THEME_STORAGE_KEY)};`;
   const uiSrc = fs.readFileSync(path.join(ROOT, "ui.js"), "utf8");
-  const mainScript = scriptSafe([runtimeSrc, uiSrc].join("\n\n"));
+  const mainScript = scriptSafe([runtimeSrc, themeKeyDecl, uiSrc].join("\n\n"));
   const cssSrc = fs.readFileSync(path.join(ROOT, "theme.css"), "utf8");
 
   return `<!doctype html>
@@ -154,13 +179,17 @@ function buildHtml() {
 <meta charset="utf-8" />
 <title>ACD &rarr; L5X Converter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>${THEME_INIT_SCRIPT}</script>
 <style>
 ${cssSrc}
 </style>
 </head>
 <body>
 <div class="page">
-<h1>ACD &rarr; L5X Converter</h1>
+<div class="page-header">
+  <h1>ACD &rarr; L5X Converter</h1>
+  <button id="theme-toggle" class="theme-toggle" type="button"></button>
+</div>
 <p class="lede">Converts a Rockwell Studio 5000 <code>.ACD</code> project file to <code>.L5X</code> XML,
 entirely in your browser. No file ever leaves this page.</p>
 <div id="drop" class="drop">

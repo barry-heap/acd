@@ -4,6 +4,16 @@
 <meta charset="utf-8" />
 <title>ACD &rarr; L5X Converter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<script>
+(function () {
+  try {
+    var saved = localStorage.getItem("acd-l5x-theme");
+    if (saved === "light" || saved === "dark") {
+      document.documentElement.setAttribute("data-theme", saved);
+    }
+  } catch (e) {}
+})();
+</script>
 <style>
 /* Light palette is this converter's own (PLC Studio has no light theme to
    match). Dark palette is pulled verbatim from barry-heap/plc-studio's own
@@ -82,9 +92,42 @@ body {
   margin: 0 auto;
 }
 
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
 h1 {
   font-size: 1.4rem;
   margin-bottom: 0.25rem;
+}
+
+.theme-toggle {
+  flex: 0 0 auto;
+  margin-top: 0.15rem;
+  padding: 0.4rem 0.75rem;
+  font: inherit;
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--fg-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.theme-toggle:active {
+  transform: translateY(1px);
 }
 
 .lede {
@@ -169,7 +212,14 @@ code {
 .status.ok { color: var(--ok); }
 
 .reset-btn {
-  display: inline-block;
+  /* No explicit display: a <button>'s UA-default display (inline-block)
+     already gives the right layout, and setting one here would win the
+     cascade over the browser's own [hidden] { display: none } rule (equal
+     specificity, this stylesheet loads later) -- found via a real visible
+     bug: the button stayed on-screen at all times regardless of its
+     `hidden` attribute, only ever "corrected" by coincidence because every
+     earlier test happened to trigger an error (where it's meant to be
+     visible anyway) before checking it. */
   margin-top: 0.75rem;
   padding: 0.5rem 1rem;
   font: inherit;
@@ -203,7 +253,10 @@ footer {
 </head>
 <body>
 <div class="page">
-<h1>ACD &rarr; L5X Converter</h1>
+<div class="page-header">
+  <h1>ACD &rarr; L5X Converter</h1>
+  <button id="theme-toggle" class="theme-toggle" type="button"></button>
+</div>
 <p class="lede">Converts a Rockwell Studio 5000 <code>.ACD</code> project file to <code>.L5X</code> XML,
 entirely in your browser. No file ever leaves this page.</p>
 <div id="drop" class="drop">
@@ -7402,6 +7455,8 @@ __modules["l5x/port_structures.json"] = function(module, exports, require) {
 var convertAcdToL5x = __require("__main__", "./convert").convertAcdToL5x;
 
 
+var THEME_STORAGE_KEY = "acd-l5x-theme";
+
 // Browser UI glue: file input/drag-drop -> convertAcdToL5x (see build.js's
 // RUNTIME_BOOTSTRAP, which exposes it as a plain global) -> progress
 // rendering + final L5X -> Blob download. Conversion runs on the main
@@ -7419,6 +7474,47 @@ var convertAcdToL5x = __require("__main__", "./convert").convertAcdToL5x;
   var progressSummary = document.getElementById("progress-summary");
   var progressLog = document.getElementById("progress-log");
   var resetBtn = document.getElementById("reset-btn");
+  var themeToggle = document.getElementById("theme-toggle");
+
+  // Manual light/dark toggle. THEME_STORAGE_KEY is a global injected by
+  // build.js (shared with the tiny anti-FOUC inline script in <head> that
+  // applies a saved override before first paint -- see build.js for why
+  // that has to run separately/earlier than this bundle). A page-level
+  // data-theme attribute wins over the system's prefers-color-scheme (see
+  // theme.css); with no attribute set at all, the page just follows the
+  // system preference, same as before this toggle existed.
+  function systemPrefersDark() {
+    return typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+
+  function currentTheme() {
+    var explicit = document.documentElement.getAttribute("data-theme");
+    if (explicit === "light" || explicit === "dark") return explicit;
+    return systemPrefersDark() ? "dark" : "light";
+  }
+
+  function updateThemeToggleLabel() {
+    var active = currentTheme();
+    themeToggle.textContent = active === "dark" ? "Light mode" : "Dark mode";
+    themeToggle.setAttribute("aria-label", "Switch to " + (active === "dark" ? "light" : "dark") + " mode");
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch (e) {
+      // Storage unavailable (private browsing, sandboxed frame, ...) -- the
+      // toggle still works for the rest of this page load, it just won't
+      // be remembered next time.
+    }
+    updateThemeToggleLabel();
+  }
+
+  themeToggle.addEventListener("click", function () {
+    applyTheme(currentTheme() === "dark" ? "light" : "dark");
+  });
+  updateThemeToggleLabel();
 
   var PHASE_LABELS = {
     extract: "Extracting archive…",
