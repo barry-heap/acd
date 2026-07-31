@@ -710,6 +710,50 @@ literal interactive load-and-look the user performed to originally find it. Trea
 as "matches real Studio 5000 output exactly, byte-for-byte, for every attribute checked" — the
 actual PLC-Studio render-check is still the outstanding confirmation step for this specific fix.
 
+**That outstanding confirmation step is now automated.** `plc_studio.html` (the external
+Studio-5000-like L5X viewer/simulator the user built separately, repo `barry-heap/plc-studio`,
+not accessible via cross-repo GitHub access from this codebase's own sessions) is committed at
+`js/reference/plc_studio.html` specifically so it's available to every future session without
+being re-pasted. `js/test_plc_studio_fbd.js` drives it headlessly (same Playwright +
+pre-installed-Chromium approach as `js/test_browser.js`): load the page, upload a converted
+`.L5X` via `#fileInput`, wait for `#fileLabel`'s text to match the uploaded file's own basename
+(the app auto-loads its own embedded demo model on open, so naively waiting on `window.model`
+alone races with — and is satisfied by — that stale demo, not the just-uploaded file), then for
+each `program:ProgramName:RoutineName` / `aoi:AOIName:RoutineName` spec, resolve the routine's
+internal `routineId` via the in-page `model.programs`/`model.aois`/`model.routines` maps and call
+`openRoutine(routineId)` directly (deterministic — avoids clicking through the collapsible tree
+DOM, which is fragile when the same routine name repeats across scopes, e.g. multiple AOIs each
+having their own "Logic" routine).
+
+The check inspects `#tabContent` for the specific failure signature that caught the VisiblePins
+bug: `renderUnsupportedTab()`'s generic fallback note, literal text `"...not yet supported by
+this tool..."` — **not** simply the presence of a `.skip-note` element, since that CSS class is
+reused for a second, benign, always-present explanatory caption shown *alongside* a real rendered
+FBD sheet whenever FBD content DOES render (confirmed by testing against the app's own bundled
+demo routine, `Trending/Trend_Main`, which renders successfully despite its own stale embedded
+XML comment claiming otherwise — the comment predates the app's own FBD renderer being written
+and was never updated). The authoritative success signal is `sheetCount > 0` (real
+`<svg class="fbd-sheet">` content actually drawn); the fallback-text check only matters as the
+*reason* when no sheet rendered.
+
+Run against both real ground-truth cases this investigation established:
+- `FBDLevelControlSimulation`'s converted output (`program:ProcessSimulation:MainFBD`) — **PASS**,
+  2 sheets/17 blocks/11 wires, confirming the VisiblePins/DEDT-`<Array>` fix resolved the actual
+  PLC-Studio symptom, not just the offline attribute diff.
+- All 28 of RefProjA's real FBD routines, including the ones flagged above as not fitting the
+  per-block-type `VisiblePins` table (`_77Proc`/`PROC_RATE_ALARM`, both `ALMA`-using; all 24
+  `TKxx` routines plus `AOI_VESSEL`'s own `Logic` routine, all using the `AddOnInstruction`
+  rendering path) — **28/28 PASS**. The still-open `ALMA`/AOI-instance `VisiblePins` gap does
+  **not** currently trigger this fallback failure mode; it's a real but subtler
+  attribute-completeness gap this DOM-text check cannot see (it doesn't inspect `VisiblePins`
+  values at all, only whether a sheet renders).
+
+**This is a coarse, cheap regression guard for "did this fail outright" — it is not a substitute
+for an occasional real visual check of whether wires land on the right pins/sheets.** Keep doing
+both; a routine can pass this check (a sheet renders, blocks/wires are drawn) while still having a
+real fidelity bug the same class as `VisiblePins` that only surfaces on visual inspection or a
+deep attribute-level ground-truth diff.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*
