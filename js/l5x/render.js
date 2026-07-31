@@ -281,12 +281,31 @@ function l5kRealLiteral(value) {
   return `${mantissa}e${sign}${expDigits}`;
 }
 
+// Mirrors Python's f"{value:.{decimals}f}" for arbitrary magnitude.
+// JS's native Number.toFixed() silently degrades to exponential notation
+// for abs(value) >= 1e21 (an actual ECMA-262 spec requirement, not a bug in
+// V8) -- found via a real project's REAL tag set to (approximately)
+// float32's max value, ~3.4028235e38: Python's f"{value:.0f}" correctly
+// renders the full 39-digit fixed-point integer (matching real Studio 5000
+// output, per _shortest_float32_repr's own docstring), while
+// `value.toFixed(0)` for the same double returns "3.4028234663852886e+38"
+// (its ordinary exponential toString), silently producing the wrong
+// literal shape. Any double this large has no fractional part at all (its
+// magnitude already exceeds what a 52-bit mantissa can represent below the
+// decimal point), so `decimals` is always effectively 0 for these -- BigInt
+// gives the exact integer value with no precision loss.
+function doubleToFixed(value, decimals) {
+  if (Math.abs(value) < 1e21) return value.toFixed(decimals);
+  const intStr = BigInt(value).toString();
+  return decimals > 0 ? `${intStr}.${"0".repeat(decimals)}` : intStr;
+}
+
 function shortestFloat32Repr(value) {
   const targetBuf = new ArrayBuffer(4);
   new DataView(targetBuf).setFloat32(0, value, true);
   const targetBits = new Uint8Array(targetBuf).join(",");
   for (let decimals = 0; decimals < 15; decimals++) {
-    const candidate = value.toFixed(decimals);
+    const candidate = doubleToFixed(value, decimals);
     const buf = new ArrayBuffer(4);
     new DataView(buf).setFloat32(0, parseFloat(candidate), true);
     if (new Uint8Array(buf).join(",") === targetBits) return candidate;

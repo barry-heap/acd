@@ -5,10 +5,21 @@
 <title>ACD &rarr; L5X Converter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-/* Placeholder palette -- swap for barry-heap/plc-studio's actual theme
-   values once that repo is reachable (see js/CLAUDE.md, "Dark mode"
-   section). Kept as CSS custom properties specifically so that swap is a
-   small diff here, not a rewrite of ui.js/build.js. */
+/* Light palette is this converter's own (PLC Studio has no light theme to
+   match). Dark palette is pulled verbatim from barry-heap/plc-studio's own
+   `<style>` block (its `:root{...}` custom properties), supplied by the
+   user as plc_studio.html, so this dark theme visually matches that app
+   family exactly rather than approximating it:
+     --bg:#0a0d12 --surface:#121922 --surface-2:#182230
+     --line:#3a4756 --line-dim:#26303c
+     --live:#2fd47a --amber:#e2a83f --fault:#e2554c
+     --ink:#cfd9e3 --ink-dim:#a0afbd --ink-bright:#eef4f9
+     --radius:2px
+   plc-studio also loads "IBM Plex Sans"/"IBM Plex Mono" from Google Fonts;
+   deliberately NOT fetched here (this converter ships as a single offline
+   file with zero network requests, see build.js) -- the font stack below
+   lists them first anyway so a machine that already has them installed
+   still gets the exact look, falling back to a system stack otherwise. */
 :root {
   --bg: #f5f6f8;
   --bg-elevated: #ffffff;
@@ -21,42 +32,45 @@
   --error: #b91c1c;
   --log-bg: #eef0f3;
   --track: #e2e5eb;
+  --radius: 8px;
 }
 
 :root[data-theme="dark"] {
-  --bg: #14161a;
-  --bg-elevated: #1b1e24;
-  --fg: #e6e8eb;
-  --fg-muted: #9aa1ac;
-  --border: #2c313a;
-  --accent: #5b8dfa;
-  --accent-fg: #0b1020;
-  --ok: #4ade80;
-  --error: #f87171;
-  --log-bg: #101318;
-  --track: #262a32;
+  --bg: #0a0d12;
+  --bg-elevated: #121922;
+  --fg: #cfd9e3;
+  --fg-muted: #a0afbd;
+  --border: #3a4756;
+  --accent: #2fd47a;
+  --accent-fg: #0a0d12;
+  --ok: #2fd47a;
+  --error: #e2554c;
+  --log-bg: #182230;
+  --track: #26303c;
+  --radius: 2px;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #14161a;
-    --bg-elevated: #1b1e24;
-    --fg: #e6e8eb;
-    --fg-muted: #9aa1ac;
-    --border: #2c313a;
-    --accent: #5b8dfa;
-    --accent-fg: #0b1020;
-    --ok: #4ade80;
-    --error: #f87171;
-    --log-bg: #101318;
-    --track: #262a32;
+    --bg: #0a0d12;
+    --bg-elevated: #121922;
+    --fg: #cfd9e3;
+    --fg-muted: #a0afbd;
+    --border: #3a4756;
+    --accent: #2fd47a;
+    --accent-fg: #0a0d12;
+    --ok: #2fd47a;
+    --error: #e2554c;
+    --log-bg: #182230;
+    --track: #26303c;
+    --radius: 2px;
   }
 }
 
 * { box-sizing: border-box; }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: var(--bg);
   color: var(--fg);
   margin: 0;
@@ -78,15 +92,16 @@ h1 {
 }
 
 code {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   background: var(--log-bg);
   padding: 0.1em 0.35em;
-  border-radius: 4px;
+  border-radius: var(--radius);
   font-size: 0.9em;
 }
 
 .drop {
   border: 2px dashed var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 2.5rem 1rem;
   text-align: center;
   cursor: pointer;
@@ -130,9 +145,9 @@ code {
   overflow-y: auto;
   background: var(--log-bg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius);
   padding: 0.5rem 0.75rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
   line-height: 1.5;
   color: var(--fg-muted);
@@ -145,7 +160,7 @@ code {
 .status {
   margin-top: 1rem;
   white-space: pre-wrap;
-  font-family: ui-monospace, monospace;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 0.85rem;
   min-height: 1.2em;
 }
@@ -2644,6 +2659,19 @@ function utf8Decode(bytes) {
   return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 }
 
+// Mirrors Kaitai's generated `.decode(u"UTF-8")` (no errors= param, i.e.
+// strict -- raises on invalid bytes) for AsciiRecord/Utf16Record/
+// ControllerRecord's own record_string field (acd/generated/comments/
+// fafa_coments.py) -- despite the "Ascii" name, the real generated parser
+// decodes these as UTF-8, confirmed via a real project's tag description
+// containing an en-dash (U+2013), which Python renders correctly but the
+// previous ascii-with-replace JS decode mangled into replacement
+// characters. Throws on invalid UTF-8 so the caller's outer try/catch can
+// return null the same way Python's strict decode raising would.
+function utf8DecodeStrict(bytes) {
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
 function readCodeUnitsUntilZero(dv, start) {
   // Returns { codeUnits, bytesConsumed } where bytesConsumed includes the
   // terminating zero code unit (2 bytes), mirroring StrzUtf16's code_units.
@@ -2770,13 +2798,13 @@ function parseCommentsRecord(datRecord) {
       tagRef = String.fromCharCode(...codeUnits);
       const stringsStart = tagRefStart + bytesConsumed + 12;
       const textEnd = indexOfZero(body, stringsStart);
-      recordString = textEnd > stringsStart ? asciiDecode(body.subarray(stringsStart, textEnd)) : "";
+      recordString = textEnd > stringsStart ? utf8DecodeStrict(body.subarray(stringsStart, textEnd)) : "";
     } else if (recordType === 1 || recordType === 2) {
       // AsciiRecord: unknown_1(13) + object_id(u4) + unknown_2(13) + record_string.
       objectId = dvBody.getUint32(13, true);
       tagRef = "";
       const textEnd = indexOfZero(body, 30);
-      recordString = textEnd > 30 ? asciiDecode(body.subarray(30, textEnd)) : "";
+      recordString = textEnd > 30 ? utf8DecodeStrict(body.subarray(30, textEnd)) : "";
       if (body.length >= 8) rungContent = dvBody.getUint32(4, true);
       if (body.length >= 4) memberRef = dvBody.getUint32(0, true);
     } else if (recordType === 23 || recordType === 25) {
@@ -2788,7 +2816,7 @@ function parseCommentsRecord(datRecord) {
       const { bytesConsumed } = readCodeUnitsUntilZero(dvBody, tagRefStart);
       const stringsStart = tagRefStart + bytesConsumed + 12;
       const textEnd = indexOfZero(body, stringsStart);
-      recordString = textEnd > stringsStart ? asciiDecode(body.subarray(stringsStart, textEnd)) : "";
+      recordString = textEnd > stringsStart ? utf8DecodeStrict(body.subarray(stringsStart, textEnd)) : "";
     } else {
       return null;
     }
@@ -3346,12 +3374,31 @@ function l5kRealLiteral(value) {
   return `${mantissa}e${sign}${expDigits}`;
 }
 
+// Mirrors Python's f"{value:.{decimals}f}" for arbitrary magnitude.
+// JS's native Number.toFixed() silently degrades to exponential notation
+// for abs(value) >= 1e21 (an actual ECMA-262 spec requirement, not a bug in
+// V8) -- found via a real project's REAL tag set to (approximately)
+// float32's max value, ~3.4028235e38: Python's f"{value:.0f}" correctly
+// renders the full 39-digit fixed-point integer (matching real Studio 5000
+// output, per _shortest_float32_repr's own docstring), while
+// `value.toFixed(0)` for the same double returns "3.4028234663852886e+38"
+// (its ordinary exponential toString), silently producing the wrong
+// literal shape. Any double this large has no fractional part at all (its
+// magnitude already exceeds what a 52-bit mantissa can represent below the
+// decimal point), so `decimals` is always effectively 0 for these -- BigInt
+// gives the exact integer value with no precision loss.
+function doubleToFixed(value, decimals) {
+  if (Math.abs(value) < 1e21) return value.toFixed(decimals);
+  const intStr = BigInt(value).toString();
+  return decimals > 0 ? `${intStr}.${"0".repeat(decimals)}` : intStr;
+}
+
 function shortestFloat32Repr(value) {
   const targetBuf = new ArrayBuffer(4);
   new DataView(targetBuf).setFloat32(0, value, true);
   const targetBits = new Uint8Array(targetBuf).join(",");
   for (let decimals = 0; decimals < 15; decimals++) {
-    const candidate = value.toFixed(decimals);
+    const candidate = doubleToFixed(value, decimals);
     const buf = new ArrayBuffer(4);
     new DataView(buf).setFloat32(0, parseFloat(candidate), true);
     if (new Uint8Array(buf).join(",") === targetBits) return candidate;
@@ -4537,7 +4584,11 @@ class Routine extends L5xElement {
       });
       if (rungXmls.length) content = `<RLLContent>${rungXmls.join("")}</RLLContent>`;
     } else if (this.type === "ST" && this._stLines.length) {
-      const lineXmls = this._stLines.map((text, i) => `<Line Number="${i}"><![CDATA[${text}]]></Line>`);
+      // Each pair's own local per-group number (already computed by
+      // stRoutineLines()/stLineLocalNumbers() in builders.js) is rendered
+      // verbatim, NOT re-enumerated here -- see those functions for why it
+      // can legitimately repeat within one routine.
+      const lineXmls = this._stLines.map(([number, text]) => `<Line Number="${number}"><![CDATA[${text}]]></Line>`);
       content = `<STContent>${lineXmls.join("")}</STContent>`;
     }
     return `<Routine Name="${escapeXmlAttr(this.name)}" Type="${this.type}">${descXml}${content}</Routine>`;
@@ -5677,27 +5728,55 @@ function parseFffeff(data, offset) {
 
 const ST_LINE_RECORD_TYPE = 0x01000002;
 
+// Groups line records by their own immediate nameless parent_id (the
+// "region" node directly above the line, one level up in the routine ->
+// map -> region -> line tree), sorts each group by seq, and numbers each
+// group locally from 0 -- see the long comment above stRoutineLines's
+// return statement below for why this (not a flat global index, and not
+// each line's raw stored seq value) is what real Studio 5000 actually
+// renders as <Line Number="...">.
+function stLineLocalNumbers(lines) {
+  const groups = new Map();
+  for (const [parentId, seq, text] of lines) {
+    if (!groups.has(parentId)) groups.set(parentId, []);
+    groups.get(parentId).push([seq, text]);
+  }
+  const orderedKeys = [...groups.keys()].sort(
+    (a, b) => Math.min(...groups.get(a).map(([s]) => s)) - Math.min(...groups.get(b).map(([s]) => s)),
+  );
+  const localNumbers = [];
+  const texts = [];
+  for (const key of orderedKeys) {
+    const groupLines = groups.get(key).slice().sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+    groupLines.forEach(([, text], i) => {
+      localNumbers.push(i);
+      texts.push(text);
+    });
+  }
+  return [localNumbers, texts];
+}
+
 function stRoutineLines(db, routineObjectId) {
   const lines = [];
   let frontier = [routineObjectId];
   for (let depth = 0; depth < 6; depth++) {
     if (!frontier.length) break;
     const qmarks = frontier.map(() => "?").join(",");
-    const rows = queryAll(db, `SELECT object_id, record FROM nameless WHERE parent_id IN (${qmarks})`, frontier);
+    const rows = queryAll(db, `SELECT object_id, parent_id, record FROM nameless WHERE parent_id IN (${qmarks})`, frontier);
     frontier = [];
-    for (const [oid, rec] of rows) {
+    for (const [oid, parentId, rec] of rows) {
       frontier.push(oid);
       if (rec.length < 24) continue;
       if (dv(rec).getUint32(4, true) !== ST_LINE_RECORD_TYPE) continue;
       const seq = dv(rec).getUint32(20, true);
       if (seq === 0xffffffff) continue;
       const [text] = parseFffeff(rec, 24);
-      lines.push([seq, text]);
+      lines.push([parentId, seq, text]);
     }
   }
   if (!lines.length) return [];
-  lines.sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
-  let texts = lines.map(([, text]) => text);
+  const [localNumbers, texts0] = stLineLocalNumbers(lines);
+  let texts = texts0;
 
   const allHex = new Set();
   for (const t of texts) {
@@ -5713,7 +5792,37 @@ function stRoutineLines(db, routineObjectId) {
       texts = texts.map((line) => line.replace(/@([0-9a-fA-F]{1,8})@/g, (m, hex) => idToName.get(hex) || m));
     }
   }
-  return texts;
+
+  // Batch-resolve &hexid: module-address references too -- the same
+  // encoding rung text uses (see buildRoutine above). Found via a real
+  // project's ST content: I/O module addresses inside ST (e.g.
+  // "PROC_TT_A001 := N2:5:I.Ch2Data;") are stored as "&hexid:" (the
+  // rung-text encoding), not "@hexid@" -- both placeholder forms can
+  // appear in the same ST routine, so both must be resolved.
+  const allHex2 = new Set();
+  for (const t of texts) {
+    for (const m of t.matchAll(/&([0-9a-f]{8}):/g)) allHex2.add(m[1]);
+  }
+  if (allHex2.size) {
+    const idToName2 = new Map();
+    for (const hexId of allHex2) {
+      const row = queryOne(db, "SELECT comp_name FROM comps WHERE object_id=?", [parseInt(hexId, 16)]);
+      if (row && row[0]) idToName2.set(hexId, row[0]);
+    }
+    if (idToName2.size) {
+      texts = texts.map((line) =>
+        line.replace(/&([0-9a-f]{8}):/g, (m, hex) => (idToName2.has(hex) ? idToName2.get(hex) + ":" : m)),
+      );
+    }
+  }
+  // Returns [localNumber, text] pairs, not bare text -- see
+  // stLineLocalNumbers() above for why a routine's own raw Nameless.Dat
+  // structure can require independently-0-based numbering across more than
+  // one group, matching real Studio 5000's own native L5X output exactly
+  // (confirmed against a real project's Alarms_from_Fox routine, whose
+  // <Line Number="..."> genuinely repeats 0-91 across two back-to-back
+  // runs). Routine.toXml() renders this number verbatim, not re-enumerated.
+  return localNumbers.map((n, i) => [n, texts[i]]);
 }
 
 function lookupObjectDescription(db, r, record) {

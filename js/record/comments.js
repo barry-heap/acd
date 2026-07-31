@@ -25,6 +25,19 @@ function utf8Decode(bytes) {
   return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 }
 
+// Mirrors Kaitai's generated `.decode(u"UTF-8")` (no errors= param, i.e.
+// strict -- raises on invalid bytes) for AsciiRecord/Utf16Record/
+// ControllerRecord's own record_string field (acd/generated/comments/
+// fafa_coments.py) -- despite the "Ascii" name, the real generated parser
+// decodes these as UTF-8, confirmed via a real project's tag description
+// containing an en-dash (U+2013), which Python renders correctly but the
+// previous ascii-with-replace JS decode mangled into replacement
+// characters. Throws on invalid UTF-8 so the caller's outer try/catch can
+// return null the same way Python's strict decode raising would.
+function utf8DecodeStrict(bytes) {
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
 function readCodeUnitsUntilZero(dv, start) {
   // Returns { codeUnits, bytesConsumed } where bytesConsumed includes the
   // terminating zero code unit (2 bytes), mirroring StrzUtf16's code_units.
@@ -151,13 +164,13 @@ function parseCommentsRecord(datRecord) {
       tagRef = String.fromCharCode(...codeUnits);
       const stringsStart = tagRefStart + bytesConsumed + 12;
       const textEnd = indexOfZero(body, stringsStart);
-      recordString = textEnd > stringsStart ? asciiDecode(body.subarray(stringsStart, textEnd)) : "";
+      recordString = textEnd > stringsStart ? utf8DecodeStrict(body.subarray(stringsStart, textEnd)) : "";
     } else if (recordType === 1 || recordType === 2) {
       // AsciiRecord: unknown_1(13) + object_id(u4) + unknown_2(13) + record_string.
       objectId = dvBody.getUint32(13, true);
       tagRef = "";
       const textEnd = indexOfZero(body, 30);
-      recordString = textEnd > 30 ? asciiDecode(body.subarray(30, textEnd)) : "";
+      recordString = textEnd > 30 ? utf8DecodeStrict(body.subarray(30, textEnd)) : "";
       if (body.length >= 8) rungContent = dvBody.getUint32(4, true);
       if (body.length >= 4) memberRef = dvBody.getUint32(0, true);
     } else if (recordType === 23 || recordType === 25) {
@@ -169,7 +182,7 @@ function parseCommentsRecord(datRecord) {
       const { bytesConsumed } = readCodeUnitsUntilZero(dvBody, tagRefStart);
       const stringsStart = tagRefStart + bytesConsumed + 12;
       const textEnd = indexOfZero(body, stringsStart);
-      recordString = textEnd > stringsStart ? asciiDecode(body.subarray(stringsStart, textEnd)) : "";
+      recordString = textEnd > stringsStart ? utf8DecodeStrict(body.subarray(stringsStart, textEnd)) : "";
     } else {
       return null;
     }
