@@ -2170,7 +2170,10 @@ class Routine(L5xElement):
     one routine), used verbatim, not renumbered again here.
     `._rung_comments` maps a rung index to its comment text. `._rung_ids[i]`
     is the integer object_id patch_rungs() needs to identify rung i for a
-    write-back edit -- NOT the same as its index i."""
+    write-back edit -- NOT the same as its index i. `._fbd_network`, when
+    set, is a (blocks, iref_feeds, oref_writes) tuple decoded from an FBD
+    routine's own compiled ladder-equivalent rungs by _parse_fbd_network()
+    -- see that function's own module-level comment for the full mechanism."""
 
     name: str
     type: str
@@ -2179,6 +2182,8 @@ class Routine(L5xElement):
     _rung_comments: Dict[int, str] = field(default_factory=dict)
     _description: Union[str, None] = field(default=None)
     _st_lines: List[Tuple[int, str]] = field(default_factory=list)
+    _fbd_network: Union[Tuple[Dict, Dict, List], None] = field(default=None)
+    _aoi_inout_order: Dict[str, List[str]] = field(default_factory=dict)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -2215,6 +2220,10 @@ class Routine(L5xElement):
                 for number, text in self._st_lines
             ]
             content = f'<STContent>{"".join(line_xmls)}</STContent>'
+        elif self.type == "FBD" and self._fbd_network:
+            blocks, iref_feeds, oref_writes = self._fbd_network
+            if blocks or oref_writes:
+                content = _render_fbd_content(blocks, iref_feeds, oref_writes, self._aoi_inout_order)
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
 
 
@@ -3840,8 +3849,15 @@ class RoutineBuilder(L5xElementBuilder):
         if routine_type == "ST":
             st_lines = _st_routine_lines(self._cur, self._object_id)
 
+        fbd_network = None
+        if routine_type == "FBD":
+            shadow_oid = _fbd_shadow_region(self._cur, self._object_id)
+            if shadow_oid is not None:
+                fbd_rungs = _fbd_compiled_rungs(self._cur, shadow_oid)
+                fbd_network = _parse_fbd_network(fbd_rungs)
+
         return Routine(
-            name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines
+            name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines, fbd_network
         )
 
 
@@ -4007,6 +4023,453 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[Tuple[int, st
             break
         texts = new_texts
     return list(zip(local_numbers, texts))
+
+
+# ---------------------------------------------------------------------------
+# FBD (Function Block Diagram) routine content
+# ---------------------------------------------------------------------------
+#
+# Nothing upstream (hutcheb/acd -> PascalGodin/acd -> this repo) has ever
+# decoded FBD content -- it parses as an empty <Routine Type="FBD"/> shell.
+# Reverse-engineered via a real Studio 5000 project + matching L5X ground
+# truth (see CLAUDE.md's "FBD routine content" section for the full
+# investigation, byte offsets, and verification results).
+#
+# The short version: Studio 5000 compiles every FBD network down to an
+# equivalent ladder-logic program at save time, and stores it exactly the
+# same way a "shadow"/compiled ST copy is stored (see the ST section above
+# for the general pattern) -- as region_map/rungs rows under a synthetic
+# parent_id that has no Comps.Dat object of its own. The correlation from a
+# real FBD routine's own comps object to that shadow parent_id is:
+#
+#   1. The routine's own comps record has several 4-byte extended-record
+#      attribute values that are themselves other objects' object_ids.
+#   2. One of those references a Nameless.Dat object whose own record type
+#      (u32 at offset 4) is 0x01000002 -- the same type ST's own individual
+#      source-line records use, but here it's a single "compiled neutral
+#      text" blob, not a per-line record.
+#   3. That node's own nameless subtree (walked via parent_id, fanning out
+#      to multiple children at each level -- NOT a fixed number of hops)
+#      eventually contains an object_id that owns rows in region_map. That
+#      object IS the shadow parent for the routine's compiled rungs.
+#   4. A single stray/decoy region_map owner with only a handful of rows can
+#      appear elsewhere in the same subtree (observed: one with exactly 1
+#      row, clearly not a compiled program) -- so the real one is identified
+#      as whichever candidate owns by far the most region_map rows, not
+#      "the first one found" during the walk.
+#
+# The compiled program itself (region_map rows, ordered by the same
+# `unknown` column already used and verified for real RLL rungs) is an
+# ordinary sequence of ladder instructions using only instructions and
+# addressing this codebase already parses correctly as plain rung text --
+# no new binary parsing is needed for the rungs themselves, only for
+# *finding* them. Each rung is one of exactly three shapes:
+#
+#   - Block instance: `OTL(Op.EnableIn)...pairs...XIC(Op.EnableIn)MNEMONIC(Op);`
+#     -- MNEMONIC is the FBD block's own Type (ALMA, BNOT, RLIM, TONR, ...);
+#     Op is its operand (instance tag) name. The "...pairs..." in between are
+#     `MOV(src, Op.Pin)` or `XIC(src)OTE(Op.Pin)ATI()` -- each is one wire
+#     into that block's own Pin, where src is either another block's own
+#     `OtherOp.Pin` directly (a direct block-to-block wire) or a synthetic
+#     pseudo-tag (`__l` + 16 hex digits).
+#   - IRef feed: a small standalone rung `MOV(RealTag, __lHEX);` or
+#     `XIC(RealTag)OTE(__lHEX)ATI();` with no trailing block instruction --
+#     RealTag is the IRef's own Operand, resolved back through the
+#     pseudo-tag wherever it's used as a block's own wire source.
+#   - ORef write: a standalone rung `MOV(src, RealTag);` or
+#     `XIC(src)OTE(RealTag)ATI();` with no trailing block instruction, where
+#     src is a block's own output pin (`Op.Pin`) -- RealTag is the ORef's
+#     own Operand.
+#
+# Verified end-to-end against a real Studio 5000 L5X export of the original
+# test routine (`PROC_RATE_ALARM`): 6/6 blocks and 18/18 wires (14 into
+# blocks + 4 ORef writes) match exactly, confirmed programmatically (parsing
+# the real L5X's own <IRef>/<ORef>/<Block>/<Wire> elements into an
+# equivalent (source, dest) set and diffing, not by inspection). Re-verified
+# against all 28 real FBD routines in a large production project (including
+# one embedded inside an AddOnInstructionDefinition) -- see CLAUDE.md for
+# the full per-routine results and any bugs found along the way.
+#
+# What is NOT recovered, and not required for a first pass per the project
+# scope: Studio's own sheet X/Y positions and its own arbitrary IRef/ORef/
+# Block/Wire ID numbers (a handful of still-undeciphered nameless
+# "bookkeeping" records nearby likely hold this), and VisiblePins/HideDesc
+# (Studio can show a pin with no wiring at all -- e.g. a block's own
+# InAlarm output shown but never wired to anything in the real ground-truth
+# routine -- which leaves zero trace in the compiled ladder representation,
+# so VisiblePins here is only ever a subset of Studio's own real one).
+
+_FBD_COMPILED_BLOB_RECORD_TYPE = 0x01000002
+
+_FBD_PLUMBING_INSTR = {"OTL", "OTU", "MOV", "XIC", "OTE", "ATI"}
+
+# [A-Z0-9_]* (not just [A-Z0-9]*) -- an AOI instance called from within an
+# FBD network keeps its own full definition name as the compiled
+# instruction mnemonic (e.g. "AOI_VESSEL(...)"), which almost always
+# contains an underscore by real-world naming convention. The narrower
+# character class silently truncated "AOI_VESSEL" to "TANK" (matching from
+# the first uppercase run after the skipped "AOI_" instead of failing
+# outright) -- found via a real project where this affected the large
+# majority of its real FBD routines (any one wrapping an AOI instance).
+_FBD_INSTR_RE = re.compile(r"([A-Z][A-Z0-9_]*)\(([^()]*)\)")
+
+
+def _fbd_shadow_region(cur: Cursor, routine_object_id: int) -> Union[int, None]:
+    """Find the synthetic (no Comps.Dat object of its own) region_map
+    parent_id that owns an FBD routine's compiled ladder-equivalent rungs.
+    Returns None if this routine has no compiled FBD content to find (e.g.
+    a genuinely empty FBD routine, or the correlation didn't turn up
+    anything -- callers should fall back to the empty-shell rendering
+    rather than raise)."""
+    cur.execute("SELECT record FROM comps WHERE object_id=?", (routine_object_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        r = RxGeneric.from_bytes(row[0])
+    except Exception:
+        return None
+
+    candidate_children = []
+    for er in r.extended_records:
+        if len(er.value) == 4:
+            candidate_children.append(struct.unpack("<I", er.value)[0])
+
+    compiled_blob_oid = None
+    for oid in candidate_children:
+        cur.execute("SELECT record FROM nameless WHERE object_id=?", (oid,))
+        nrow = cur.fetchone()
+        if not nrow or len(nrow[0]) < 8:
+            continue
+        if struct.unpack_from("<I", nrow[0], 4)[0] == _FBD_COMPILED_BLOB_RECORD_TYPE:
+            compiled_blob_oid = oid
+            break
+    if compiled_blob_oid is None:
+        return None
+
+    frontier = [compiled_blob_oid]
+    best_oid, best_count = None, 0
+    seen: set = set()
+    for _depth in range(6):
+        frontier = [o for o in frontier if o not in seen]
+        if not frontier:
+            break
+        seen.update(frontier)
+        qmarks = ",".join("?" * len(frontier))
+        cur.execute(
+            f"SELECT parent_id, COUNT(*) FROM region_map WHERE parent_id IN ({qmarks}) GROUP BY parent_id",
+            frontier,
+        )
+        for oid, count in cur.fetchall():
+            if count > best_count:
+                best_oid, best_count = oid, count
+        cur.execute(f"SELECT object_id FROM nameless WHERE parent_id IN ({qmarks})", frontier)
+        frontier = [row[0] for row in cur.fetchall()]
+    return best_oid
+
+
+def _fbd_compiled_rungs(cur: Cursor, shadow_oid: int) -> List[str]:
+    """Ordered compiled ladder-equivalent rung texts for an FBD routine's
+    shadow region -- same query shape RoutineBuilder already uses for real
+    RLL rungs (ORDER BY the region_map `unknown` column)."""
+    cur.execute(
+        "SELECT rm.unknown, r.rung FROM region_map rm "
+        "LEFT JOIN rungs r ON r.object_id = rm.object_id "
+        "WHERE rm.parent_id=? ORDER BY rm.unknown",
+        (shadow_oid,),
+    )
+    return [rung for _seq, rung in cur.fetchall() if rung is not None]
+
+
+def _parse_fbd_network(rungs: List[str]):
+    """Parse compiled ladder-equivalent rungs into an FBD block/wire graph.
+
+    Returns (blocks, iref_feeds, oref_writes):
+      blocks: {block_operand: {"type": mnemonic, "wires_in": {"Op.Pin": src},
+                                "extra_args": [...]}}
+      iref_feeds: {pseudo_tag_or_real_tag: source_real_tag} (feeder rungs)
+      oref_writes: [(source_expr, dest_real_tag), ...]
+
+    `extra_args` holds any positional arguments after the operand in the
+    final instruction call -- e.g. `AOI_VESSEL(TANK03,TANK03_GA,TANK03_PA,TANK03_OA,
+    TANK03_FRA)` has extra_args ["TANK03_GA","TANK03_PA","TANK03_OA","TANK03_FRA"].
+    Empty for ordinary built-in FBD instructions (ALMA, BNOT, RLIM, TONR,
+    ...), which only ever take their own operand. Real Studio 5000 renders
+    this case as a completely different L5X element (<AddOnInstruction>
+    with <InOutParameter> children, not <Block> with <Wire>-based pin
+    wiring) -- see _render_fbd_content().
+
+    See the module-level comment above this section for the exact rung
+    shapes this recognizes."""
+    blocks: Dict[str, Dict] = {}
+    iref_feeds: Dict[str, str] = {}
+    oref_writes: List[Tuple[str, str]] = []
+
+    for text in rungs:
+        text = text.rstrip(";") if text else ""
+        calls = _FBD_INSTR_RE.findall(text)
+        if not calls:
+            continue
+        mnemonics = [c[0] for c in calls]
+
+        if mnemonics[0] == "OTL" and mnemonics[-1] not in _FBD_PLUMBING_INSTR:
+            block_type = mnemonics[-1]
+            final_args = [a.strip() for a in calls[-1][1].split(",")]
+            # Stateless "math"/bitwise instructions (AND, and presumably
+            # OR/BAND/BOR/NOT/etc.) use a different shape, found via a local
+            # test fixture (not the primary real project this decoder was
+            # verified against, so no ground truth exists to confirm pin
+            # names beyond what's already inferable): the whole call is
+            # wrapped in `start_block(Op.Member)`/`end_block(Op.Member)`
+            # markers (lowercase mnemonics -- never matched by
+            # _FBD_INSTR_RE's `[A-Z]`-anchored pattern, so they simply don't
+            # appear in `calls` at all and need no special skip logic here),
+            # and the final call's own arguments are THEMSELVES dot-qualified
+            # "Op.Pin" pin references (e.g. `AND(AND_01.SourceA,
+            # AND_01.SourceB,AND_01.Dest)`), not one bare operand followed by
+            # AOI-style extra positional args. A normal block/AOI operand is
+            # always a bare name with no dot, so every final argument sharing
+            # the identical dot-prefix is the signal to use here -- that
+            # shared prefix is the block's own operand name. The individual
+            # pin wires themselves (e.g. wires_in["AND_01.SourceA"]) are
+            # still populated correctly below by the ordinary MOV/XIC pair
+            # loop, which reads each pin name verbatim from the rung text
+            # the same already-verified way every other block does -- this
+            # branch only needs to fix the operand name, not the wiring.
+            final_prefixes = [a.split(".", 1)[0] for a in final_args if "." in a]
+            if len(final_prefixes) == len(final_args) and len(set(final_prefixes)) == 1:
+                block_operand, extra_args = final_prefixes[0], []
+            else:
+                block_operand, extra_args = final_args[0], final_args[1:]
+            blocks.setdefault(block_operand, {"type": block_type, "wires_in": {}, "extra_args": extra_args})
+            i = 1
+            while i < len(calls) - 1:
+                mnem, args = calls[i]
+                if mnem == "MOV":
+                    src, dst = [a.strip() for a in args.split(",", 1)]
+                    blocks[block_operand]["wires_in"][dst] = src
+                    i += 1
+                elif mnem == "XIC":
+                    src = args.strip()
+                    if i + 1 < len(calls) and calls[i + 1][0] == "OTE":
+                        dst = calls[i + 1][1].strip()
+                        blocks[block_operand]["wires_in"][dst] = src
+                        i += 2
+                        if i < len(calls) and calls[i][0] == "ATI":
+                            i += 1
+                        continue
+                    i += 1
+                elif mnem in ("OTL", "OTU"):
+                    # A mid-rung OTL/OTU (not the leading OTL(Op.EnableIn) at
+                    # i==0, which is just the "this rung is a block" marker)
+                    # means that single pin is wired to a literal constant
+                    # (1 for OTL, 0 for OTU) rather than left disconnected --
+                    # a real, deliberate wire the user drew in the FBD editor
+                    # to a constant value, which real Studio renders as an
+                    # ordinary IRef whose own Operand is the literal digit
+                    # (e.g. `<IRef Operand="0"/>`), not specially. Verified
+                    # against a real project: an AOI's own "Logic" routine
+                    # wires a literal 0 into an ALMA block's AckRequired pin
+                    # this way (`OTU(ROOF_ALM.AckRequired)`).
+                    dst = args.strip()
+                    blocks[block_operand]["wires_in"][dst] = "1" if mnem == "OTL" else "0"
+                    i += 1
+                else:
+                    i += 1
+            continue
+
+        # Not a block-execution rung: an IRef feeder (destination is a
+        # pseudo-tag) or an ORef writer (destination is a real project tag).
+        if mnemonics == ["MOV"]:
+            src, dst = [a.strip() for a in calls[0][1].split(",", 1)]
+            if dst.startswith("__l"):
+                iref_feeds[dst] = src
+            else:
+                oref_writes.append((src, dst))
+        elif len(mnemonics) >= 2 and mnemonics[0] == "XIC" and mnemonics[1] == "OTE":
+            src = calls[0][1].strip()
+            dst = calls[1][1].strip()
+            if dst.startswith("__l"):
+                iref_feeds[dst] = src
+            else:
+                oref_writes.append((src, dst))
+
+    return blocks, iref_feeds, oref_writes
+
+
+def _fbd_resolve_source(src: str, iref_feeds: Dict[str, str]) -> str:
+    """Resolve one wire's source expression back to its real tag.
+
+    A pseudo-tag can be referenced with a trailing numeric bit-index (e.g.
+    `__l2621AF94E947AB0D.19`) when several boolean IRefs are packed into one
+    word-sized feed (verified against a real project: several
+    `AOI_ALM2` instances each consume a different bit of one shared word
+    fed from a tag's own hidden bit-host member, e.g.
+    `MOV(TANK19_SUP.__BitHost00,__l2621AF94E947AB0D);` then
+    `XIC(__l2621AF94E947AB0D.19)OTE(...)`). The base pseudo-tag resolves via
+    `iref_feeds` same as any other, but the bit INDEX itself is not further
+    resolved to its real named bit-overlay member (e.g. real Studio shows
+    `TANK19_SUP.OpenLS`, not a raw bit index) -- doing that would need the
+    feed tag's own DataType/UDT member list (which member has this bit
+    number and this backing field as its target), not available at this
+    decode layer. Left as `RealTag.__BitHost00.19` -- traceable back to a
+    real tag and a real bit position, just not the friendly member name."""
+    if src in iref_feeds:
+        return iref_feeds[src]
+    if "." in src:
+        base, suffix = src.split(".", 1)
+        if base in iref_feeds:
+            return f"{iref_feeds[base]}.{suffix}"
+    return src
+
+
+def _fbd_resolve_wires(blocks: Dict[str, Dict], iref_feeds: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Flatten every block's own wires_in into (source, "Op.Pin") pairs,
+    resolving pseudo-tags back to their real feeder source. `dst` is
+    already the fully-qualified "BlockOperand.Pin" form (it appeared
+    literally inside the compiled instruction's own argument list)."""
+    resolved = []
+    for _block_operand, info in blocks.items():
+        for dst, src in info["wires_in"].items():
+            resolved.append((_fbd_resolve_source(src, iref_feeds), dst))
+    return resolved
+
+
+def _fbd_split_pin_ref(ref: str, blocks: Dict[str, Dict]) -> Tuple[str, Union[str, None]]:
+    """Split a wire endpoint into (operand, pin). A dot alone doesn't mean
+    "block pin" -- an IRef/ORef's own Operand can legitimately be a
+    tag.member reference (e.g. "TANK16_RET.CloseLS", verified against a real
+    project), which must stay intact, not get mis-split. Only split at the
+    LAST dot, and only when the part before it is a name we already know is
+    a block operand; otherwise the whole string is the operand (an IRef/
+    ORef) with no pin at all."""
+    if "." in ref:
+        op, pin = ref.rsplit(".", 1)
+        if op in blocks:
+            return op, pin
+    return ref, None
+
+
+def _render_fbd_content(
+    blocks: Dict[str, Dict],
+    iref_feeds: Dict[str, str],
+    oref_writes: List[Tuple[str, str]],
+    aoi_inout_order: Union[Dict[str, List[str]], None] = None,
+) -> str:
+    """Render a decoded FBD block/wire graph as <FBDContent><Sheet>...
+    XML. IDs are assigned deterministically (sorted by operand/tag name
+    within each element kind) since Studio's own arbitrary numbering isn't
+    recoverable; X/Y positions are a simple synthetic grid, not Studio's own
+    layout -- see the module comment above for why both are out of scope
+    for a first pass. VisiblePins lists only the pins this decode actually
+    observed wired, plus (for an AOI instance) its own InOut parameter
+    names -- a real block/AOI instance can have additional pins Studio
+    shows with no wiring at all, which leaves no trace here.
+
+    A block whose own mnemonic matches a real project AOI's name (looked up
+    in `aoi_inout_order`, keyed upper-case) is an AOI instance, not a
+    built-in FBD instruction -- rendered as <AddOnInstruction Name="...">
+    with <InOutParameter Name="..." Argument="..."/> children (one per
+    `extra_args` entry, in order, paired with that AOI's own declared
+    InOut parameter names in declaration order -- verified exactly against
+    a real project's ground truth), a completely different L5X shape from
+    a built-in instruction's plain <Block>/<Wire> pin wiring."""
+    aoi_inout_order = aoi_inout_order or {}
+    wires = _fbd_resolve_wires(blocks, iref_feeds)
+
+    block_pins_seen: Dict[str, List[str]] = {}
+    for _src, dst in wires:
+        op, pin = _fbd_split_pin_ref(dst, blocks)
+        if pin is None:
+            continue
+        block_pins_seen.setdefault(op, [])
+        if pin not in block_pins_seen[op]:
+            block_pins_seen[op].append(pin)
+
+    all_wire_endpoints = (
+        [src for src, _dst in wires]
+        + [dst for _src, dst in wires]
+        + [src for src, _dst in oref_writes]
+        + [dst for _src, dst in oref_writes]
+    )
+    iref_operands = sorted(
+        {_fbd_split_pin_ref(ref, blocks)[0] for ref in all_wire_endpoints}
+        - set(blocks.keys())
+        - {dst for _src, dst in oref_writes}
+    )
+    oref_operands = sorted({dst for _src, dst in oref_writes})
+    block_operands = sorted(blocks.keys())
+
+    id_map: Dict[str, int] = {}
+    next_id = 0
+    for op in iref_operands + oref_operands + block_operands:
+        id_map[op] = next_id
+        next_id += 1
+
+    elements_xml = []
+    x = 100
+    for op in iref_operands:
+        elements_xml.append(f'<IRef ID="{id_map[op]}" X="{x}" Y="100" Operand="{_escape_xml_attr(op)}" HideDesc="false"/>')
+        x += 120
+    x = 100
+    for op in oref_operands:
+        elements_xml.append(f'<ORef ID="{id_map[op]}" X="{x}" Y="700" Operand="{_escape_xml_attr(op)}" HideDesc="false"/>')
+        x += 120
+    x = 100
+    for op in block_operands:
+        info = blocks[op]
+        inout_names = aoi_inout_order.get(info["type"].upper())
+        if inout_names is not None:
+            extra_args = info.get("extra_args", [])
+            inout_xml = "".join(
+                f'<InOutParameter Name="{_escape_xml_attr(pname)}" Argument="{_escape_xml_attr(arg)}"/>'
+                for pname, arg in zip(inout_names, extra_args)
+            )
+            visible_pins = " ".join(block_pins_seen.get(op, []) + inout_names)
+            elements_xml.append(
+                f'<AddOnInstruction Name="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
+                f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}">'
+                f'{inout_xml}</AddOnInstruction>'
+            )
+        else:
+            visible_pins = " ".join(block_pins_seen.get(op, []))
+            elements_xml.append(
+                f'<Block Type="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
+                f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}" HideDesc="false"/>'
+            )
+        x += 200
+
+    wires_xml = []
+    for src, dst in wires:
+        dst_op, dst_pin = _fbd_split_pin_ref(dst, blocks)
+        to_id = id_map.get(dst_op)
+        # A block-input wire's own dst is always "Op.Pin" text taken
+        # verbatim from the compiled rung, so dst_pin should never be None
+        # here; guard anyway so a not-yet-understood instruction shape
+        # degrades to a dropped (logged) wire rather than a literal "None"
+        # string leaking into the rendered XML's ToParam attribute.
+        if to_id is None or dst_pin is None:
+            log.warning(f"_render_fbd_content: could not resolve block-input wire destination {dst!r}; dropping wire")
+            continue
+        src_op, src_pin = _fbd_split_pin_ref(src, blocks)
+        from_id = id_map.get(src_op)
+        if from_id is None:
+            continue
+        from_param_xml = f' FromParam="{_escape_xml_attr(src_pin)}"' if src_pin else ""
+        wires_xml.append(f'<Wire FromID="{from_id}"{from_param_xml} ToID="{to_id}" ToParam="{_escape_xml_attr(dst_pin)}"/>')
+    for src, dst in oref_writes:
+        to_id = id_map.get(dst)
+        if to_id is None:
+            continue
+        src_op, src_pin = _fbd_split_pin_ref(src, blocks)
+        from_id = id_map.get(src_op)
+        if from_id is None:
+            continue
+        from_param_xml = f' FromParam="{_escape_xml_attr(src_pin)}"' if src_pin else ""
+        wires_xml.append(f'<Wire FromID="{from_id}"{from_param_xml} ToID="{to_id}"/>')
+
+    sheet_xml = "".join(elements_xml) + "".join(wires_xml)
+    return f'<FBDContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="Landscape"><Sheet Number="1">{sheet_xml}</Sheet></FBDContent>'
 
 
 def _lookup_object_description(cur: Cursor, r, record: bytes) -> Union[str, None]:
@@ -4825,6 +5288,36 @@ class ControllerBuilder(L5xElementBuilder):
         # <Comments> block. A genuine user comment on a whole AOI-typed member
         # would not coincidentally equal one of that AOI's own parameter names
         # verbatim, so this is a safe, narrow filter.
+        # An AOI instance called from inside an FBD network's compiled rungs
+        # (e.g. "AOI_VESSEL(TANK03,TANK03_GA,TANK03_PA,TANK03_OA,TANK03_FRA)") passes its
+        # own InOut parameters as extra positional arguments, in the AOI's
+        # own declaration order -- verified against a real project's ground-
+        # truth L5X: the compiled call's own extra-arg order matches
+        # `aoi.parameters`' declaration order restricted to usage=="InOut"
+        # exactly (LEVEL_ALM, PROG_ALM, OPER_LVL_ALM,
+        # ROOF_ALM for AOI_VESSEL). Rendered as this real project's own
+        # `<InOutParameter Name="..." Argument="..."/>` child elements
+        # (a completely different L5X shape from a built-in FBD
+        # instruction's plain <Wire>-based pin wiring), which is why FBD
+        # rendering needs each AOI's own InOut parameter order -- not
+        # available yet when each Routine is first built (RoutineBuilder
+        # runs from within ProgramBuilder/AoiBuilder, before this
+        # controller-level aois list exists), so it's attached here, the
+        # same way `_data_types_map` is attached to tags post-hoc below.
+        _aoi_inout_order = {
+            aoi.name.upper(): [p.name for p in aoi.parameters if p.usage == "InOut"]
+            for aoi in aois
+        }
+        if _aoi_inout_order:
+            def _attach_aoi_inout_order(routine_list: List[Routine]) -> None:
+                for _routine in routine_list:
+                    if _routine.type == "FBD" and _routine._fbd_network:
+                        _routine._aoi_inout_order = _aoi_inout_order
+            for _prog in programs:
+                _attach_aoi_inout_order(_prog.routines)
+            for _aoi in aois:
+                _attach_aoi_inout_order(_aoi.routines)
+
         _aoi_param_names = {
             aoi.name.upper(): {p.name for p in aoi.parameters} for aoi in aois
         }

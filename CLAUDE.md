@@ -377,6 +377,125 @@ ever find `_st_routine_lines()` missing a resolution that should have happened, 
 because a comps name is itself still a raw placeholder (bug 2's exact scenario) before assuming a
 new root cause.
 
+## FBD (Function Block Diagram) routine content
+
+Like ST (see above), FBD routine content is **not** stored as its own native binary shape —
+Studio 5000 compiles an FBD sheet down to an equivalent ladder-logic ("compiled neutral text")
+program at save time, stored via the exact same `region_map`/`rungs` SQL tables real RLL rungs
+use, under a synthetic shadow region with no `Comps.Dat` object of its own (the same general
+"shadow/compiled copy" pattern already documented for ST). Correlation mechanism
+(`_fbd_shadow_region()`): a routine's own comps record has 4-byte extended-record attributes
+referencing other objects; one references a `Nameless.Dat` object with record_type `0x01000002`
+(the same record type ST source lines use, but here a single "compiled neutral text" blob, not
+per-line records) — BFS down that node's nameless subtree (fanning out at each level, bounded to
+6 depth levels, not a fixed hop count) finds whichever descendant owns by far the MOST
+`region_map` rows (a decoy/stale single-row region_map owner elsewhere in the same subtree was
+observed in real data, so "first match" isn't reliable — must pick the max, same lesson as the
+`RegnLink.Idx` stale-entry handling documented elsewhere in this file).
+
+**Confirmed working unchanged for an FBD routine embedded inside an
+`AddOnInstructionDefinition`** (not just a Program) — `AOI_VESSEL`'s own "Logic" routine resolves
+via the exact same `_fbd_shadow_region()`/BFS mechanism with zero AOI-specific special-casing,
+verified as an exact match against real Studio 5000 ground truth. The only AOI-specific handling
+needed anywhere in this feature is unrelated to routine *location* — it's about rendering an
+AOI-*instance* block correctly (see below).
+
+**Compiled-rung instruction grammar** (`_parse_fbd_network()`), reverse-engineered directly
+against real ground truth (`RefProjA_V33_R17_4.ACD`/`.L5X`, a large real project with 28 FBD
+routines, one embedded in an AOI):
+- Block-execution rung: `OTL(Op.EnableIn)...wiring pairs...XIC(Op.EnableIn)MNEMONIC(Op);` —
+  MNEMONIC is the block's Type (`ALMA`/`BNOT`/`RLIM`/`TONR`/etc. for built-ins, or an AOI's own
+  definition name like `AOI_VESSEL`/`AOI_ALM2` for AOI instances).
+- Wiring pairs inside a block rung: `MOV(src,Op.Pin)` or `XIC(src)OTE(Op.Pin)ATI()`.
+- A mid-rung `OTL(Op.Pin)`/`OTU(Op.Pin)` (not the leading position-0 `OTL`, which is just the
+  "this rung is a block" marker) means that pin is wired to a literal constant 1/0, not left
+  disconnected — real Studio renders this as a genuine `<IRef Operand="1"/>`/`<IRef
+  Operand="0"/>`, a real FBD feature (literal constants can be IRef sources). Verified: an AOI's
+  own "Logic" routine wires a literal 0 into an ALMA block's `AckRequired` pin this way.
+- IRef feeder rung: `MOV(RealTag,__lHEX);` or `XIC(RealTag)OTE(__lHEX)ATI();` (no trailing block
+  instruction) — resolves the pseudo-tag (`__l` + 16 hex digits) back to its real source tag.
+- ORef writer rung: `MOV(src,RealTag);` or `XIC(src)OTE(RealTag)ATI();` (no trailing block
+  instruction) where `src` is a block's own output pin.
+- **AOI-instance calls take extra positional arguments beyond the operand**
+  (`AOI_VESSEL(TANK03,TANK03_GA,TANK03_PA,TANK03_OA,TANK03_FRA)`), corresponding 1:1 in order to that AOI's
+  own declared InOut parameters (verified exactly: `LEVEL_ALM`, `PROG_ALM`,
+  `OPER_LVL_ALM`, `ROOF_ALM`). Rendered as a **completely different L5X element**:
+  `<AddOnInstruction Name="AOI_VESSEL" ...><InOutParameter Name="..." Argument="..."/></AddOnInstruction>`,
+  not `<Block Type="...">` with `<Wire>`-based pin wiring. `_aoi_inout_order` (AOI name upper-cased
+  → ordered InOut parameter names) is threaded onto each FBD `Routine` post-hoc from
+  `ControllerBuilder.build()`, the same dataclass-field-attached-after-the-fact pattern already
+  used for `tag._data_types_map`, since `RoutineBuilder` runs before the controller-level AOI list
+  exists.
+- IRef/ORef operands can themselves be dotted `tag.member` references (e.g.
+  `TANK16_RET.CloseLS`, confirmed in real ground truth) — **not** the same as a block-pin reference
+  (`BlockOperand.Pin`). `_fbd_split_pin_ref()` disambiguates correctly by checking whether the
+  part before the dot is a known block operand, not just checking for dot-presence (an earlier,
+  wrong version assumed any dot meant "block pin" and corrupted these real tag.member IRefs).
+- A single pseudo-tag can be referenced with a trailing bit index (`__lHEX.19`) when several
+  boolean IRefs are packed into one word-sized feed via a hidden bit-host member (e.g.
+  `MOV(TANK19_SUP.__BitHost00,__lHEX);` then consumers reference `__lHEX.19`, `__lHEX.27`, etc.) —
+  the same "hidden bit-overlay backing field" pattern documented elsewhere in this file for
+  TIMER/COUNTER. `_fbd_resolve_source()` resolves the pseudo-tag base but **does not** map the
+  bit index back to its real named bit-overlay member — see "Known gap" below.
+
+**`_render_fbd_content()`** renders `<FBDContent><Sheet Number="1">...</Sheet></FBDContent>`,
+assigning synthetic sequential IDs (sorted by operand name, IRefs then ORefs then Blocks) and a
+simple synthetic X/Y grid — **deliberately not** Studio's own layout/ID numbering, per this
+round's explicit scope (functional correctness — right blocks, right wiring, right parameters —
+is the bar; exact sheet layout fidelity and Studio's own arbitrary element IDs are not). Emits
+`<AddOnInstruction>`/`<InOutParameter>` for a block whose type matches a known AOI name (via
+`aoi_inout_order`), else a plain `<Block Type="..." .../>`. `VisiblePins` includes only pins
+actually observed wired (plus, for an AOI instance, its own InOut parameter names) — documented
+as an incomplete approximation, since a real block/AOI instance can show an unwired pin too (e.g.
+a real `InAlarm` pin shown but never wired) with no trace of that left anywhere in the compiled
+rungs to recover.
+
+**Verification**: built the whole `Controller` object graph once, iterated every FBD routine
+(`programs[*].routines` + `aois[*].routines`) in the real 28-routine project, matched each
+against its own real Studio 5000 L5X export (disambiguating same-named routines by
+Program/AOI scope, since e.g. multiple AOIs each have a routine literally named "Logic"), and
+diffed blocks/wires/oref-writes/InOutParameter sets programmatically (not by eye) — **27/28
+routines match exactly**. Confirmed **zero multi-sheet FBD routines exist anywhere in this
+project** (every one of the 28 has exactly one `<Sheet>`) — multi-sheet handling is therefore
+**untested**, not proven to work; treat it as an open risk if a future project has one, don't
+assume the single-sheet renderer generalizes.
+
+**Known gap (1 routine, fully understood, not mysterious)**: `UNIT_STATUS` is the sole mismatch.
+Its wires resolve to `RealTag.__BitHost00.N` (a bit index into the pseudo-tag's own hidden
+bit-host member) where real Studio shows the friendly bit-overlay member name instead (e.g.
+`TANK19_SUP.OpenLS`). Fixing this needs the fed tag's own DataType/UDT member list (which member
+has this bit number and this backing field as its target) cross-referenced at this decode layer,
+which `_fbd_resolve_source()` doesn't have access to today — left as a documented limitation
+rather than guessed at.
+
+**A second, distinct instruction convention found via broader fixture testing (NOT the main
+verified project)**: re-running the pre-existing small repo fixtures `ACDTestsWithAOI.ACD`/
+`ACDTestsNonRedundant.ACD` as a regression check (previously silently rendering FBD as empty
+shells) turned up a real `FBDRoutine` containing stateless "math"/bitwise blocks (`AND`, likely
+shared by `OR`/`BAND`/`BOR`/`NOT`/etc.) using a shape never seen in the main project: wrapped in
+`start_block(Op.Member)`/`end_block(Op.Member)` markers (lowercase mnemonics — never matched by
+`_FBD_INSTR_RE`'s `[A-Z]`-anchored pattern, so they simply don't appear as parsed calls at all,
+no special skip logic needed), with the final instruction call's own arguments being THEMSELVES
+dot-qualified `Op.Pin` pin references (`AND(AND_01.SourceA,AND_01.SourceB,AND_01.Dest)`) rather
+than one bare operand followed by AOI-style extra positional args. The original
+`block_operand = final_args[0]` logic took `"AND_01.SourceA"` (a dotted member reference) as if
+it were the whole bare operand, producing a corrupted `<Block Operand="AND_01.SourceA">` and a
+literal Python `None` leaking into a `ToParam="None"` attribute (the pin lookup failed since
+`"AND_01"` was never actually a key in `blocks`). Fixed by detecting when every final-call
+argument shares an identical dot-prefix (a normal block/AOI operand is always a bare name with no
+dot, so this is an unambiguous signal) and deriving `block_operand` from that shared prefix
+instead — the individual pin wires themselves needed no fix, since they're populated by the
+ordinary MOV/XIC-pair loop reading each pin name verbatim from the rung text, the exact same
+already-verified mechanism every other block uses. Also added a defensive guard in
+`_render_fbd_content()` so a wire whose destination pin can't be resolved is dropped (with a
+`log.warning()`) rather than ever rendering a literal `"None"` into XML, independent of this
+specific root cause. **No ground-truth L5X exists for either small fixture** (only
+`resources/CuteLogix.ACD` has one, and it has no FBD content at all), so this fix is verified only
+for structural sanity (no crash, no garbage/`None` in the output, blocks/wires look internally
+consistent) — not byte-exact against a real Studio 5000 export the way the main 28-routine
+project was. If you ever add ground truth for these fixtures (or hit this shape in a new real
+project), re-verify properly rather than trusting this as "done."
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*
