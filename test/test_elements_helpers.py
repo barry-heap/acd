@@ -683,3 +683,45 @@ def test_render_fbd_content_multi_sheet_splits_cross_sheet_wire_via_oconicon():
     sheet2_xml = xml.split('<Sheet Number="2">')[1].split("</Sheet>")[0]
     assert 'FromParam="Out"' in sheet1_xml and "ToParam=" not in sheet1_xml.split("<Wire")[1]
     assert 'ToParam="In"' in sheet2_xml and "FromParam=" not in sheet2_xml.split("<Wire")[1]
+
+
+def test_render_fbd_content_uses_default_visible_pins_for_known_block_types():
+    # Regression test for a real bug found via an actual PLC-Studio load:
+    # VisiblePins is a fixed per-instruction-TYPE default in real Studio
+    # 5000 (confirmed identical across every real instance of a type,
+    # project-wide, in two independent ground-truth projects), NOT the set
+    # of pins this decode happens to observe wired -- the wired-only
+    # approach silently truncated VisiblePins to just the pins with an
+    # incoming wire, so a block's own OUTPUT pin (e.g. DEDT's "Out", never
+    # a wire *destination*) was dropped entirely. A real <Wire
+    # FromParam="Out"> then referenced a pin absent from that block's own
+    # VisiblePins list -- a self-inconsistency severe enough that
+    # PLC-Studio's actual FBD renderer fell back to its generic "not yet
+    # supported" placeholder for the whole routine rather than rendering
+    # something merely incomplete. Neither local fixture nor the original
+    # RefProjA verification ever compared VisiblePins content (only block/wire
+    # *sets*), which is how this went undetected through "27/28"/"28/28
+    # exact" claims.
+    blocks = {
+        "DEDT_01": {"type": "DEDT", "wires_in": {"DEDT_01.In": "SomeTag"}, "extra_args": ["DEDT_01array"]},
+        "UNKNOWN_01": {"type": "NEWTYPE", "wires_in": {"UNKNOWN_01.Foo": "SomeTag"}, "extra_args": []},
+    }
+    xml = _render_fbd_content(blocks, {}, [])
+
+    dedt_xml = xml[xml.index('<Block Type="DEDT"') : xml.index("</Block>") + len("</Block>")]
+    assert 'VisiblePins="In Out"' in dedt_xml
+    # DEDT's own extra positional arg renders as a real <Array
+    # Name="StorageArray"> child (verified: DEDT(DEDT_01,DEDT_01array)
+    # compiles this from its second argument) -- scoped narrowly to DEDT,
+    # since a different built-in type's own extra arg (PIDE's own trailing
+    # literal "0") does NOT render as anything in real Studio output at
+    # all; treating every extra_args entry as an Array child generically
+    # was tried and found wrong.
+    assert '<Array Name="StorageArray" Operand="DEDT_01array"/>' in dedt_xml
+
+    # A block type with no ground-truth-backed default falls back to the
+    # (still real, just possibly incomplete) set of pins actually observed
+    # wired -- not a guess, and not silently empty.
+    unknown_xml = xml[xml.index('<Block Type="NEWTYPE"') :]
+    assert 'VisiblePins="Foo"' in unknown_xml
+    assert "<Array" not in unknown_xml

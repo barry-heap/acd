@@ -700,3 +700,13 @@ XML (both sheets, all blocks, all `Wire`/`FeedbackWire` entries, and the one `OC
 byte-for-byte identical between Python and JS after this change (single-sheet routines are
 unaffected, confirming the "one rendering implementation" design actually holds in both
 languages, not just Python). `npm test` still passes with no regressions.
+
+**Round 3 follow-up: ported the `VisiblePins`/`<Array>` fix too** (see root `CLAUDE.md`'s
+`VisiblePins` section for the full story — a real PLC-Studio load treating the converted
+`MainFBD` routine as entirely unrecognized, root-caused to `VisiblePins` being a fixed per-
+instruction-TYPE default in real Studio 5000, not "pins observed wired" as assumed, plus a missing
+`<Array Name="StorageArray">` child on `DEDT` blocks specifically). `FBD_BLOCK_DEFAULT_VISIBLE_PINS`
+(`js/l5x/elements.js`) mirrors `_FBD_BLOCK_DEFAULT_VISIBLE_PINS` exactly (same 12 built-in types,
+same explicit `ALMA` exclusion); `renderFbdContent()`'s plain-`<Block>` branch uses it the same
+way, with the `<Array>` child scoped narrowly to `DEDT`. Re-verified byte-for-byte identical to
+Python on both real projects after the fix.

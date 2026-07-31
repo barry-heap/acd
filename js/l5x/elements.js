@@ -333,6 +333,45 @@ function fbdSplitPinRef(ref, blocks) {
 // <InOutParameter Name="..." Argument="..."/> children, a completely
 // different L5X shape from a built-in instruction's plain <Block>/<Wire>
 // pin wiring.
+// VisiblePins is a fixed default set PER BUILT-IN INSTRUCTION TYPE, baked
+// into Studio 5000 itself -- NOT the set of pins actually wired in this
+// specific instance, which earlier rounds assumed. Confirmed by extracting
+// every real <Block Type="..." VisiblePins="..."> from two independent
+// ground-truth projects: 12 of the 13 built-in types seen have an
+// IDENTICAL VisiblePins string across every real instance of that type
+// project-wide. ALMA is the one exception (varies with which alarm limits
+// that specific instance has enabled) and is deliberately left out,
+// falling back to the observed-wired behavior below -- a real, open gap,
+// not silently guessed at. See CLAUDE.md's "FBD" section for the full
+// story of how this was found (a real PLC-Studio load treating the whole
+// routine as unrecognized, not just rendering it wrong).
+const FBD_BLOCK_DEFAULT_VISIBLE_PINS = new Map([
+  ["ADD", "SourceA SourceB Dest"],
+  ["BNOT", "In Out"],
+  [
+    "D2SD",
+    "ProgCommand State0Perm State1Perm FB0 FB1 HandFB ProgProgReq ProgOperReq " +
+      "ProgOverrideReq ProgHandReq Out Device0State Device1State CommandStatus FaultAlarm " +
+      "ModeAlarm ProgOper Override Hand",
+  ],
+  ["DEDT", "In Out"],
+  ["GRT", "SourceA SourceB Dest"],
+  ["HLL", "In Out HighAlarm LowAlarm"],
+  ["LDLG", "In Out"],
+  ["MUL", "SourceA Dest"],
+  [
+    "PIDE",
+    "PV SPProg SPCascade RatioProg CVProg FF HandFB ProgProgReq ProgOperReq ProgCasRatReq " +
+      "ProgAutoReq ProgManualReq ProgOverrideReq ProgHandReq CVEU SP PVHHAlarm PVHAlarm PVLAlarm " +
+      "PVLLAlarm PVROCPosAlarm PVROCNegAlarm DevHHAlarm DevHAlarm DevLAlarm DevLLAlarm ProgOper " +
+      "CasRat Auto Manual Override Hand",
+  ],
+  ["RLIM", "In IncRate DecRate ByPass Out"],
+  ["SCL", "In InRawMax InRawMin InEUMax InEUMin Limiting Out MaxAlarm MinAlarm"],
+  ["SUB", "SourceA SourceB Dest"],
+  ["TONR", "TimerEnable PRE Reset ACC DN"],
+]);
+
 // sheetLayout, when given, is the {sheets, operandToSheet, connectorFeed,
 // feedbackPairs} object from fbdDecodeSheets() (js/l5x/builders.js) -- see
 // that function's comment and CLAUDE.md's "Multi-sheet FBD" section for
@@ -509,11 +548,24 @@ function renderFbdContent(blocks, irefFeeds, orefWrites, aoiInoutOrder, bitResol
             `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}">${inoutXml}</AddOnInstruction>`,
         );
       } else {
-        const visiblePins = (blockPinsSeen.get(op) || []).join(" ");
-        elementsXml.push(
+        const defaultPins = FBD_BLOCK_DEFAULT_VISIBLE_PINS.get(info.type.toUpperCase());
+        const visiblePins = defaultPins !== undefined ? defaultPins : (blockPinsSeen.get(op) || []).join(" ");
+        // A built-in instruction's compiled call can carry an extra
+        // positional argument beyond its own operand, but its meaning is
+        // NOT generic across types (confirmed: DEDT's extra arg is a real
+        // tag reference rendering as a genuine <Array Name="StorageArray">
+        // child; PIDE's own extra arg is a bare literal that renders as
+        // nothing at all in real Studio output) -- scoped narrowly to DEDT
+        // until a real ground-truth example shows another type needs it.
+        const extraArgs = info.extraArgs || [];
+        const arrayXml =
+          extraArgs.length && info.type.toUpperCase() === "DEDT"
+            ? `<Array Name="StorageArray" Operand="${escapeXmlAttr(extraArgs[0])}"/>`
+            : "";
+        const openTag =
           `<Block Type="${escapeXmlAttr(info.type)}" ID="${idMap.get(op)}" X="${x}" Y="400" ` +
-            `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}" HideDesc="false"/>`,
-        );
+          `Operand="${escapeXmlAttr(op)}" VisiblePins="${escapeXmlAttr(visiblePins)}" HideDesc="false"`;
+        elementsXml.push(arrayXml ? `${openTag}>${arrayXml}</Block>` : `${openTag}/>`);
       }
       x += 200;
     }

@@ -600,6 +600,116 @@ consistent) — not byte-exact against a real Studio 5000 export the way the mai
 project was. If you ever add ground truth for these fixtures (or hit this shape in a new real
 project), re-verify properly rather than trusting this as "done."
 
+## `VisiblePins` is a per-block-TYPE default, not "pins observed wired" — SOLVED (real
+## PLC-Studio rendering bug, found because the multi-sheet round's own verification was blind to it)
+
+The multi-sheet round above claimed the converted `FBDLevelControlSimulation` output "verified
+exactly" — every block/wire/connector matched ground truth as a *set*. That was true and also not
+enough: loading the actual converted file into a real third-party FBD-capable viewer (PLC-Studio)
+showed it falling back to a generic "not yet supported" placeholder for `MainFBD` — not a garbled
+render, a full refusal to recognize the routine as renderable FBD content at all — while the
+original Studio 5000 export of the same routine rendered completely. The gap: `verify_all_fbd.py`
+(and every "exact match" claim built on it) only ever parsed each `<Block>`'s own `Operand`/`Type`
+into the comparison set — it never read the `VisiblePins` attribute's actual *value*, so a real,
+severe bug in that one attribute sailed through every prior round undetected.
+
+**Root cause**: `VisiblePins` had been assumed (and documented, repeatedly) to be "the pins this
+decode actually observed wired" — plausible-sounding, and wrong. Checked properly this round by
+extracting every real `<Block Type="..." VisiblePins="...">` from two independent ground-truth
+projects (`RefProjA_V33_R17_4.L5X`, `FBDLevelControlSimulation.L5X`): **12 of the 13 built-in
+instruction types seen have an IDENTICAL VisiblePins string across every real instance of that
+type, project-wide** — `ADD`/`BNOT`/`D2SD`/`DEDT`/`GRT`/`HLL`/`LDLG`/`MUL`/`PIDE`/`RLIM`/`SCL`/
+`SUB`/`TONR` all confirmed constant regardless of instance-specific wiring. This is a genuine
+Rockwell UI convention — a fixed default pin-visibility set baked into Studio 5000 itself for each
+instruction type, analogous to (and just as unrecoverable from the ACD binary as) the hand-
+maintained `catalog_numbers.py`/`port_structures.py` lookup tables already in this codebase. The
+old wired-pins-only approach silently dropped every pin that's real-and-shown-by-default but
+happens not to be a wire endpoint in this specific instance — e.g. `DEDT_01`'s own `Out` pin (never
+a wire *destination*, only ever a *source*, so the old `block_pins_seen` tracking — built solely
+from wire destinations — never recorded it) was missing from `VisiblePins`, while a real `<Wire
+FromParam="Out">` still referenced it. That specific self-inconsistency — a `Wire`'s own
+`FromParam`/`ToParam` naming a pin absent from that block's own declared `VisiblePins` — is almost
+certainly what a real third-party parser trips on hard enough to bail to "unrecognized" rather than
+render a merely-incomplete diagram.
+
+**Fix**: `_FBD_BLOCK_DEFAULT_VISIBLE_PINS` (`acd/l5x/elements.py`) is a hand-maintained table
+(built directly from the ground-truth strings above) keyed by upper-cased instruction Type;
+`_render_fbd_content()`'s plain-`<Block>` branch uses it when the type is known, falling back to
+the old observed-wired-pins behavior only for a type with no ground-truth backing (documented as
+still-incomplete for those, not silently treated as solved).
+
+**`ALMA` is the one built-in type that is NOT a per-type constant** — 4 different real
+`VisiblePins` strings observed across different `ALMA` instances in the same project, varying with
+which alarm limits (`HH`/`H`/`L`/`LL`) that specific instance has enabled. Left out of the table
+deliberately; `ALMA` blocks keep falling back to the old (still real, still incomplete)
+observed-wired behavior. **This is a real, still-open gap** — `ALMA` instances (and AOI-instance
+blocks, see below) are not fixed by this round and may still trip the same PLC-Studio "unrecognized
+routine" failure mode. Whether the enabled-alarm-level pattern is cleanly derivable from each
+`ALMA` instance's own decoded `HHEnabled`/`HEnabled`/`LEnabled`/`LLEnabled` tag values (plausible,
+not yet investigated) is a follow-up, not something this round attempted or verified.
+
+**AOI-instance blocks (`<AddOnInstruction>`) have the exact same class of problem, also unsolved**:
+checked the same way against both ground-truth projects, and `VisiblePins` for an AOI instance is
+**not** simply "that AOI's own declared parameter list" either — tried that hypothesis directly
+against `AOI_VESSEL` (an AOI actually used inside an FBD network in the RefProjA project) and it failed:
+ground truth's real `VisiblePins` for `AOI_VESSEL`'s own instances is a ~32-name *subset* of its own
+~47 non-`EnableIn`/`EnableOut` parameters, in a different order than declaration order, omitting
+whole parameter sub-groups (e.g. a `SCALED_LEVEL`/`DISP_RAWLO`/... "scaling display" group, and an
+entire `OAHH_EN`.../`OALL` "operator-alarm" group tied to `OPER_LVL_ALM`) — this looks like a
+genuine per-AOI-definition "configure visible pins" preference stored somewhere in the AOI's own
+definition data, not derivable from anything already decoded. Not attempted further this round;
+this is real reverse-engineering work still to be done, not a simple table lookup like the 12
+built-in types above.
+
+**A second, independent real bug found in the same investigation**: `DEDT`'s own compiled call
+carries an extra positional argument beyond its operand (`DEDT(DEDT_01,DEDT_01array)`, the same
+`extra_args` mechanism already used for AOI-instance InOut binding) that real Studio renders as a
+genuine `<Array Name="StorageArray" Operand="DEDT_01array"/>` child of `<Block Type="DEDT">` —
+previously rendered as nothing at all (a bare self-closed `<Block .../>`). **This does NOT
+generalize to "any block with extra_args gets an Array child"** — tried that first and it broke
+`PIDE`, whose own compiled call is `PIDE(LevelController,0)`: that trailing `0` is a bare literal
+(an internal compiled-form artifact, e.g. a revision/variant flag) that renders as **nothing** in
+real Studio output (`PIDE`'s own `<Block>` is plain and self-closed, no extra attribute or child).
+Fixed by scoping the `<Array Name="StorageArray">` emission narrowly to `DEDT` specifically, not
+generically to every type with extra args — a repeat of the exact lesson the AND/math-block
+convention taught earlier in this same file: verify a new mechanism against every real example
+available before generalizing it, not just the first one found.
+
+**Verified end-to-end**: with both fixes, the full `MainFBD` routine (both sheets) now matches the
+real `FBDLevelControlSimulation.L5X` ground truth exactly — block Type/Operand/**VisiblePins**/
+`<Array>` child content, every `Wire`/`FeedbackWire`, and the one `OCon`/`ICon` connector pair, all
+checked directly (not via the old, blind-to-`VisiblePins` set-based comparison). Re-ran the same
+richer check against the RefProjA project: the 12 now-tabled built-in types (where present) also now
+match ground truth's `VisiblePins` exactly project-wide; `ALMA` and every AOI-instance block remain
+mismatched, exactly as expected given the still-open gaps above — **re-testing RefProjA's own converted
+output in a real FBD-capable viewer, specifically routines using `ALMA` or an AOI instance, is
+still an open action item, not something this round can claim to have closed.** Full `pytest` and
+`npm test` both still pass with no regressions; ported the same fix to JS
+(`FBD_BLOCK_DEFAULT_VISIBLE_PINS` in `js/l5x/elements.js`) and re-confirmed byte-for-byte identical
+output between Python and JS on both real projects.
+
+**Also checked and ruled out, per this round's own investigation checklist** (documented so the
+next person doesn't have to re-derive these): `<FBDContent>` is correctly nested as a direct child
+of the right `<Routine Name="MainFBD" Type="FBD">` element (not misplaced/duplicated); top-level
+`RSLogix5000Content`/`Controller` metadata (`ExportOptions`, `SoftwareRevision`, schema) differs
+between the converted output and this specific ground truth file only in ways that are additive or
+expected, not something a routine-type/content detector would plausibly key off; and the one real
+attribute-level difference PLC-Studio's own Compare feature flagged outside `MainFBD` itself —
+`Local:0`'s `CatalogNumber` (`1756-L63` real vs `1756-L73` converted) — is fully explained and
+benign: the `.ACD` file's own internal controller revision (`MajorRev="33" MinorRev="11"`,
+`ProductCode="94"`) genuinely differs from the ground-truth `.L5X`'s (`MajorRev="17" MinorRev="2"`,
+`ProductCode="56"`) — two different save-points/versions of the same sample project, not a
+converter bug — confirmed by checking that `94 → "1756-L73"` is itself a real, correct
+`catalog_numbers.py` entry, not a wrong guess reading the right bytes wrong.
+
+**Not independently re-verified this round**: whether the fixed output actually opens and renders
+correctly in a live PLC-Studio session — every check above is the most rigorous *offline* text/
+structural diff achievable against the real ground-truth L5X (attribute-by-attribute, not just
+element-set comparison), which is what actually caught this bug, but it is not the same as the
+literal interactive load-and-look the user performed to originally find it. Treat "verified" here
+as "matches real Studio 5000 output exactly, byte-for-byte, for every attribute checked" — the
+actual PLC-Studio render-check is still the outstanding confirmation step for this specific fix.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*

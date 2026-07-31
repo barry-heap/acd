@@ -4694,6 +4694,54 @@ def _fbd_split_pin_ref(ref: str, blocks: Dict[str, Dict]) -> Tuple[str, Union[st
     return ref, None
 
 
+
+# `VisiblePins` is a fixed default set PER BUILT-IN INSTRUCTION TYPE, baked
+# into Studio 5000 itself -- NOT the set of pins actually wired in this
+# specific instance, which is what earlier rounds assumed (documented as
+# "only pins this decode actually observed wired... a real block can show
+# an unwired pin too") and is what every "27/28"/"28/28 exact" verification
+# up through this point actually checked: block/wire/oref-write *sets*, via
+# a parser (`verify_all_fbd.py`) that only ever read each `<Block>`'s own
+# `Operand`/`Type`, never its `VisiblePins` attribute value. That
+# blind spot let a real, severe rendering bug through undetected: PLC
+# Studio's own FBD renderer, given a `<Wire FromParam="Dest">` referencing
+# a pin absent from that block's own `VisiblePins`, doesn't render a
+# flawed diagram -- it falls back to a generic "not yet supported"
+# placeholder for the whole routine, treating the routine as unrecognized
+# rather than malformed. Confirmed the fix by extracting every real
+# `<Block Type="..." VisiblePins="...">` from two independent ground-truth
+# projects (`RefProjA_V33_R17_4.L5X`, `FBDLevelControlSimulation.L5X`):
+# 12 of the 13 built-in types seen have an IDENTICAL VisiblePins string
+# across every real instance of that type project-wide, confirming it's a
+# per-TYPE constant, not observed-wiring-dependent at all. `ALMA` is the
+# one exception -- 4 different real VisiblePins strings across different
+# `ALMA` instances (varying with which alarm limits that specific
+# instance has enabled, e.g. `HHEnabled`/`LEnabled`), so it is NOT a
+# simple per-type constant and is deliberately left out of this table,
+# falling back to the (still-incomplete, pre-existing) observed-wired
+# behavior below -- a real, open gap, not silently guessed at.
+_FBD_BLOCK_DEFAULT_VISIBLE_PINS: Dict[str, str] = {
+    "ADD": "SourceA SourceB Dest",
+    "BNOT": "In Out",
+    "D2SD": "ProgCommand State0Perm State1Perm FB0 FB1 HandFB ProgProgReq ProgOperReq "
+    "ProgOverrideReq ProgHandReq Out Device0State Device1State CommandStatus FaultAlarm "
+    "ModeAlarm ProgOper Override Hand",
+    "DEDT": "In Out",
+    "GRT": "SourceA SourceB Dest",
+    "HLL": "In Out HighAlarm LowAlarm",
+    "LDLG": "In Out",
+    "MUL": "SourceA Dest",
+    "PIDE": "PV SPProg SPCascade RatioProg CVProg FF HandFB ProgProgReq ProgOperReq ProgCasRatReq "
+    "ProgAutoReq ProgManualReq ProgOverrideReq ProgHandReq CVEU SP PVHHAlarm PVHAlarm PVLAlarm "
+    "PVLLAlarm PVROCPosAlarm PVROCNegAlarm DevHHAlarm DevHAlarm DevLAlarm DevLLAlarm ProgOper "
+    "CasRat Auto Manual Override Hand",
+    "RLIM": "In IncRate DecRate ByPass Out",
+    "SCL": "In InRawMax InRawMin InEUMax InEUMin Limiting Out MaxAlarm MinAlarm",
+    "SUB": "SourceA SourceB Dest",
+    "TONR": "TimerEnable PRE Reset ACC DN",
+}
+
+
 def _render_fbd_content(
     blocks: Dict[str, Dict],
     iref_feeds: Dict[str, str],
@@ -4910,11 +4958,35 @@ def _render_fbd_content(
                     f'{inout_xml}</AddOnInstruction>'
                 )
             else:
-                visible_pins = " ".join(block_pins_seen.get(op, []))
-                elements_xml.append(
-                    f'<Block Type="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
-                    f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}" HideDesc="false"/>'
+                default_pins = _FBD_BLOCK_DEFAULT_VISIBLE_PINS.get(info["type"].upper())
+                visible_pins = default_pins if default_pins is not None else " ".join(block_pins_seen.get(op, []))
+                # A built-in instruction's compiled call can carry an extra
+                # positional argument beyond its own operand -- the same
+                # `extra_args` mechanism already used for AOI-instance
+                # InOut binding, but its meaning is NOT generic across
+                # built-in types (confirmed by checking both real examples
+                # in the same project): `DEDT(DEDT_01,DEDT_01array)`'s
+                # extra arg is a real tag reference that compiles to a
+                # genuine `<Array Name="StorageArray" Operand="...">
+                # child; `PIDE(LevelController,0)`'s own extra arg is a
+                # bare literal (an internal compiled-form artifact, e.g. a
+                # revision/variant flag) that renders as nothing at all in
+                # real Studio's own output (its `<Block Type="PIDE">` is
+                # plain, self-closed, no extra attribute or child). Scoped
+                # narrowly to DEDT until a real ground-truth example shows
+                # another built-in type needs the same treatment -- do not
+                # generalize this to "any block with extra_args" again.
+                extra_args = info.get("extra_args", [])
+                array_xml = (
+                    f'<Array Name="StorageArray" Operand="{_escape_xml_attr(extra_args[0])}"/>'
+                    if extra_args and info["type"].upper() == "DEDT"
+                    else ""
                 )
+                open_tag = (
+                    f'<Block Type="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
+                    f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}" HideDesc="false"'
+                )
+                elements_xml.append(f'{open_tag}>{array_xml}</Block>' if array_xml else f'{open_tag}/>')
             x += 200
 
         desc_xml = ""
