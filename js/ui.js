@@ -14,6 +14,7 @@
   var progressBar = document.getElementById("progress-bar");
   var progressSummary = document.getElementById("progress-summary");
   var progressLog = document.getElementById("progress-log");
+  var resetBtn = document.getElementById("reset-btn");
 
   var PHASE_LABELS = {
     extract: "Extracting archive…",
@@ -54,6 +55,25 @@
     }
   }
 
+  // Clears any error/progress state left over from a previous attempt and
+  // returns to the initial file-picker UI, without a page reload. Covers
+  // every failure path (bad magic bytes, empty/truncated file, a real .ACD
+  // that fails partway through parsing, ...) since they all funnel through
+  // handleFile's single .catch() below -- there's exactly one place that
+  // needs to show this button, not one per failure mode.
+  function resetUI() {
+    setStatus("");
+    resetBtn.hidden = true;
+    progressWrap.hidden = true;
+    progressLog.textContent = "";
+    progressBar.style.width = "0%";
+    progressSummary.textContent = "";
+    // Clearing the input's value (not just relying on the "change" event)
+    // means picking the exact same file again still fires "change" -- some
+    // browsers don't re-fire it for an unchanged file list otherwise.
+    input.value = "";
+  }
+
   function downloadText(filename, text) {
     var blob = new Blob([text], { type: "application/xml" });
     var url = URL.createObjectURL(blob);
@@ -83,6 +103,7 @@
 
   function handleFile(file) {
     setStatus("");
+    resetBtn.hidden = true;
     progressWrap.hidden = false;
     progressLog.textContent = "";
     progressBar.style.width = "0%";
@@ -143,7 +164,9 @@
         setStatus("Done — " + outName + " (" + xml.length.toLocaleString() + " characters) downloaded.", "ok");
       })
       .catch(function (err) {
+        progressWrap.hidden = true;
         setStatus("Error: " + ((err && err.message) || String(err)), "error");
+        resetBtn.hidden = false;
         console.error(err);
       });
   }
@@ -166,4 +189,5 @@
     drop.classList.remove("dragover");
     if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
   });
+  resetBtn.addEventListener("click", resetUI);
 })();

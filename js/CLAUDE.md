@@ -543,3 +543,28 @@ drift from a `.scss`/build-time source elsewhere in that repo).
   addressed yet — deferred to the wrapper-UI task.
 
 All three are pure-JS/WASM with no native bindings, no Java, and no server dependency.
+
+## Bug fix: no recovery affordance from an error state
+
+Reported symptom: dropping a non-ACD file (e.g. an `.L5X` by mistake) correctly showed `Error:
+File isn't a Rockwell ACD file`, but there was no visible way back to the picker UI short of
+reloading the page. Confirmed via Playwright that `handleFile`'s single `.catch()` already funnels
+*every* failure mode to the same code path (checked empty file, truncated file, and non-ACD
+garbage bytes -- all three land in the same `.catch()`, just with different `err.message` text),
+so one fix point covers all of them, not just the reported "wrong file type" case.
+
+Added a `<button id="reset-btn">Try another file</button>` (hidden by default, styled in
+`theme.css`'s new `.reset-btn` rule) that appears only in the error branch of `handleFile`'s
+`.catch()` (`ui.js`), alongside a `resetUI()` function that clears the status text/class, hides
+the progress panel, clears the progress bar/log, hides the reset button again, and clears the
+file `<input>`'s own `.value` (not just relying on a fresh "change" event -- some browsers won't
+re-fire "change" for re-selecting the exact same file unless the input's value is cleared first).
+`handleFile` also now hides the reset button at its own start, so a stale visible button from a
+previous error doesn't linger if the user recovers by dropping a new file directly onto the drop
+zone instead of clicking the button.
+
+**Verified** via Playwright end-to-end: trigger an error -> reset button appears, progress panel
+hides -> click it -> status/progress fully clear, button hides again -> pick a valid file via the
+same file input -> converts and downloads normally -> trigger a second error afterward -> button
+correctly reappears. All 4 local fixtures re-verified byte-identical to their established
+baselines afterward (this change only touches error-path UI, not the conversion pipeline).

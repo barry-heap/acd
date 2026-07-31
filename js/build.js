@@ -173,6 +173,7 @@ entirely in your browser. No file ever leaves this page.</p>
   <div id="progress-log" class="progress-log"></div>
 </div>
 <div id="status" class="status"></div>
+<button id="reset-btn" class="reset-btn" type="button" hidden>Try another file</button>
 <footer>Read-only: produces an L5X export only, never writes back to the source .ACD.
 FBD routines are not yet supported and export as an empty shell, matching the Python reference tool.</footer>
 </div>
