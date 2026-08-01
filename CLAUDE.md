@@ -924,6 +924,69 @@ Full `pytest`/`npm test` both still pass (same one pre-existing, unrelated Windo
 constraint: `AOI_VESSEL`'s real routines must not regress, and they don't (confirmed above), but the
 override-field hunt came up empty rather than closing the gap outright.
 
+## AOI-instance `VisiblePins` — follow-up: the union rule closes `AOI_VESSEL` too, plus a real parameter-ordering bug fixed along the way
+
+Barry supplied a controlled before/after ground-truth pair (`compare-test/RefProjA_V33_R17_4.L5X`
+and `..._changed.L5X`, no matching `.ACD`, L5X-only): the only change is 6 `AOI_VESSEL` parameters
+flipped `Visible="false"`→`"true"` (`DISP_IN`, `SCALED_LEVEL`, `GAHH_VAL`, `GAH_VAL`, `GAL_VAL`,
+`GALL_VAL`). Only ONE new pin appeared in all 24 instances' real `VisiblePins`: `SCALED_LEVEL`. The
+other 5 were already shown before the flip — flipping them made zero observable difference. That's
+the signature of a **union rule**: `VisiblePins = (a per-instance persisted set) ∪ (currently
+declared Visible="true" params)`. A param already in the persisted set is a no-op when its flag
+flips; a param newly flagged visible gets added only if it wasn't already there.
+
+This reframes the earlier override-hunt finding rather than requiring new raw-byte work:
+`AOI_VESSEL`'s own per-block record (tag `0x0002008A`) holds a 28-entry list that set-matches the 28
+non-InOut real `VisiblePins` names exactly — previously dismissed as wired-pins bookkeeping (the
+compiled network for a real instance only wires 1 pin). Under the union theory this **is** the
+persisted set: declared `Visible="true"` currently gives exactly `AOI_VESSEL`'s 4 InOut params, and
+4 + 28 = 32 = the real total. `AOI_ALM2`'s "wired pins" reading never actually distinguished the
+two theories — its own `Visible="true"` set alone already covers its entire real `VisiblePins`
+regardless of what its own per-instance list holds.
+
+**A real, separate ordering bug found and fixed while verifying this to the "exact order" bar.**
+The union, filtered/sorted by "declaration order" using the pre-existing ordering (`ORDER BY
+seq_number`, then implicit row order), did NOT reproduce the real order — `seq_number` is only a
+coarse tier stamp (`0` for every InOut parameter, `16` for every Input/Output/local one, confirmed
+across all of `AOI_VESSEL`'s real 51 members and `AOI_ALM2`'s 9), not a real declaration order at
+all. Real Studio interleaves InOut parameters among Input/Output ones by their own authored
+position (real `AOI_VESSEL` order: `EnableIn, EnableOut, DISP_IN, SCALED_LEVEL, LEVEL_ALM (InOut),
+DISP_RAWLO, ...` — not "all 4 InOut first"). **This is a real, previously undetected bug in
+`AoiBuilder.build()`'s own parameter/local-tag ordering** — confirmed by checking our own shipped
+(pre-this-fix) `AOI_VESSEL`'s own `<Parameters>` XML block against real ground truth: it was already
+wrong (all 4 InOut parameters emitted first), unrelated to `VisiblePins` specifically. Found the
+real ordinal field: a `u16` LE value at **byte offset 6** of each tag-collection member's own raw
+`comps.record`, confirmed to reproduce real declared order exactly for both `AOI_VESSEL` (51 members)
+and `AOI_ALM2` (9, including its own interspersed `LocalTag`). Fixed in `AoiBuilder.build()`: the
+existing `ORDER BY seq_number` SQL fetch is now re-sorted in Python by this ordinal before the
+parameter/local-tag split, instead of trusting the SQL-level order.
+
+**Implemented, replacing the earlier AOI_VESSEL-excluded default rule**: `_fbd_decode_aoi_block_lists()`
+(new, alongside `_fbd_decode_alma_tier_pins()`) decodes each AOI-instance call site's own persisted
+pin list (same record type/BFS mechanism as ALMA's tier bits, tag `0x0002008A`). `ControllerBuilder.
+build()`'s `_aoi_default_visible_pins` now stores `{"order": [...], "visible_default": {...}}` per
+AOI type (the full non-EnableIn/EnableOut declared order, plus the Visible="true" subset) for
+**every** AOI, no more `AOI_VESSEL` exclusion. `_render_fbd_content()`'s `AddOnInstruction` branch
+computes `union(visible_default, per_instance_override)`, filtered through `order` (which sorts as
+a side effect of iteration, no separate index map needed).
+
+**Verified**: all 24 real `AOI_VESSEL` instances and all 4 real `AOI_ALM2` instances now match
+`compare-test/RefProjA_V33_R17_4.L5X` ground truth **exactly**, order included — not "no
+regression from fallback," full correctness. The per-instance 28-entry list is confirmed
+byte-identical across all 24 real `AOI_VESSEL` call sites (a persisted snapshot from AOI-definition
+edit time, consistent with every real `TK*` routine being a template copy of one original
+placement). `AOI_VESSEL`'s own `<Parameters>` XML block order also now matches real ground truth
+exactly (51/51), a bonus correctness fix from the same root-cause repair. Full whole-project
+`RefProjA_V33_R17_4.ACD` conversion: Python and JS **byte-for-byte identical**
+(2,957,933 characters, modulo `ExportDate`). All 28 of RefProjA's real FBD routines PASS the PLC-Studio
+render check, plus `FBDLevelControlSimulation`'s `MainFBD` — zero regressions.
+`FBDLevelControlSimulation.ACD`/`Test_FBD.ACD` (no AOI-instance content) confirmed byte-identical to
+their own pre-this-round baselines (the parameter-ordering fix doesn't touch them). Full
+`pytest`/`npm test` both still pass (same one pre-existing, unrelated Windows-only
+`test_api.py::test_to_xml` file-lock flake as every prior round on this platform).
+
+**Not committed** — held in the working tree pending review, same discipline as every round.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*

@@ -2187,7 +2187,8 @@ class Routine(L5xElement):
     _fbd_bit_resolver: object = field(default=None)
     _fbd_sheet_layout: object = field(default=None)
     _fbd_alma_tier_pins: Dict[str, List[str]] = field(default_factory=dict)
-    _aoi_default_visible_pins: Dict[str, List[str]] = field(default_factory=dict)
+    _aoi_default_visible_pins: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    _aoi_visible_pins_override: Dict[str, List[str]] = field(default_factory=dict)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -2230,6 +2231,7 @@ class Routine(L5xElement):
                 content = _render_fbd_content(
                     blocks, iref_feeds, oref_writes, self._aoi_inout_order, self._fbd_bit_resolver,
                     self._fbd_sheet_layout, self._fbd_alma_tier_pins, self._aoi_default_visible_pins,
+                    self._aoi_visible_pins_override,
                 )
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
 
@@ -3859,6 +3861,7 @@ class RoutineBuilder(L5xElementBuilder):
         fbd_network = None
         fbd_sheet_layout = None
         fbd_alma_tier_pins: Dict[str, List[str]] = {}
+        fbd_aoi_visible_pins_override: Dict[str, List[str]] = {}
         if routine_type == "FBD":
             shadow_oid = _fbd_shadow_region(self._cur, self._object_id)
             if shadow_oid is not None:
@@ -3868,12 +3871,21 @@ class RoutineBuilder(L5xElementBuilder):
                 alma_operands = {op for op, info in fbd_network[0].items() if info["type"].upper() == "ALMA"}
                 if alma_operands:
                     fbd_alma_tier_pins = _fbd_decode_alma_tier_pins(self._cur, shadow_oid, alma_operands)
+                # Every block operand is a candidate here (not just known
+                # AOI-instance ones -- the aois list isn't available yet at
+                # this point, same limitation _aoi_inout_order has). Harmless:
+                # a built-in instruction's own element record never carries
+                # the 0x0002008A tag this looks for.
+                all_operands = set(fbd_network[0].keys())
+                if all_operands:
+                    fbd_aoi_visible_pins_override = _fbd_decode_aoi_block_lists(self._cur, shadow_oid, all_operands)
 
         routine = Routine(
             name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines, fbd_network
         )
         routine._fbd_sheet_layout = fbd_sheet_layout
         routine._fbd_alma_tier_pins = fbd_alma_tier_pins
+        routine._aoi_visible_pins_override = fbd_aoi_visible_pins_override
         return routine
 
 
@@ -4583,6 +4595,89 @@ def _fbd_decode_alma_tier_pins(cur: Cursor, shadow_oid: int, alma_operands: set)
     return result
 
 
+# --- AOI-instance VisiblePins: per-instance persisted-pin-set override ----
+#
+# AOI-instance blocks (<AddOnInstruction>) have their own per-call-site FBD
+# element record, same tree as ALMA's above, tagged 0x0002008A instead of
+# ALMA's 0x0005008C. Originally decoded (during the override hunt for
+# AOI_VESSEL) as a count-prefixed list of comps.object_id references and
+# dismissed as wired-input-pins bookkeeping -- confirmed correct for
+# AOI_ALM2 (exactly matches each real instance's own wired PRI_IN* pins)
+# but WRONG for AOI_VESSEL, where a real controlled before/after edit (Barry
+# flipped 6 parameters Visible="false"->"true"; only ONE, SCALED_LEVEL,
+# newly appeared in real VisiblePins -- the other 5 were already shown)
+# revealed the real rule: VisiblePins = (this per-instance persisted list)
+# UNION (the AOI's own currently-declared Visible="true" parameters), sorted
+# by true declaration order. A parameter already in the persisted list is a
+# no-op when its own Visible flag flips; only a parameter newly flagged
+# visible AND not already in the persisted list gets added. Under this
+# reading AOI_VESSEL's own 28-entry list (4 InOut + 28 = 32 = its real total)
+# was never wiring data at all for the purpose that matters here --
+# AOI_ALM2's "wired pins" reading never actually distinguished the two
+# theories, since its own Visible="true" set alone already covers its entire
+# real VisiblePins regardless of what this list holds.
+#
+# Verified exactly against all ~24 real AOI_VESSEL instances in
+# RefProjA_V33_R17_4.ACD (see CLAUDE.md) -- the union, sorted by each
+# name's true declaration-order position (see the ordinal-field fix in
+# AoiBuilder.build() -- this sort is only correct because of that fix),
+# reproduces real ground truth's VisiblePins string exactly, order included,
+# for every real instance. Also confirmed the per-instance list itself is
+# byte-identical across all 24 real call sites (a persisted snapshot from
+# AOI definition edit time, not something touched per placement -- consistent
+# with every real TK* routine being a template copy of the same original
+# placement).
+_AOI_ELEMENT_FLAG = 0x0002008A
+
+
+def _fbd_decode_aoi_block_lists(cur: Cursor, shadow_oid: int, aoi_operands: set) -> Dict[str, List[str]]:
+    """For each AOI-instance block operand named in aoi_operands, decode its
+    own persisted pin-reference list from the per-block diagram metadata
+    (see the module comment above). Returns {operand: [param_name, ...]}
+    (resolved via comps.object_id, in the list's own raw stored order --
+    callers should NOT rely on this order, only on set membership, since the
+    real render order comes from the AOI's own declared parameter order
+    instead). An operand missing from the result means no such record was
+    found for it."""
+    if not aoi_operands:
+        return {}
+    cur.execute("SELECT parent_id FROM nameless WHERE object_id=?", (shadow_oid,))
+    row = cur.fetchone()
+    shadow_parent = row[0] if row else shadow_oid
+    nodes = _fbd_bfs_subtree(cur, shadow_parent)
+
+    result: Dict[str, List[str]] = {}
+    for _oid, (_parent_id, rec) in nodes.items():
+        if len(rec) < 36 or struct.unpack_from("<I", rec, 4)[0] != _FBD_COMPILED_BLOB_RECORD_TYPE:
+            continue
+        if struct.unpack_from("<I", rec, 16)[0] != _AOI_ELEMENT_FLAG:
+            continue
+        idx = rec.find(b"\xff\xfe\xff")
+        if idx < 0:
+            continue
+        text, after_text = _parse_fffeff(rec, idx)
+        operand = _fbd_resolve_element_text(cur, text)
+        if operand not in aoi_operands:
+            continue
+        off = after_text
+        if off + 2 > len(rec):
+            continue
+        count = struct.unpack_from("<H", rec, off)[0]
+        off += 2
+        names: List[str] = []
+        for _i in range(count):
+            if off + 8 > len(rec):
+                break
+            param_oid = struct.unpack_from("<I", rec, off)[0]
+            cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (param_oid,))
+            prow = cur.fetchone()
+            if prow and prow[0]:
+                names.append(prow[0])
+            off += 8
+        result[operand] = names
+    return result
+
+
 def _parse_fbd_network(rungs: List[str]):
     """Parse compiled ladder-equivalent rungs into an FBD block/wire graph.
 
@@ -4863,7 +4958,8 @@ def _render_fbd_content(
     bit_resolver=None,
     sheet_layout=None,
     alma_tier_pins: Union[Dict[str, List[str]], None] = None,
-    aoi_default_visible_pins: Union[Dict[str, List[str]], None] = None,
+    aoi_default_visible_pins: Union[Dict[str, Dict[str, object]], None] = None,
+    aoi_visible_pins_override: Union[Dict[str, List[str]], None] = None,
 ) -> str:
     """Render a decoded FBD block/wire graph as <FBDContent><Sheet>...
     XML. IDs are assigned deterministically (sorted by operand/tag name
@@ -4897,6 +4993,7 @@ def _render_fbd_content(
     aoi_inout_order = aoi_inout_order or {}
     alma_tier_pins = alma_tier_pins or {}
     aoi_default_visible_pins = aoi_default_visible_pins or {}
+    aoi_visible_pins_override = aoi_visible_pins_override or {}
     wires = _fbd_resolve_wires(blocks, iref_feeds, bit_resolver)
 
     block_pins_seen: Dict[str, List[str]] = {}
@@ -5068,18 +5165,20 @@ def _render_fbd_content(
                     f'<InOutParameter Name="{_escape_xml_attr(pname)}" Argument="{_escape_xml_attr(arg)}"/>'
                     for pname, arg in zip(inout_names, extra_args)
                 )
-                # Default rule (confirmed against LoopSimulation/
-                # TankLevelSimulation/AOI_ALM2, all real, all exact-order
-                # matches): declared parameters, in declaration order,
-                # filtered to non-EnableIn/EnableOut with Visible="true".
-                # AOI_VESSEL is deliberately absent from
-                # aoi_default_visible_pins (see its own construction site's
-                # comment) and falls through to the pre-existing
-                # observed-wired+InOut-names fallback -- a real, still-open
-                # gap, not silently forced to fit.
-                default_visible_pins = aoi_default_visible_pins.get(info["type"].upper())
-                if default_visible_pins is not None:
-                    visible_pins = " ".join(default_visible_pins)
+                # Union rule (confirmed against LoopSimulation/
+                # TankLevelSimulation/AOI_ALM2/AOI_VESSEL, all real, all
+                # exact-order matches -- see _fbd_decode_aoi_block_lists()'s
+                # own comment for the full evidence): declared Visible=
+                # "true" parameters UNION this specific call site's own
+                # persisted pin list, sorted by true declaration order
+                # (aoi_param_info["order"] already IS that true order --
+                # filtering it by set membership sorts as a side effect, no
+                # separate index map needed).
+                aoi_param_info = aoi_default_visible_pins.get(info["type"].upper())
+                if aoi_param_info is not None:
+                    override = aoi_visible_pins_override.get(op, [])
+                    union_set = set(aoi_param_info["visible_default"]) | set(override)
+                    visible_pins = " ".join(n for n in aoi_param_info["order"] if n in union_set)
                 else:
                     visible_pins = " ".join(block_pins_seen.get(op, []) + inout_names)
                 elements_xml.append(
@@ -5308,7 +5407,24 @@ class AoiBuilder(L5xElementBuilder):
                 + " AND record_type != 512"
                 + " ORDER BY seq_number"
             )
-            for child_oid, child_rec in self._cur.fetchall():
+            # `seq_number` is only a coarse tier stamp (0 for InOut, 16 for
+            # Input/Output/local, confirmed across real data) -- NOT true
+            # Studio declaration order, which real ground truth shows
+            # interleaves InOut parameters among Input/Output ones by their
+            # own authored position (e.g. real AOI_VESSEL: EnableIn,
+            # EnableOut, DISP_IN, SCALED_LEVEL, LEVEL_ALM (InOut),
+            # DISP_RAWLO, ...). The real per-tag-collection-member ordinal
+            # lives at u16 LE offset 6 of the raw record (confirmed exact
+            # match against real declared order for both AOI_VESSEL's 51
+            # members and AOI_ALM2's 9, including its own interspersed
+            # LocalTag) -- re-sort by that instead of trusting the
+            # SQL-level seq_number order. Falls back to +inf (stable, sorts
+            # last) for a pathologically short record rather than raising.
+            def _tag_ordinal(rec: bytes) -> float:
+                return struct.unpack_from("<H", rec, 6)[0] if len(rec) > 7 else float("inf")
+
+            _rows = sorted(self._cur.fetchall(), key=lambda row: _tag_ordinal(bytes(row[1])))
+            for child_oid, child_rec in _rows:
                 child_rec = bytes(child_rec)
                 # Determine whether this is a parameter or a local tag by inspecting
                 # ext01[0x20E]: bits 0x04 (Input) or 0x08 (Output) indicate a parameter.
@@ -5998,39 +6114,31 @@ class ControllerBuilder(L5xElementBuilder):
             for _aoi in aois:
                 _attach_aoi_inout_order(_aoi.routines)
 
-        # AOI-instance VisiblePins default rule -- confirmed against 3 real
-        # AOI types with zero cross-instance variation each (LoopSimulation,
+        # AOI-instance VisiblePins union rule -- confirmed against 3 real AOI
+        # types with zero cross-instance variation each (LoopSimulation,
         # TankLevelSimulation in the official Rockwell
-        # Add_On_Instructions_Samples project; AOI_ALM2 in RefProjA): a
-        # real AOI-instance block's own VisiblePins is that AOI's own
-        # declared parameters, in DECLARATION order, filtered to real
-        # (non-EnableIn/EnableOut) parameters with Visible="true" -- exact
-        # string match, exact order, all 3 cases. AOI_VESSEL (RefProjA) is the
-        # one known, real exception: several Visible="false" parameters
-        # (GAHH/GAH/GAL/GALL/... etc.) ARE shown in its real VisiblePins,
-        # while other Visible="false" ones (the OA* group) are correctly
-        # hidden -- confirmed NOT a misread, and NOT explained by any bit of
-        # the parameter's own raw flags byte (0x04 Input / 0x08 Output
-        # identically for every included AND excluded non-InOut parameter --
-        # zero variation in the 4 otherwise-unused bits of that byte either)
-        # nor anything in the AOI definition's own top-level extended
-        # records. AOI_VESSEL's own per-block FBD element record (the same
-        # 0x0002008A-tagged record examined for this) is confirmed to hold a
-        # DIFFERENT thing entirely -- an explicit list of wired-input-pin
-        # references (verified exactly against AOI_ALM2's real per-instance
-        # wiring), not a display-visibility override. No raw-data field
-        # explaining AOI_VESSEL's real VisiblePins has been found despite a
-        # genuine search; deliberately excluded from this map (falls through
-        # to the pre-existing observed-wired+InOut-names fallback in
-        # _render_fbd_content) rather than guessed at -- a real, open gap,
-        # not silently forced to fit.
-        _aoi_default_visible_pins = {
-            aoi.name.upper(): [
-                p.name for p in aoi.parameters if p.name not in ("EnableIn", "EnableOut") and p.visible == "true"
-            ]
-            for aoi in aois
-            if aoi.name.upper() != "AOI_VESSEL"
-        }
+        # Add_On_Instructions_Samples project; AOI_ALM2 in RefProjA) PLUS
+        # AOI_VESSEL (RefProjA), closing what was an open gap in an earlier
+        # round. VisiblePins = (declared Visible="true" non-EnableIn/
+        # EnableOut parameters) UNION (this specific call site's own
+        # persisted pin list, decoded by _fbd_decode_aoi_block_lists() -- see
+        # that function's own comment for the full evidence, including the
+        # controlled before/after edit that revealed the union rule and
+        # ruled out the earlier "wired-pins bookkeeping" reading), sorted by
+        # each name's TRUE declaration-order position (see the ordinal-field
+        # fix in AoiBuilder.build() -- this sort is only correct because of
+        # that fix). Stored here as {"order", "visible_default"} per AOI
+        # type rather than an already-filtered list, since the union needs
+        # the FULL declared order (to place names that are only visible via
+        # the per-instance override, not the Visible="true" set, in their
+        # correct position).
+        _aoi_default_visible_pins: Dict[str, Dict[str, object]] = {}
+        for aoi in aois:
+            non_system = [p for p in aoi.parameters if p.name not in ("EnableIn", "EnableOut")]
+            _aoi_default_visible_pins[aoi.name.upper()] = {
+                "order": [p.name for p in non_system],
+                "visible_default": {p.name for p in non_system if p.visible == "true"},
+            }
         if _aoi_default_visible_pins:
             def _attach_aoi_default_visible_pins(routine_list: List[Routine]) -> None:
                 for _routine in routine_list:
