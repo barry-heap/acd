@@ -2186,6 +2186,7 @@ class Routine(L5xElement):
     _aoi_inout_order: Dict[str, List[str]] = field(default_factory=dict)
     _fbd_bit_resolver: object = field(default=None)
     _fbd_sheet_layout: object = field(default=None)
+    _fbd_alma_tier_pins: Dict[str, List[str]] = field(default_factory=dict)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -2227,7 +2228,7 @@ class Routine(L5xElement):
             if blocks or oref_writes:
                 content = _render_fbd_content(
                     blocks, iref_feeds, oref_writes, self._aoi_inout_order, self._fbd_bit_resolver,
-                    self._fbd_sheet_layout,
+                    self._fbd_sheet_layout, self._fbd_alma_tier_pins,
                 )
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
 
@@ -3856,17 +3857,22 @@ class RoutineBuilder(L5xElementBuilder):
 
         fbd_network = None
         fbd_sheet_layout = None
+        fbd_alma_tier_pins: Dict[str, List[str]] = {}
         if routine_type == "FBD":
             shadow_oid = _fbd_shadow_region(self._cur, self._object_id)
             if shadow_oid is not None:
                 fbd_rungs = _fbd_compiled_rungs(self._cur, shadow_oid)
                 fbd_network = _parse_fbd_network(fbd_rungs)
                 fbd_sheet_layout = _fbd_decode_sheets(self._cur, shadow_oid)
+                alma_operands = {op for op, info in fbd_network[0].items() if info["type"].upper() == "ALMA"}
+                if alma_operands:
+                    fbd_alma_tier_pins = _fbd_decode_alma_tier_pins(self._cur, shadow_oid, alma_operands)
 
         routine = Routine(
             name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines, fbd_network
         )
         routine._fbd_sheet_layout = fbd_sheet_layout
+        routine._fbd_alma_tier_pins = fbd_alma_tier_pins
         return routine
 
 
@@ -4470,6 +4476,112 @@ def _fbd_decode_sheets(cur: Cursor, shadow_oid: int):
     return sheets, operand_to_sheet, connector_feed, feedback_pairs
 
 
+# --- FBD ALMA per-instance "enabled tier" VisiblePins bits ----------------
+#
+# ALMA is the one built-in FBD instruction type whose real VisiblePins is
+# NOT a fixed per-type constant (see _FBD_BLOCK_DEFAULT_VISIBLE_PINS's own
+# comment below) -- it varies per instance with which alarm-limit tiers
+# (HH/H/L/LL) that instance has enabled. Reverse-engineered against all 7
+# real ALMA instances available anywhere in this repo's ground truth
+# (RefProjA_V33_R17_4.L5X/.ACD: COND_CT_A001_ALM, PROC_TT_A001_ALM,
+# A002_ALM, plus 4 generic instances -- ROOF_ALM/LEVEL_ALM/
+# OPER_LVL_ALM/PROG_ALM -- inside AOI_VESSEL's own definition
+# Logic routine; no other real ALMA instance exists in any fixture or
+# sample project checked into this repo tree).
+#
+# Each ALMA block instance has its own element node in the SAME per-block
+# FBD-diagram metadata tree _fbd_decode_sheets() already walks for sheet
+# membership (hanging off shadow_oid's own nameless parent_id, found via a
+# blind subtree scan here rather than the sheet/elements-container
+# structure above, since a single-sheet routine has no sheet-description
+# node to hang that structure off at all) -- a record_type 0x01000002 node
+# whose u32 at offset 16 is 0x0005008C (confirmed constant across all 7
+# real ALMA element records, distinct from every other real block type's
+# own tag at that offset seen in the same ground truth, e.g. TONR's
+# 0x0002005B). Bytes 24:28 and 28:32 of the same record are this block's
+# own X/Y diagram position -- verified byte-exact (int32 LE) against all 7
+# real instances' ground-truth <Block X="..." Y="..."> attributes, strong
+# proof this record is genuine per-instance Studio-authored metadata, not
+# shared/derived data. Byte 35's low nibble (bits 0-3) is a per-tier
+# "Enabled" bitmask -- bit0=HH, bit1=H, bit2=L, bit3=LL -- confirmed to
+# reproduce all 7 real instances' HHEnabled/HEnabled/LEnabled/LLEnabled
+# *presence* in VisiblePins exactly: COND_CT_A001_ALM's L+LL both
+# enabled -> nibble 0b1100; PROC_TT_A001_ALM's LL only -> 0b1000;
+# A002_ALM's H only -> 0b0010; the 4 AOI_VESSEL-internal instances' all four
+# enabled -> 0b1111 (plus an extra bit 4 that correlates with
+# AckRequired/Suppressed being shown -- NOT ported, see below). This
+# nibble is also byte-identical to each instance's own AlarmAnalogParameters
+# HHEnabled/HEnabled/LEnabled/LLEnabled tag values where a real backing tag
+# exists (the 3 non-AOI-internal instances) -- two independent lines of
+# evidence agreeing.
+#
+# NOT ported by this function, deliberately left on the pre-existing
+# "observed wired" fallback in _render_fbd_content -- confirmed aliased/
+# undecidable from the available real data (see CLAUDE.md's "ALMA
+# VisiblePins" section for the full evidence trail):
+#   - AckRequired, Suppressed, Disabled: candidate bits correlate with
+#     these in the 7 known instances, but are 100% aliased with the
+#     HH-tier/H-tier enabled bits respectively in every available real
+#     sample (every instance with AckRequired/Suppressed shown also has
+#     the HH tier enabled; every instance with Disabled shown also has
+#     the H tier enabled or is one of the 4 AOI-internal ones) -- cannot
+#     distinguish "own independent bit" from "coincidental co-occurrence"
+#     without a real counter-example instance, which does not exist
+#     anywhere in this repo's ground truth.
+#   - bare InAlarm: shown only in the two non-AOI-internal, non-A002
+#     instances (COND_CT/COND_TT) -- plausibly "shown iff AckRequired is
+#     NOT shown", but only 2 real data points touch this, not enough to
+#     confirm a structural rule.
+#
+# A SEPARATE real ground-truth anomaly, also NOT modeled here (see
+# CLAUDE.md): PROC_TT_A001_ALM has ONLY its LL tier enabled, yet its
+# real Limit pin is named "LLimit" (the L tier's own name) rather than
+# "LLLimit" (the LL tier's own name that COND_CT_A001_ALM -- which has
+# BOTH tiers enabled -- correctly uses alongside its own "LLimit" for the
+# L tier). This function always emits each enabled tier's OWN canonical
+# Limit-pin name (e.g. "LLLimit" for a lone enabled LL tier), so rendering
+# PROC_TT_A001_ALM will show this one specific known mismatch on this
+# one pin name -- a genuine Rockwell naming quirk (or bug) in the one real
+# sample that exercises "LL enabled alone", not a decode error, and not
+# guessed around here per this round's explicit scope.
+_ALMA_ELEMENT_FLAG = 0x0005008C
+_ALMA_TIER_ORDER = ["HH", "H", "L", "LL"]
+
+
+def _fbd_decode_alma_tier_pins(cur: Cursor, shadow_oid: int, alma_operands: set) -> Dict[str, List[str]]:
+    """For each real ALMA block instance named in alma_operands, decode
+    which alarm-limit tiers (HH/H/L/LL, in that canonical order) its own
+    VisiblePins should include, from the per-block diagram metadata's
+    byte-35 bitmask (see the module comment above). Returns
+    {operand: [tier, ...]} for every ALMA operand successfully decoded;
+    an operand missing from the result means its own element record
+    couldn't be found, and callers should leave that instance entirely on
+    the pre-existing observed-wired fallback."""
+    if not alma_operands:
+        return {}
+    cur.execute("SELECT parent_id FROM nameless WHERE object_id=?", (shadow_oid,))
+    row = cur.fetchone()
+    shadow_parent = row[0] if row else shadow_oid
+    nodes = _fbd_bfs_subtree(cur, shadow_parent)
+
+    result: Dict[str, List[str]] = {}
+    for _oid, (_parent_id, rec) in nodes.items():
+        if len(rec) < 36 or struct.unpack_from("<I", rec, 4)[0] != _FBD_COMPILED_BLOB_RECORD_TYPE:
+            continue
+        if struct.unpack_from("<I", rec, 16)[0] != _ALMA_ELEMENT_FLAG:
+            continue
+        idx = rec.find(b"\xff\xfe\xff")
+        if idx < 0:
+            continue
+        text, _ = _parse_fffeff(rec, idx)
+        operand = _fbd_resolve_element_text(cur, text)
+        if operand not in alma_operands:
+            continue
+        nibble = rec[35] & 0x0F
+        result[operand] = [tier for i, tier in enumerate(_ALMA_TIER_ORDER) if nibble & (1 << i)]
+    return result
+
+
 def _parse_fbd_network(rungs: List[str]):
     """Parse compiled ladder-equivalent rungs into an FBD block/wire graph.
 
@@ -4749,6 +4861,7 @@ def _render_fbd_content(
     aoi_inout_order: Union[Dict[str, List[str]], None] = None,
     bit_resolver=None,
     sheet_layout=None,
+    alma_tier_pins: Union[Dict[str, List[str]], None] = None,
 ) -> str:
     """Render a decoded FBD block/wire graph as <FBDContent><Sheet>...
     XML. IDs are assigned deterministically (sorted by operand/tag name
@@ -4780,6 +4893,7 @@ def _render_fbd_content(
     assigned to any other, so there is deliberately only one implementation
     of the element/wire rendering logic, not two parallel ones."""
     aoi_inout_order = aoi_inout_order or {}
+    alma_tier_pins = alma_tier_pins or {}
     wires = _fbd_resolve_wires(blocks, iref_feeds, bit_resolver)
 
     block_pins_seen: Dict[str, List[str]] = {}
@@ -4958,8 +5072,32 @@ def _render_fbd_content(
                     f'{inout_xml}</AddOnInstruction>'
                 )
             else:
-                default_pins = _FBD_BLOCK_DEFAULT_VISIBLE_PINS.get(info["type"].upper())
-                visible_pins = default_pins if default_pins is not None else " ".join(block_pins_seen.get(op, []))
+                type_upper = info["type"].upper()
+                if type_upper == "ALMA" and op in alma_tier_pins:
+                    # Confirmed tier-Enabled bits merged with the pre-existing
+                    # observed-wired fallback for the still-open AckRequired/
+                    # bare-InAlarm/Suppressed/Disabled pins -- see
+                    # _fbd_decode_alma_tier_pins()'s own module comment for
+                    # the full evidence and the known residual mismatches
+                    # (PROC_TT_A001_ALM's Limit-pin naming anomaly; any
+                    # instance whose AckRequired/Suppressed/Disabled/bare-
+                    # InAlarm visibility isn't already caught by wiring).
+                    seen = block_pins_seen.get(op, [])
+                    tiers = alma_tier_pins[op]
+                    ordered_pins = (
+                        (["In"] if "In" in seen else [])
+                        + [f"{tier}Enabled" for tier in tiers]
+                        + (["AckRequired"] if "AckRequired" in seen else [])
+                        + [f"{tier}Limit" for tier in tiers]
+                        + (["InAlarm"] if "InAlarm" in seen else [])
+                        + [f"{tier}InAlarm" for tier in tiers]
+                        + (["Suppressed"] if "Suppressed" in seen else [])
+                        + (["Disabled"] if "Disabled" in seen else [])
+                    )
+                    visible_pins = " ".join(ordered_pins)
+                else:
+                    default_pins = _FBD_BLOCK_DEFAULT_VISIBLE_PINS.get(type_upper)
+                    visible_pins = default_pins if default_pins is not None else " ".join(block_pins_seen.get(op, []))
                 # A built-in instruction's compiled call can carry an extra
                 # positional argument beyond its own operand -- the same
                 # `extra_args` mechanism already used for AOI-instance

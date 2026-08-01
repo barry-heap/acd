@@ -754,6 +754,93 @@ both; a routine can pass this check (a sheet renders, blocks/wires are drawn) wh
 real fidelity bug the same class as `VisiblePins` that only surfaces on visual inspection or a
 deep attribute-level ground-truth diff.
 
+## ALMA `VisiblePins` tier-bit rule — CONFIRMED and implemented for the 12 tier pins; AOI-instance gap remains fully open
+
+Follow-up investigation into the two gaps left open above (`ALMA` and AOI-instance `VisiblePins`).
+Two separate investigations, one per gap, run in parallel — do not let a fix for one bend into the
+other; they turned out to need genuinely different resolutions.
+
+**ALMA — confirmed and implemented.** Gathered every real `ALMA` instance available anywhere in
+this repo's ground truth: **7 real instances total** in `RefProjA_V33_R17_4.L5X`, not the "4
+different `VisiblePins` strings" originally estimated by eyeball — re-grepped properly and found
+`COND_CT_A001_ALM`, `PROC_TT_A001_ALM` (in `PROC_RATE_ALARM`), `A002_ALM` (in `_77Proc`),
+plus **4 previously-missed instances** — `ROOF_ALM`/`LEVEL_ALM`/`OPER_LVL_ALM`/
+`PROG_ALM` — living inside `AOI_VESSEL`'s own definition `Logic` routine (its InOut
+parameters, generic/unbound at the AOI-definition level). 4 distinct `VisiblePins` strings across
+those 7 (the AOI-internal 4 are byte-identical to each other). No other real `ALMA` instance exists
+in any fixture, sample project, or `.ACD`/`.L5X` file checked into any repo in this tree
+(`Test_FBD.ACD`/`.L5X` and `PROC_RATE_ALARM_Routine_FBD.L5X` are just extracts of the same 2
+COND_*_ALM instances; the Rockwell sample projects have zero `ALMA` instances at all).
+
+**The real mechanism**: each `ALMA` block instance has its own element node in the SAME per-block
+FBD-diagram metadata tree `_fbd_decode_sheets()` already walks for sheet membership (hanging off
+the shadow region's own nameless `parent_id`) — a `record_type=0x01000002` node whose u32 at offset
+16 is `0x0005008C` (confirmed constant across all 7 real `ALMA` element records, distinct from
+every other real block type's own tag at that offset seen in the same ground truth, e.g. TONR's
+`0x0002005B`). Bytes 24:28 and 28:32 of the same record are the block's own X/Y diagram position —
+verified byte-exact (`int32` LE) against all 7 real instances' ground-truth `<Block X="..."
+Y="...">` attributes, strong proof this record is genuine per-instance Studio-authored metadata,
+not shared/derived data (the same category of evidence the Multi-sheet FBD section above used).
+**Byte 35's low nibble (bits 0-3) is a per-tier "Enabled" bitmask** — bit0=HH, bit1=H, bit2=L,
+bit3=LL — confirmed to reproduce all 7 real instances' `HHEnabled`/`HEnabled`/`LEnabled`/
+`LLEnabled` *presence* in `VisiblePins` exactly (`COND_CT_A001_ALM`'s L+LL both enabled → nibble
+`0b1100`; `PROC_TT_A001_ALM`'s LL only → `0b1000`; `A002_ALM`'s H only → `0b0010`; the 4
+AOI-internal instances' all four enabled → `0b1111`). This nibble is also byte-identical to each
+instance's own `AlarmAnalogParameters` `HHEnabled`/`HEnabled`/`LEnabled`/`LLEnabled` tag values
+where a real backing tag exists (the 3 non-AOI-internal instances) — two independent lines of
+evidence agreeing. Implemented as `_fbd_decode_alma_tier_pins()` in `acd/l5x/elements.py`
+(JS: `fbdDecodeAlmaTierPins()` in `js/l5x/builders.js`), feeding `_render_fbd_content()`'s/
+`renderFbdContent()`'s `ALMA`-specific branch: each enabled tier contributes its own
+`<Tier>Enabled`/`<Tier>Limit`/`<Tier>InAlarm` trio, in canonical `HH,H,L,LL` order.
+
+**Deliberately NOT derived, left on the pre-existing observed-wired fallback** (confirmed
+aliased/undecidable from the available real data — do not guess further to force a fit):
+- `AckRequired`/`Suppressed`/`Disabled`: a candidate bit (byte 35 bit 4, plus correlated bits
+  elsewhere in the record) tracks these in the 7 known instances, but is **100% aliased** with the
+  HH-tier/H-tier enabled bits respectively in every available real sample (every instance with
+  `AckRequired`/`Suppressed` shown also has the HH tier enabled; every instance with `Disabled`
+  shown also has the H tier enabled or is one of the 4 AOI-internal ones) — cannot distinguish "own
+  independent bit" from "coincidental co-occurrence" without a real counter-example instance, which
+  does not exist anywhere in this repo's ground truth.
+- Bare `InAlarm`: shown only in the two non-AOI-internal, non-`A002` instances (`COND_CT`/
+  `COND_TT`) — plausibly "shown iff `AckRequired` is NOT shown", but only 2 real data points touch
+  this, not enough to confirm a structural rule.
+
+**A separate real ground-truth anomaly, also not modeled**: `PROC_TT_A001_ALM` has ONLY its LL
+tier enabled, yet its real `Limit` pin is named `"LLimit"` (the L tier's own canonical name) rather
+than `"LLLimit"` (the LL tier's own canonical name that `COND_CT_A001_ALM` — which has BOTH
+tiers enabled — correctly uses alongside its own `"LLimit"` for the L tier). The implementation
+always emits each enabled tier's own canonical `Limit`-pin name, so rendering
+`PROC_TT_A001_ALM` shows this one specific, known, non-guessed-around mismatch — a genuine
+Rockwell naming quirk (or bug) in the one real sample that exercises "LL enabled alone".
+
+**Verified**: all 7 real instances' tier-scoped pins (`<Tier>Enabled`/`<Tier>Limit`/`<Tier>InAlarm`)
+now match ground truth exactly, zero exceptions. Residual, expected, documented-above mismatches
+remain for `COND_CT_A001_ALM`/`PROC_TT_A001_ALM` (missing bare `InAlarm`), `A002_ALM`
+(missing `Disabled`), the COND_TT Limit-naming anomaly, and the 4 AOI-internal instances (missing
+`Suppressed`/`Disabled`) — all pre-existing/expected, none newly introduced. Full whole-project
+`ConvertAcdToL5x` output for `RefProjA_V33_R17_4.ACD` re-diffed directly against JS's
+`convertAcdToL5x()` output: **byte-for-byte identical** (2,953,353 characters, modulo the usual
+per-run `ExportDate`), same for `FBDLevelControlSimulation.ACD` and `Test_FBD.ACD`. All 28 of
+RefProjA's real FBD routines, plus `FBDLevelControlSimulation`'s `MainFBD`, re-ran through the
+PLC-Studio render check (`js/test_plc_studio_fbd.js`): still 28/28 and 1/1 PASS, zero regressions.
+Full `pytest` (111 passed, 2 skipped, one pre-existing unrelated `pytest-asyncio` error, plus one
+newly-observed Windows-only test-isolation flake in `test_api.py::test_to_xml` — passes in
+isolation, fails only when run in the same process as other tests that leave a SQLite file handle
+open on Windows; confirmed unrelated to this change, since it touches zero SQLite-connection-
+lifecycle code) and `npm test` both still pass.
+
+**AOI-instance `VisiblePins` — remains fully open.** A sibling investigation this session tested
+the "AOI parameter has its own `Visible="true"/"false"` attribute, settable by the AOI's author,
+independent of Input/Output/InOut usage type" hypothesis directly against real ground truth
+(`AOI_VESSEL`'s own `AddOnInstructionDefinition` `<Parameter>` elements do carry a real `Visible`
+attribute in the L5X) and **rejected it** — it does not reproduce the real, observed
+`VisiblePins` subset/ordering for `AOI_VESSEL`'s own 24 real call-site instances. No raw-metadata
+excavation (the same byte-offset approach that solved `ALMA` above) has been attempted yet for
+AOI-instance blocks — worth trying next, following the identical method, but genuinely unattempted
+this round. `AddOnInstruction` blocks are untouched by this round's code change and remain exactly
+on the pre-existing "observed wired + own InOut parameter names" fallback.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*
