@@ -841,6 +841,89 @@ AOI-instance blocks — worth trying next, following the identical method, but g
 this round. `AddOnInstruction` blocks are untouched by this round's code change and remain exactly
 on the pre-existing "observed wired + own InOut parameter names" fallback.
 
+## AOI-instance `VisiblePins` default rule — CONFIRMED and implemented; `AOI_VESSEL` remains a real, documented exception
+
+Follow-up to the AOI-instance gap left open above. The "declared parameter `Visible="true"`, in
+declaration order (excluding `EnableIn`/`EnableOut`)" hypothesis — rejected earlier against
+`AOI_VESSEL` alone — is **confirmed exactly** once tested against real ground truth beyond `AOI_VESSEL`:
+
+- Two AOI types in the official Rockwell sample project `Add_On_Instructions_Samples.L5X`
+  (untouched since 2007) — `LoopSimulation` (`Visible="true"` on exactly `LoopOutput`/
+  `SimulatedPV`/`DeadtimeInv` → real `VisiblePins="LoopOutput SimulatedPV DeadtimeInv"`) and
+  `TankLevelSimulation` (`Visible="true"` on exactly `FlowIntoTank`/`FlowOutOfTank`/`TankLevel` →
+  real `VisiblePins="FlowIntoTank FlowOutOfTank TankLevel"`) — both exact string and order matches.
+- `AOI_ALM2` (`RefProjA_V33_R17_4.L5X`) is genuinely FBD-placed (routine `UNIT_STATUS`, real
+  `<Wire>`s feeding `PRI_IN1`-`PRI_IN5` from real `IRef`s — re-confirmed directly, not a
+  misattribution) and is trivially consistent too: all 6 non-system parameters are `Visible="true"`,
+  matching its real 6-name `VisiblePins` exactly.
+
+**`AOI_VESSEL` remains the one real, confirmed exception** — re-checked directly against the raw L5X:
+`GAHH`/`GAH`/`GAL`/`GALL`/`GAHH_EN`/etc. are genuinely `Visible="false"` in the definition yet shown
+in real `VisiblePins`, while `OAHH_EN` (also `Visible="false"`) is correctly hidden. Not a misread.
+
+**A further, genuine search for a per-instance override field for `AOI_VESSEL` came up empty**, ruling
+out three real candidate locations (not guessed at, not force-fit):
+1. `AOI_VESSEL`'s own per-call-site FBD element record (`record_type=0x01000002`, u32 at offset 16 =
+   `0x0002008A` — a distinct tag from ALMA's `0x0005008C`, confirmed genuine per-instance diagram
+   metadata via byte-exact X/Y position match against all 5 real instances with known coordinates,
+   `AOI_VESSEL` and `AOI_ALM2` alike). This record's own count-prefixed list of `comps.object_id`
+   references (same `count:u16` + `N × (u32 object_id, u32=1)` shape found for both AOI types) is
+   confirmed to be **wired-input-pins bookkeeping, not a display-visibility selection** — proven by
+   two independent facts: (a) for `AOI_ALM2`, the list's per-instance content (3/4/3/5 entries)
+   exactly equals each instance's own actually-wired `PRI_IN*` pins from the compiled FBD rung
+   network, and never includes the never-wired `PRIOUT`, yet real `VisiblePins` always shows all 6
+   including `PRIOUT` — the list plainly isn't the answer; (b) for `AOI_VESSEL`, the list has 28
+   entries (matching the 28 non-InOut real `VisiblePins` names as a SET) while the compiled rung
+   network for a real instance (`TANK01`) wires only ONE pin (`DISP_IN`; zero `oref_writes` at all) —
+   directly contradicting the "wired pins" reading that fit `AOI_ALM2`, so the field cannot mean
+   the same thing for both types, and doesn't explain `AOI_VESSEL`'s real `VisiblePins` either way.
+2. Each `Parameter`'s own raw flags byte (`ext01[0x20e]`, already decoded for `Usage`/`Required`/
+   `Visible` via bits `0x0c`/`0x20`/`0x40`) has 4 otherwise-unused bits (`0x01`/`0x02`/`0x10`/`0x80`)
+   — checked directly against all 51 of `AOI_VESSEL`'s real declared parameters: **every** non-InOut
+   `Input`-usage parameter (included or excluded from real `VisiblePins` alike) has this byte equal
+   to exactly `0x04`; every `Output`-usage one equal to exactly `0x08` — zero variation whatsoever
+   between the 32 shown and 19 hidden parameters. Conclusively rules out this byte as the source.
+3. The `AddOnInstructionDefinition`'s own top-level extended records (`comps.record`'s own
+   `extended_records`, same mechanism `revision`/`vendor` are already read from) — only 4 small
+   (≤4-byte) attributes exist beyond the main 263-byte one, none list-shaped, no room for a
+   32-element selection.
+
+**Working theory, not yet provable either way**: `Visible="true"` declared order is the genuine
+*default* rule, applying straight-through whenever an instance's pins were never individually
+touched; `AOI_VESSEL` — actively edited very recently (`EditedDate="2026-07-15"`) — may be a case
+where a real per-instance (or per-definition) override was made through Studio's own diagram UI and
+is stored somewhere not yet found, OR the zero-variation-across-24-real-instances pattern (every
+real `TANK01`..`TANK35` byte-identical) may instead mean this is a per-AOI-TYPE authored default that
+just isn't derivable from anything decoded so far -- both remain open, undecided by the evidence in
+hand.
+
+**Implemented**: `_render_fbd_content()`'s `AddOnInstruction` branch (`elements.py`) now uses the
+default rule (`aoi_default_visible_pins`, built in `ControllerBuilder.build()` right alongside
+`_aoi_inout_order`, attached to each FBD `Routine` post-hoc the same way) for every real AOI type
+**except** `AOI_VESSEL`, which is deliberately excluded from that map and falls straight through to
+the pre-existing observed-wired+InOut-names fallback, unchanged — a real, still-open gap, not
+silently forced to fit. Ported identically to JS (`fbdDecodeAlmaTierPins`'s sibling map,
+`aoiDefaultVisiblePins`, in `js/l5x/builders.js`/`js/l5x/elements.js`).
+
+**Verified**: `AOI_ALM2`'s real `VisiblePins` (`"PRIOUT PRI_IN1 PRI_IN2 PRI_IN3 PRI_IN4 PRI_IN5"`)
+now matches exactly for all 4 real instances, both languages. `AOI_VESSEL`'s own rendered
+`VisiblePins` (`"DISP_IN LEVEL_ALM PROG_ALM OPER_LVL_ALM ROOF_ALM"`, the pre-existing
+observed-wired+InOut fallback) is **confirmed byte-identical to its pre-this-round output** across
+all 24 real `TK*` instances — no regression. Full whole-project `RefProjA_V33_R17_4.ACD` output:
+Python and JS **byte-for-byte identical** (2,953,421 characters, modulo `ExportDate`). All 28 of
+RefProjA's real FBD routines PASS the PLC-Studio render check (`js/test_plc_studio_fbd.js`), plus
+`FBDLevelControlSimulation`'s `MainFBD` (2 sheets/17 blocks/11 wires, unchanged) — zero regressions.
+`FBDLevelControlSimulation.ACD`/`Test_FBD.ACD` (neither has AOI-instance content) confirmed
+byte-identical to their own pre-this-round baselines. `Add_On_Instructions_Samples.L5X` has no
+matching `.ACD` in this environment, so it could only be checked by direct inspection against the
+implemented rule (done, matches exactly per above), not run through the actual conversion pipeline.
+Full `pytest`/`npm test` both still pass (same one pre-existing, unrelated Windows-only
+`test_api.py::test_to_xml` file-lock flake as every prior round on this platform).
+
+**Not committed** — held in the working tree pending review, per this round's own explicit
+constraint: `AOI_VESSEL`'s real routines must not regress, and they don't (confirmed above), but the
+override-field hunt came up empty rather than closing the gap outright.
+
 ## Ingestion robustness (`_parse_records` in `export_l5x.py`)
 
 `Comps.Dat`/`SbRegion.Dat`/`Comments.Dat`/`Nameless.Dat` ingestion used to abort the *entire*

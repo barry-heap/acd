@@ -2187,6 +2187,7 @@ class Routine(L5xElement):
     _fbd_bit_resolver: object = field(default=None)
     _fbd_sheet_layout: object = field(default=None)
     _fbd_alma_tier_pins: Dict[str, List[str]] = field(default_factory=dict)
+    _aoi_default_visible_pins: Dict[str, List[str]] = field(default_factory=dict)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -2228,7 +2229,7 @@ class Routine(L5xElement):
             if blocks or oref_writes:
                 content = _render_fbd_content(
                     blocks, iref_feeds, oref_writes, self._aoi_inout_order, self._fbd_bit_resolver,
-                    self._fbd_sheet_layout, self._fbd_alma_tier_pins,
+                    self._fbd_sheet_layout, self._fbd_alma_tier_pins, self._aoi_default_visible_pins,
                 )
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
 
@@ -4862,6 +4863,7 @@ def _render_fbd_content(
     bit_resolver=None,
     sheet_layout=None,
     alma_tier_pins: Union[Dict[str, List[str]], None] = None,
+    aoi_default_visible_pins: Union[Dict[str, List[str]], None] = None,
 ) -> str:
     """Render a decoded FBD block/wire graph as <FBDContent><Sheet>...
     XML. IDs are assigned deterministically (sorted by operand/tag name
@@ -4894,6 +4896,7 @@ def _render_fbd_content(
     of the element/wire rendering logic, not two parallel ones."""
     aoi_inout_order = aoi_inout_order or {}
     alma_tier_pins = alma_tier_pins or {}
+    aoi_default_visible_pins = aoi_default_visible_pins or {}
     wires = _fbd_resolve_wires(blocks, iref_feeds, bit_resolver)
 
     block_pins_seen: Dict[str, List[str]] = {}
@@ -5065,7 +5068,20 @@ def _render_fbd_content(
                     f'<InOutParameter Name="{_escape_xml_attr(pname)}" Argument="{_escape_xml_attr(arg)}"/>'
                     for pname, arg in zip(inout_names, extra_args)
                 )
-                visible_pins = " ".join(block_pins_seen.get(op, []) + inout_names)
+                # Default rule (confirmed against LoopSimulation/
+                # TankLevelSimulation/AOI_ALM2, all real, all exact-order
+                # matches): declared parameters, in declaration order,
+                # filtered to non-EnableIn/EnableOut with Visible="true".
+                # AOI_VESSEL is deliberately absent from
+                # aoi_default_visible_pins (see its own construction site's
+                # comment) and falls through to the pre-existing
+                # observed-wired+InOut-names fallback -- a real, still-open
+                # gap, not silently forced to fit.
+                default_visible_pins = aoi_default_visible_pins.get(info["type"].upper())
+                if default_visible_pins is not None:
+                    visible_pins = " ".join(default_visible_pins)
+                else:
+                    visible_pins = " ".join(block_pins_seen.get(op, []) + inout_names)
                 elements_xml.append(
                     f'<AddOnInstruction Name="{_escape_xml_attr(info["type"])}" ID="{id_map[op]}" X="{x}" Y="400" '
                     f'Operand="{_escape_xml_attr(op)}" VisiblePins="{_escape_xml_attr(visible_pins)}">'
@@ -5981,6 +5997,49 @@ class ControllerBuilder(L5xElementBuilder):
                 _attach_aoi_inout_order(_prog.routines)
             for _aoi in aois:
                 _attach_aoi_inout_order(_aoi.routines)
+
+        # AOI-instance VisiblePins default rule -- confirmed against 3 real
+        # AOI types with zero cross-instance variation each (LoopSimulation,
+        # TankLevelSimulation in the official Rockwell
+        # Add_On_Instructions_Samples project; AOI_ALM2 in RefProjA): a
+        # real AOI-instance block's own VisiblePins is that AOI's own
+        # declared parameters, in DECLARATION order, filtered to real
+        # (non-EnableIn/EnableOut) parameters with Visible="true" -- exact
+        # string match, exact order, all 3 cases. AOI_VESSEL (RefProjA) is the
+        # one known, real exception: several Visible="false" parameters
+        # (GAHH/GAH/GAL/GALL/... etc.) ARE shown in its real VisiblePins,
+        # while other Visible="false" ones (the OA* group) are correctly
+        # hidden -- confirmed NOT a misread, and NOT explained by any bit of
+        # the parameter's own raw flags byte (0x04 Input / 0x08 Output
+        # identically for every included AND excluded non-InOut parameter --
+        # zero variation in the 4 otherwise-unused bits of that byte either)
+        # nor anything in the AOI definition's own top-level extended
+        # records. AOI_VESSEL's own per-block FBD element record (the same
+        # 0x0002008A-tagged record examined for this) is confirmed to hold a
+        # DIFFERENT thing entirely -- an explicit list of wired-input-pin
+        # references (verified exactly against AOI_ALM2's real per-instance
+        # wiring), not a display-visibility override. No raw-data field
+        # explaining AOI_VESSEL's real VisiblePins has been found despite a
+        # genuine search; deliberately excluded from this map (falls through
+        # to the pre-existing observed-wired+InOut-names fallback in
+        # _render_fbd_content) rather than guessed at -- a real, open gap,
+        # not silently forced to fit.
+        _aoi_default_visible_pins = {
+            aoi.name.upper(): [
+                p.name for p in aoi.parameters if p.name not in ("EnableIn", "EnableOut") and p.visible == "true"
+            ]
+            for aoi in aois
+            if aoi.name.upper() != "AOI_VESSEL"
+        }
+        if _aoi_default_visible_pins:
+            def _attach_aoi_default_visible_pins(routine_list: List[Routine]) -> None:
+                for _routine in routine_list:
+                    if _routine.type == "FBD" and _routine._fbd_network:
+                        _routine._aoi_default_visible_pins = _aoi_default_visible_pins
+            for _prog in programs:
+                _attach_aoi_default_visible_pins(_prog.routines)
+            for _aoi in aois:
+                _attach_aoi_default_visible_pins(_aoi.routines)
 
         # Same post-hoc-attachment reason as _aoi_inout_order above: an FBD
         # routine's compiled form can pack several BOOL fields into one
