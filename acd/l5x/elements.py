@@ -5,6 +5,7 @@ import re
 import shutil
 import struct
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from os import PathLike
@@ -2189,6 +2190,7 @@ class Routine(L5xElement):
     _fbd_alma_tier_pins: Dict[str, List[str]] = field(default_factory=dict)
     _aoi_default_visible_pins: Dict[str, Dict[str, object]] = field(default_factory=dict)
     _aoi_visible_pins_override: Dict[str, List[str]] = field(default_factory=dict)
+    _sfc_network: Union[dict, None] = field(default=None)
 
     def to_xml(self) -> str:
         desc_xml = ""
@@ -2233,6 +2235,8 @@ class Routine(L5xElement):
                     self._fbd_sheet_layout, self._fbd_alma_tier_pins, self._aoi_default_visible_pins,
                     self._aoi_visible_pins_override,
                 )
+        elif self.type == "SFC" and self._sfc_network:
+            content = _render_sfc_content(self._sfc_network)
         return f'<Routine Name="{_escape_xml_attr(self.name)}" Type="{self.type}">{desc_xml}{content}</Routine>'
 
 
@@ -3880,12 +3884,17 @@ class RoutineBuilder(L5xElementBuilder):
                 if all_operands:
                     fbd_aoi_visible_pins_override = _fbd_decode_aoi_block_lists(self._cur, shadow_oid, all_operands)
 
+        sfc_network = None
+        if routine_type == "SFC":
+            sfc_network = _parse_sfc_network(self._cur, self._object_id)
+
         routine = Routine(
             name, name, routine_type, rungs, rung_ids, rung_comments, description, st_lines, fbd_network
         )
         routine._fbd_sheet_layout = fbd_sheet_layout
         routine._fbd_alma_tier_pins = fbd_alma_tier_pins
         routine._aoi_visible_pins_override = fbd_aoi_visible_pins_override
+        routine._sfc_network = sfc_network
         return routine
 
 
@@ -3912,7 +3921,7 @@ def _parse_fffeff(data: bytes, offset: int):
 _ST_LINE_RECORD_TYPE = 0x01000002
 
 
-def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[Tuple[int, str]]:
+def _st_routine_lines(cur: Cursor, routine_object_id: int, max_depth: int = 6) -> List[Tuple[int, str]]:
     """Extract a Structured Text routine's source lines as (seq, text) pairs.
 
     ST bodies are not stored in SbRegion like ladder rungs; they live in
@@ -3959,10 +3968,17 @@ def _st_routine_lines(cur: Cursor, routine_object_id: int) -> List[Tuple[int, st
     resolved together, iterated to a fixed point rather than in one pass:
     a resolved comp name can itself still be an unresolved ``&hexid:``
     placeholder (a composite/derived module-address reference stored that
-    way in the comps table), which a single pass would leave untouched."""
+    way in the comps table), which a single pass would leave untouched.
+
+    ``max_depth`` defaults to 6 (a plain ST routine's own line tree never
+    needs more). SFC Action bodies / Transition conditions reuse this exact
+    same function with a larger max_depth (their own line tree hangs much
+    deeper below the Action/Transition's own comps-referenced object than a
+    routine's line tree does below the routine itself) -- see the SFC
+    section below for why the underlying storage grammar is identical."""
     lines: List[Tuple[int, int, str]] = []  # (parent_id, seq, text)
     frontier: List[int] = [routine_object_id]
-    for _depth in range(6):
+    for _depth in range(max_depth):
         if not frontier:
             break
         qmarks = ",".join("?" * len(frontier))
@@ -5249,6 +5265,577 @@ def _render_fbd_content(
         sheets_xml.append(f'<Sheet Number="{sheet_number}">{desc_xml}{body}</Sheet>')
 
     return f'<FBDContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="Landscape">{"".join(sheets_xml)}</FBDContent>'
+
+
+# ---------------------------------------------------------------------------
+# SFC (Sequential Function Chart) routine content
+# ---------------------------------------------------------------------------
+#
+# Nothing upstream has ever decoded SFC content -- like FBD before this round,
+# it parsed as an empty <Routine Type="SFC"/> shell. Reverse-engineered via
+# two real Studio 5000 projects + their own genuine L5X exports
+# (`Equipment_Phase_Sequencer.ACD`/`.L5X`, routine `Recipe_Sweet_Cream_Op`:
+# 8 Steps/8 Actions/5 Transitions/5 Branches/21 DirectedLinks; and
+# `SFC_GearChange.ACD`/`.L5X`, routine `SimpleMotion`: 7 Steps/10 Actions/9
+# Transitions/3 Branches/21 DirectedLinks) -- see CLAUDE.md's "SFC" section
+# for the full investigation.
+#
+# Unlike FBD, Studio 5000 does NOT compile an SFC diagram down to a
+# ladder-equivalent shadow region -- region_map/rungs are never populated for
+# an SFC routine (confirmed: every `region_map` row whose parent_id lands
+# anywhere in an SFC routine's own nameless subtree is an inert `0xFFFFFFFF`
+# sentinel placeholder, the same "field absent" marker used everywhere else
+# in this codebase, not real ladder content). The real structure instead
+# lives entirely in Nameless.Dat, reusing THREE mechanisms this codebase
+# already has independent precedent for:
+#
+#   1. Steps and Actions are ordinary comps tags of the built-in
+#      `SFC_STEP`/`SFC_ACTION` data types (decodable today, unmodified, by
+#      the existing `DataTypeBuilder`/`TagBuilder` machinery -- not
+#      exercised by this decode at all, since the diagram's own Operand
+#      names are recovered directly, see below).
+#   2. Action Body / Transition Condition text is stored using the *exact*
+#      same "Map -> Region -> Line" Nameless.Dat grammar as an ST routine's
+#      own source lines (`_ST_LINE_RECORD_TYPE`, `_parse_fffeff`,
+#      `_st_routine_lines`'s grouping/local-numbering/@hexid@-resolution
+#      logic) -- just hanging much deeper below an Action/Transition's own
+#      object than a plain ST routine's line tree hangs below the routine
+#      itself, which is why `_st_routine_lines` above was given a
+#      `max_depth` parameter rather than being reimplemented here.
+#   3. The routine's own comps record has several 4-byte extended-record
+#      attribute values that are themselves other objects' object_ids --
+#      the same "candidate object id list" shape `_fbd_shadow_region` reads.
+#      Unlike FBD (which disambiguates the real one by region_map
+#      ownership), SFC has no region_map signal to key off, so the real
+#      candidate is identified the same way FBD breaks its own remaining
+#      tie -- "whichever candidate's own nameless subtree is by far the
+#      largest" (`_sfc_count_descendants`) -- confirmed to unambiguously
+#      pick the right one in both real projects (hundreds of descendants for
+#      the real content vs. 0-9 for the other, genuinely-unused, candidates
+#      -- e.g. Stop/SbrRet collections, empty in both available samples).
+#
+# Steps, Transitions, and Branches are all direct children of one "content
+# root" node (found by locating whichever node in the shadow subtree has a
+# child shaped like a Step -- 5 grandchildren of its own and an own-text
+# that is a bare `@hexid@` tag reference). All three share one grammar,
+# distinguished purely by shape (own-text present or not; child count):
+#
+#   - Step:       own-text = bare `@hexid@` (resolves to the Step's own
+#                 SFC_STEP tag name), 5 children.
+#   - Transition: own-text = bare `@hexid@` (Tran tag name), 2 children.
+#   - Branch:     no own-text, 1 child (a "legs" container whose own
+#                 children -- 2 or 3 observed -- are the Branch's Legs).
+#   - Action:     own-text = bare `@hexid@` (Action tag name), 3 children.
+#                 Not a content-root child -- nested arbitrarily deep inside
+#                 its owning Step's own subtree (a Step with N actions has N
+#                 such nodes as siblings under one intermediate "actions"
+#                 node -- confirmed against `SimpleMotion`'s `ServosOn`
+#                 step, which has 3 real actions).
+#
+# A Step/Transition's own record directly embeds its real Studio X/Y (u32
+# index 6/7) and a HideDesc flag (u32 index 8, 1=hidden) -- both confirmed
+# exact against every Step/Transition in both real projects (15 Steps + 14
+# Transitions total). A dedicated child (the one shaped `type==0x1000000`,
+# 32 bytes total) holds DescX/DescY the same way (its own index 6/7) --
+# also confirmed exact for all 29. A Step's own record additionally embeds
+# an InitialStep marker at u32 index 10: `0x11` for every normal Step,
+# `0x12` for the one Step with `InitialStep="true"` in each project
+# (`Wait_For_Start`, `ServosOn`) -- confirmed unique and correct both times,
+# not just "differs from the others" but reproducibly the same two values
+# across two unrelated real projects.
+#
+# A Branch's own record embeds its Y (u32 index 7, no X -- matches the real
+# schema, a Branch element has no X attribute at all) and, at u32 index 4, a
+# combined BranchType+BranchFlow code -- confirmed as a clean 2x2 grid
+# against all 8 real Branches across both projects (5 Simultaneous in the
+# first project, 3 Selection in the second -- the second project was the
+# only one available with a positive Selection example, closing what had
+# been an open gap after the first project alone):
+#
+#     0x103fb = Simultaneous + Diverge      0x103f9 = Selection + Diverge
+#     0x103fc = Simultaneous + Converge     0x103fa = Selection + Converge
+#
+# `Priority="Default"` is only ever seen on a Selection+Diverge Branch in
+# either real project (never on a Simultaneous+Diverge one, and Converge
+# branches never have it at all, matching the real schema's own semantics --
+# Priority only matters when multiple legs could otherwise seize control
+# simultaneously); no byte-level source for its own value was found -- there
+# is no contrasting non-"Default" example in either sample -- so it is
+# rendered as the confirmed-common literal string whenever that one
+# structural condition holds, not decoded from any field.
+#
+# An Action's own record embeds a Qualifier code at u32 index 8 -- 4
+# distinct real values seen across the 18 real Actions in both projects:
+#
+#     0x1 = NonStored     0x6 = Pulse
+#     0x7 = PulseRisingEdge     0x8 = PulseFallingEdge
+#
+# These are Rockwell's own internal ordinals, not the IEC 61131-3 standard's
+# own qualifier-letter ordering (N/S/R/L/D/P/SD/DS/SL/P1/P0) -- the 4 known
+# codes don't fit any obvious linear mapping onto that 11-value list, so the
+# other 7 real Rockwell codes remain genuinely unknown; `_SFC_QUALIFIER_CODE`
+# only maps the 4 confirmed values, and an unrecognized code falls back to
+# `_SFC_QUALIFIER_DEFAULT` ("PulseRisingEdge", the single most common real
+# value: 11 of 18 real Actions across both projects) rather than fabricating
+# a mapping -- flagged clearly here and in CLAUDE.md as an open gap, exactly
+# the same "don't guess a bit mapping to force it" discipline this project
+# used for FBD's own still-open ALMA AckRequired/Suppressed/Disabled gap.
+#
+# DirectedLinks are recovered with a single global, self-contained filter
+# rather than by first locating "the DirectedLinks container" as a specific
+# node (that container turned out to be a SIBLING of the Steps/Transitions/
+# Branches content root, one level further up, not a descendant of it --
+# simpler to just not care where it lives): any zero-child, `type==0x1000000`
+# node in the whole shadow subtree whose own two reference fields (u32 index
+# 6 and 8) BOTH resolve to an already-identified Step/Transition/Branch/Leg
+# object id is a real DirectedLink -- confirmed to recover exactly the real
+# 21/21 links in both projects, semantically isomorphic to the real
+# `FromID`/`ToID` graph (via names/coordinates, not literal ID numbers --
+# see below) including each project's own `Show="false"` links (1 in the
+# first project, 4 in the second, all correctly identified via u32 index 10:
+# `0` = shown, nonzero = hidden). A leaf node accidentally matching this
+# filter by coincidence is not a real concern -- both fields must
+# independently collide with a real object id out of the full 32-bit id
+# space, and the filter also requires zero children and the exact record
+# type, which every non-DirectedLink leaf shape already fails on other
+# grounds (coordinates, GUID bytes, etc. are not valid object ids at all).
+#
+# What is explicitly NOT recovered, and out of scope for this round, mostly
+# following the same precedent FBD's own "what is NOT recovered" section
+# already set for this codebase:
+#
+#   - Studio's own small integer ID numbering (0, 2, 4, ..., 37 in the real
+#     L5X) and its own X/Y-driven visual layout of the *diagram elements'
+#     IDs specifically* -- real Step/Transition/Branch/Action/Leg X/Y
+#     coordinates ARE recovered and rendered (unlike FBD's blocks, which
+#     always render at a synthetic grid position), but the small integer
+#     `ID="..."` values themselves are freshly synthesized per render
+#     (sequential, in whatever order this decode's own dict iteration
+#     produces -- see `_render_sfc_content`), the same "Studio's own element
+#     numbering is out of scope" position already taken for FBD.
+#   - `IsBoolean="true"`: every real Action in both projects (18 total) is
+#     `IsBoolean="false"` -- no positive example exists to find the
+#     differentiating bit, so it is always rendered `"false"`.
+#   - A populated `Preset`/`LimitHigh`/`LimitLow` expression on any Step:
+#     every real Step in both projects (15 total) has
+#     `PresetUsesExpr="false" LimitHighUsesExpr="false"
+#     LimitLowUsesExpr="false"` and no `<Preset>`/`<LimitHigh>`/`<LimitLow>`
+#     child element at all. The 3 per-step placeholder slots these would
+#     occupy WERE located in the raw record tree (structurally identical
+#     scaffolding under every Step, in both projects), but since none is
+#     ever populated in either available sample there is no ground truth to
+#     confirm which of the 3 is which, or how a populated one would be
+#     shaped -- so these three are never emitted at all, matching what both
+#     real ground truths actually do for a Step with no expression, and the
+#     three `UsesExpr` attributes are always rendered `"false"`.
+#   - `<Stop>`/`<SbrRet>` elements: the real schema has both, but neither
+#     appears even once across either available real project, so there is
+#     no ground truth to decode either against.
+#   - `<TextBox>` elements: purely decorative diagram annotations, no
+#     bearing on the executable Step/Transition/Branch/DirectedLink graph a
+#     live SFC engine actually walks; not rendered at all.
+#   - `SheetOrientation` is NOT a decoded field -- no byte-level source was
+#     found for it, and unlike `SheetSize`/`StepName`/`TransitionName`/
+#     `ActionName`/`StopName` (identical literal defaults in both real
+#     projects, so simply hardcoded), `SheetOrientation` genuinely differs
+#     between the two real projects (`Portrait` vs. `Landscape`) and a fixed
+#     default would be wrong for one of them. Instead it is inferred
+#     geometrically from the decoded elements' own bounding box (wider than
+#     tall -> `Landscape`, else `Portrait`) -- a principled heuristic that
+#     happens to get both real projects right, not a byte-level decode; if a
+#     future sample disagrees with this heuristic, that would be a genuine
+#     new finding worth another investigation round, not a bug in the
+#     heuristic's own logic as currently understood.
+#
+# Verified end-to-end (see CLAUDE.md for the full per-project numbers, not
+# just aggregate counts): every Step (name/X/Y/DescX/DescY/HideDesc/
+# InitialStep), every Action (name/Qualifier/Body text, correctly attributed
+# to its own owning Step), every Transition (name/X/Y/DescX/DescY/HideDesc/
+# Condition text), every Branch (Y/BranchType/BranchFlow/Priority/Leg
+# count), and the full DirectedLink graph (topology + Show flag) match the
+# real Studio 5000 L5X exactly for both `Recipe_Sweet_Cream_Op` and
+# `SimpleMotion` -- attribute-by-attribute, not just element counts.
+
+_SFC_BRANCH_FLOW_CODE = {
+    0x103FB: ("Simultaneous", "Diverge"),
+    0x103FC: ("Simultaneous", "Converge"),
+    0x103F9: ("Selection", "Diverge"),
+    0x103FA: ("Selection", "Converge"),
+}
+
+_SFC_QUALIFIER_CODE = {
+    0x1: "NonStored",
+    0x6: "Pulse",
+    0x7: "PulseRisingEdge",
+    0x8: "PulseFallingEdge",
+}
+# See the module-level comment above for why this exists and isn't a guess
+# at the other 7 real Rockwell codes.
+_SFC_QUALIFIER_DEFAULT = "PulseRisingEdge"
+
+_SFC_BARE_HEXID_RE = re.compile(r"^@([0-9a-fA-F]{1,8})@$")
+
+
+def _sfc_u32(rec: bytes, index: int) -> Union[int, None]:
+    """uint32 LE field at ``index * 4`` bytes into ``rec``, or None if the
+    record is too short -- every SFC node shape read here is a flat run of
+    LE uint32 fields, same convention as the rest of this file's raw-record
+    readers."""
+    offset = index * 4
+    if offset + 4 > len(rec):
+        return None
+    return struct.unpack_from("<I", rec, offset)[0]
+
+
+def _sfc_own_text(rec: bytes) -> Union[str, None]:
+    """The fffeff-encoded string embedded somewhere in this node's own
+    record, if any -- None for a node with no embedded string at all
+    (a Branch, or a purely structural container). Unlike
+    `_st_routine_lines`'s fixed offset 24 (every ST line record has the
+    same fixed-size header), SFC wrapper nodes carry a variable amount of
+    header data before the marker (their own X/Y/flags/child-pointer
+    fields), so the marker's own byte offset is found by scanning rather
+    than assumed."""
+    idx = rec.find(b"\xff\xfe\xff")
+    if idx < 0:
+        return None
+    text, _ = _parse_fffeff(rec, idx)
+    return text
+
+
+def _sfc_count_descendants(cur: Cursor, root_object_id: int, max_depth: int = 25) -> int:
+    """Total count of every nameless-table descendant of root_object_id --
+    used only to break a tie among several structurally-similar sibling
+    candidates by picking whichever has by far the most real content, the
+    same "most X wins" discipline `_fbd_shadow_region` uses for region_map
+    row ownership (SFC has no region_map signal of its own to key off, so
+    this counts nameless descendants directly instead)."""
+    count = 0
+    frontier = [root_object_id]
+    seen: set = set()
+    for _ in range(max_depth):
+        frontier = [o for o in frontier if o not in seen]
+        if not frontier:
+            break
+        seen.update(frontier)
+        qmarks = ",".join("?" * len(frontier))
+        cur.execute(f"SELECT object_id FROM nameless WHERE parent_id IN ({qmarks})", frontier)
+        frontier = [row[0] for row in cur.fetchall()]
+        count += len(frontier)
+    return count
+
+
+def _sfc_shadow_root(cur: Cursor, routine_object_id: int) -> Union[int, None]:
+    """Find the nameless-table subtree root holding an SFC routine's real
+    diagram content -- see the module comment above for the disambiguation
+    strategy. Returns None if this routine has no real SFC content to find."""
+    cur.execute("SELECT record FROM comps WHERE object_id=?", (routine_object_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        r = RxGeneric.from_bytes(row[0])
+    except Exception:
+        return None
+    candidates = [struct.unpack("<I", er.value)[0] for er in r.extended_records if len(er.value) == 4]
+    best_oid, best_count = None, 0
+    for oid in candidates:
+        count = _sfc_count_descendants(cur, oid)
+        if count > best_count:
+            best_oid, best_count = oid, count
+    return best_oid
+
+
+def _sfc_resolve_tag_name(cur: Cursor, hex_id: str) -> Union[str, None]:
+    cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (int(hex_id, 16),))
+    row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _parse_sfc_network(cur: Cursor, routine_object_id: int):
+    """Decode an SFC routine's full diagram content (Steps, Actions,
+    Transitions, Branches+Legs, DirectedLinks) from the ACD's own raw
+    Nameless.Dat records -- see the long module comment above for the full
+    reverse-engineered mechanism and what is/isn't recovered.
+
+    Returns a dict shaped:
+        {
+          "steps": [ {oid, name, x, y, desc_x, desc_y, hide_desc,
+                      initial_step, actions: [ {oid, name, qualifier,
+                      is_boolean, body_lines: [(number, text), ...]} ]} ],
+          "transitions": [ {oid, name, x, y, desc_x, desc_y, hide_desc,
+                             condition_lines: [(number, text), ...]} ],
+          "branches": [ {oid, y, branch_type, branch_flow,
+                          legs: [leg_oid, ...]} ],
+          "links": [ {from_oid, to_oid, show} ],
+        }
+    or None if this routine has no real SFC content (an empty/placeholder
+    SFC routine)."""
+    shadow_root = _sfc_shadow_root(cur, routine_object_id)
+    if shadow_root is None:
+        return None
+    subtree = _fbd_bfs_subtree(cur, shadow_root, max_depth=30)
+    if not subtree:
+        return None
+
+    children_of: Dict[int, List[int]] = defaultdict(list)
+    for oid, (parent_id, _rec) in subtree.items():
+        children_of[parent_id].append(oid)
+
+    # A Step-shaped node: own-text is a bare @hexid@ and it has exactly 5
+    # children. The content root is whichever node in the whole subtree
+    # has at least one such node as a direct child -- Transitions and
+    # Branches live as its siblings, not its own children.
+    content_root = None
+    for oid in subtree:
+        for kid in children_of.get(oid, []):
+            _pid, krec = subtree[kid]
+            ktext = _sfc_own_text(krec)
+            if ktext and _SFC_BARE_HEXID_RE.match(ktext) and len(children_of.get(kid, [])) == 5:
+                content_root = oid
+                break
+        if content_root is not None:
+            break
+    if content_root is None:
+        return None
+
+    def _desc_xy(kids: List[int]) -> Tuple[int, int]:
+        for kid in kids:
+            _pid, krec = subtree[kid]
+            if len(krec) == 32 and _sfc_u32(krec, 1) == 0x1000000:
+                return _sfc_u32(krec, 6) or 0, _sfc_u32(krec, 7) or 0
+        return 0, 0
+
+    steps: Dict[int, dict] = {}
+    transitions: Dict[int, dict] = {}
+    branches: Dict[int, dict] = {}
+    for oid in sorted(children_of.get(content_root, [])):
+        _pid, rec = subtree[oid]
+        text = _sfc_own_text(rec)
+        kids = children_of.get(oid, [])
+        m = _SFC_BARE_HEXID_RE.match(text) if text else None
+        if m:
+            name = _sfc_resolve_tag_name(cur, m.group(1))
+            if name is None:
+                continue
+            if len(kids) == 5:
+                desc_x, desc_y = _desc_xy(kids)
+                steps[oid] = {
+                    "oid": oid,
+                    "name": name,
+                    "x": _sfc_u32(rec, 6) or 0,
+                    "y": _sfc_u32(rec, 7) or 0,
+                    "desc_x": desc_x,
+                    "desc_y": desc_y,
+                    "hide_desc": _sfc_u32(rec, 8) == 1,
+                    "initial_step": _sfc_u32(rec, 10) == 0x12,
+                    "actions": [],
+                }
+            elif len(kids) == 2:
+                desc_x, desc_y = _desc_xy(kids)
+                transitions[oid] = {
+                    "oid": oid,
+                    "name": name,
+                    "x": _sfc_u32(rec, 6) or 0,
+                    "y": _sfc_u32(rec, 7) or 0,
+                    "desc_x": desc_x,
+                    "desc_y": desc_y,
+                    "hide_desc": _sfc_u32(rec, 8) == 1,
+                    "condition_lines": _st_routine_lines(cur, oid, max_depth=15),
+                }
+        elif not text and len(kids) == 1:
+            leg_container = kids[0]
+            leg_oids = sorted(children_of.get(leg_container, []))
+            if not leg_oids:
+                continue
+            flow_code = _sfc_u32(rec, 4)
+            branch_type, branch_flow = _SFC_BRANCH_FLOW_CODE.get(flow_code, ("Simultaneous", "Diverge"))
+            branches[oid] = {
+                "oid": oid,
+                "y": _sfc_u32(rec, 7) or 0,
+                "branch_type": branch_type,
+                "branch_flow": branch_flow,
+                "legs": leg_oids,
+            }
+
+    # Actions: nested arbitrarily deep below their own owning Step. Scoped
+    # per-step (BFS down from each Step's own oid using the same
+    # already-collected subtree/children_of, not a fresh query) so an
+    # Action is never misattributed to the wrong Step.
+    for step_oid, step in steps.items():
+        step_descendants: set = set()
+        frontier = [step_oid]
+        for _ in range(15):
+            frontier = [c for o in frontier for c in children_of.get(o, [])]
+            if not frontier:
+                break
+            step_descendants.update(frontier)
+        action_oids = []
+        for oid in step_descendants:
+            _pid, rec = subtree[oid]
+            kids = children_of.get(oid, [])
+            if len(kids) != 3:
+                continue
+            text = _sfc_own_text(rec)
+            m = _SFC_BARE_HEXID_RE.match(text) if text else None
+            if not m:
+                continue
+            name = _sfc_resolve_tag_name(cur, m.group(1))
+            if name is None:
+                continue
+            action_oids.append((oid, name))
+        for oid, name in sorted(action_oids):
+            _pid, rec = subtree[oid]
+            # An Action wrapper's 3 children are: a leader/sentinel node (own
+            # text always "", real seq but no real content), an unused
+            # Preset placeholder (type==0x0 -- structurally present even
+            # when empty, and its own descendants can include a stray
+            # zero-length-text ST_LINE_RECORD_TYPE leaf with a REAL seq
+            # number, which would otherwise corrupt the Body line count if
+            # swept in), and the real Body text container (type==0x1000000,
+            # a "region" node exactly like an ST routine's own Map->Region
+            # tree). Scope the line search to that one child specifically,
+            # not the whole Action subtree, to avoid picking up the Preset
+            # placeholder's own dummy line -- found via a real diff against
+            # both real ground truths (every real Action's Body had exactly
+            # one extra bogus empty line before this fix).
+            body_root = oid
+            for kid in children_of.get(oid, []):
+                _kpid, krec = subtree[kid]
+                if _sfc_u32(krec, 1) == 0x1000000:
+                    body_root = kid
+                    break
+            step["actions"].append(
+                {
+                    "oid": oid,
+                    "name": name,
+                    "qualifier": _SFC_QUALIFIER_CODE.get(_sfc_u32(rec, 8), _SFC_QUALIFIER_DEFAULT),
+                    "is_boolean": False,
+                    "body_lines": _st_routine_lines(cur, body_root, max_depth=14),
+                }
+            )
+
+    # DirectedLinks: a single global filter over the whole subtree, not
+    # scoped to a specific "links container" node -- see the module comment
+    # above for why.
+    named_oids: set = set(steps) | set(transitions) | set(branches)
+    for b in branches.values():
+        named_oids.update(b["legs"])
+    links = []
+    for oid, (_pid, rec) in subtree.items():
+        if children_of.get(oid):
+            continue
+        if _sfc_u32(rec, 1) != 0x1000000:
+            continue
+        field_a = _sfc_u32(rec, 6)
+        field_b = _sfc_u32(rec, 8)
+        if field_a in named_oids and field_b in named_oids:
+            links.append({"from_oid": field_a, "to_oid": field_b, "show": _sfc_u32(rec, 10) == 0})
+
+    if not steps and not transitions and not branches:
+        return None
+
+    return {
+        "steps": [steps[k] for k in sorted(steps)],
+        "transitions": [transitions[k] for k in sorted(transitions)],
+        "branches": [branches[k] for k in sorted(branches, key=lambda k: branches[k]["y"])],
+        "links": links,
+    }
+
+
+def _render_sfc_content(network: dict) -> str:
+    """Render a decoded SFC network (see `_parse_sfc_network`) as the
+    `<SFCContent>` element. Studio's own small integer `ID="..."` values are
+    not recovered (see the module comment above) -- freshly synthesized
+    here, sequentially, in the same Step(+its Actions), Transition,
+    Branch(+its Legs) order real Studio's own native L5X export uses
+    (confirmed against both real ground truths), just with different
+    literal numbers."""
+    id_of: Dict[int, int] = {}
+    next_id = [0]
+
+    def alloc(oid: int) -> int:
+        id_of[oid] = next_id[0]
+        next_id[0] += 1
+        return id_of[oid]
+
+    steps = network["steps"]
+    transitions = network["transitions"]
+    branches = network["branches"]
+
+    xs, ys = [], []
+    for s in steps:
+        xs.append(s["x"])
+        ys.append(s["y"])
+    for t in transitions:
+        xs.append(t["x"])
+        ys.append(t["y"])
+    orientation = "Landscape" if xs and ys and (max(xs) - min(xs)) > (max(ys) - min(ys)) else "Portrait"
+
+    parts = [
+        f'<SFCContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="{orientation}" '
+        f'StepName="Step" TransitionName="Tran" ActionName="Action" StopName="Stop">'
+    ]
+
+    for step in steps:
+        step_id = alloc(step["oid"])
+        actions_xml = []
+        for action in step["actions"]:
+            alloc(action["oid"])
+            lines_xml = "".join(
+                f'<Line Number="{number}"><![CDATA[{text}]]></Line>' for number, text in action["body_lines"]
+            )
+            body_xml = f'<Body><STContent>{lines_xml}</STContent></Body>' if lines_xml else "<Body/>"
+            actions_xml.append(
+                f'<Action ID="{id_of[action["oid"]]}" Operand="{_escape_xml_attr(action["name"])}" '
+                f'Qualifier="{action["qualifier"]}" IsBoolean="{"true" if action["is_boolean"] else "false"}" '
+                f'PresetUsesExpr="false">{body_xml}</Action>'
+            )
+        parts.append(
+            f'<Step ID="{step_id}" X="{step["x"]}" Y="{step["y"]}" Operand="{_escape_xml_attr(step["name"])}" '
+            f'HideDesc="{"true" if step["hide_desc"] else "false"}" DescX="{step["desc_x"]}" '
+            f'DescY="{step["desc_y"]}" DescWidth="0" InitialStep="{"true" if step["initial_step"] else "false"}" '
+            f'PresetUsesExpr="false" LimitHighUsesExpr="false" LimitLowUsesExpr="false" ShowActions="true">'
+            f'{"".join(actions_xml)}</Step>'
+        )
+
+    for tran in transitions:
+        tran_id = alloc(tran["oid"])
+        lines_xml = "".join(
+            f'<Line Number="{number}"><![CDATA[{text}]]></Line>' for number, text in tran["condition_lines"]
+        )
+        cond_xml = f'<Condition><STContent>{lines_xml}</STContent></Condition>' if lines_xml else "<Condition/>"
+        parts.append(
+            f'<Transition ID="{tran_id}" X="{tran["x"]}" Y="{tran["y"]}" Operand="{_escape_xml_attr(tran["name"])}" '
+            f'HideDesc="{"true" if tran["hide_desc"] else "false"}" DescX="{tran["desc_x"]}" '
+            f'DescY="{tran["desc_y"]}" DescWidth="0">{cond_xml}</Transition>'
+        )
+
+    for branch in branches:
+        branch_id = alloc(branch["oid"])
+        leg_xml = "".join(f'<Leg ID="{alloc(leg_oid)}"/>' for leg_oid in branch["legs"])
+        priority_xml = (
+            ' Priority="Default"'
+            if branch["branch_type"] == "Selection" and branch["branch_flow"] == "Diverge"
+            else ""
+        )
+        parts.append(
+            f'<Branch ID="{branch_id}" Y="{branch["y"]}" BranchType="{branch["branch_type"]}" '
+            f'BranchFlow="{branch["branch_flow"]}"{priority_xml}>{leg_xml}</Branch>'
+        )
+
+    for link in network["links"]:
+        from_oid, to_oid = link["from_oid"], link["to_oid"]
+        if from_oid not in id_of or to_oid not in id_of:
+            # Only possible if a link's endpoint is an element type this
+            # decode doesn't render at all (e.g. a Stop/SbrRet) -- neither
+            # available real sample ever exercises this.
+            continue
+        show = "true" if link["show"] else "false"
+        parts.append(f'<DirectedLink FromID="{id_of[from_oid]}" ToID="{id_of[to_oid]}" Show="{show}"/>')
+
+    parts.append("</SFCContent>")
+    return "".join(parts)
 
 
 def _lookup_object_description(cur: Cursor, r, record: bytes) -> Union[str, None]:

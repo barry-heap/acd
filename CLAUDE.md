@@ -283,11 +283,19 @@ a hard error since callers mostly only care whether IO is input-like or output-l
   `.description` **Python property** (`Member.description`/`Tag.description`) still
   deliberately collapses to one line — that's documented, existing convenience-API behavior,
   separate from XML fidelity.
-- SFC routine content is still not decoded — only `RLL` (ladder, via `SbRegion.Dat`), `ST`
-  (structured text, via `Nameless.Dat`, see below), and `FBD` (Function Block Diagram, see the
-  "FBD" section below) routine bodies are exported; an SFC routine still exports as an empty
-  `<Routine Type="SFC"/>` with no `<SheetContent>`-equivalent — nobody has reverse-engineered its
-  storage format yet.
+- ~~SFC routine content is still not decoded~~ — **implemented**, see the "SFC (Sequential
+  Function Chart) routine content" section below. All four routine types now export real content:
+  `RLL` (ladder, via `SbRegion.Dat`), `ST` (structured text, via `Nameless.Dat`), `FBD` (Function
+  Block Diagram), and `SFC`. Known SFC-specific gaps (not decoded, or decoded via a heuristic
+  rather than a byte field): `IsBoolean="true"` on an Action, a populated Step
+  `Preset`/`LimitHigh`/`LimitLow` expression, `<Stop>`/`<SbrRet>` elements, `<TextBox>` elements,
+  and `SheetOrientation` (geometric heuristic, not decoded) — see that section for the full
+  detail and why each one is currently unconfirmable rather than just unimplemented. Also found
+  via SFC's own live-simulation verification, but unrelated to SFC decoding itself: Equipment
+  Phase `<Program>` elements never render `Type="EquipmentPhase"` (or its accompanying
+  `InitialStepIndex`/`InitialState`/`CompleteStateIfNotImpl`/`LossOfCommCmd`/
+  `ExternalRequestAction` attributes) — a separate, pre-existing `Program`/`ProgramBuilder` gap,
+  flagged in the SFC section below, not yet fixed.
 
 ## Structured Text (ST) routine content (`_st_routine_lines`)
 
@@ -599,6 +607,243 @@ for structural sanity (no crash, no garbage/`None` in the output, blocks/wires l
 consistent) — not byte-exact against a real Studio 5000 export the way the main 28-routine
 project was. If you ever add ground truth for these fixtures (or hit this shape in a new real
 project), re-verify properly rather than trusting this as "done."
+
+## SFC (Sequential Function Chart) routine content — SOLVED, verified against two real projects
+
+Like FBD before this round, nothing upstream (hutcheb/acd → PascalGodin/acd → this repo) has ever
+decoded SFC content — `Routine.to_xml()`'s SFC branch was empty, so an SFC routine rendered as a
+bare `<Routine Name="..." Type="SFC"></Routine>` shell. This was previously parked specifically
+because there was no ground truth to verify against; that blocker was resolved when two real
+sample projects turned up, each with both the `.ACD` source and its own genuine Studio 5000 L5X
+export: `Equipment_Phase_Sequencer.ACD`/`.L5X` (routine `Recipe_Sweet_Cream_Op`: 8 Steps/8
+Actions/5 Transitions/5 Branches/21 DirectedLinks) and `SFC_GearChange.ACD`/`.L5X` (routine
+`SimpleMotion`: 7 Steps/10 Actions/9 Transitions/3 Branches/21 DirectedLinks).
+
+**Don't assume the FBD shortcut applies.** FBD turned out to be tractable specifically because
+Studio 5000 compiles an FBD network down to the same ladder-equivalent shadow-region mechanism RLL
+already uses (see above). SFC does **not** do this — confirmed empirically: every `region_map` row
+whose `parent_id` lands anywhere in an SFC routine's own nameless subtree is an inert `0xFFFFFFFF`
+sentinel placeholder (the same "field absent" marker used everywhere else in this codebase), never
+real ladder content. The real structure lives entirely in `Nameless.Dat`, reusing three mechanisms
+this codebase already had independent precedent for, rather than needing a wholly new grammar:
+
+1. **Steps and Actions are ordinary comps tags** of the built-in `SFC_STEP`/`SFC_ACTION` data
+   types — decodable today, unmodified, by the existing `DataTypeBuilder`/`TagBuilder` machinery
+   (confirmed: `SFC_STEP`'s full member layout — `Status` DINT + 22 BIT-overlay members `X`/`FS`/
+   `SA`/`LS`/`DN`/`OV`/... + `PRE` DINT — and `SFC_ACTION`'s `Status`/`A`/`Q`/`PauseTimer`/`PRE`/
+   `T`/`Count` both decode correctly via `DataTypeBuilder.build()` with zero code changes). This
+   thread was **not** actually used by the final decode, though — the diagram's own Operand names
+   are recovered directly from the raw nameless-tree wrapper nodes (see below), which turned out
+   simpler than resolving through the tag layer.
+2. **Action Body / Transition Condition text is stored using the *exact* same "Map → Region →
+   Line" `Nameless.Dat` grammar as an ST routine's own source lines** (`_ST_LINE_RECORD_TYPE`,
+   `_parse_fffeff`, `_st_routine_lines`'s grouping/local-numbering/`@hexid@`-resolution logic) —
+   just hanging much deeper below an Action/Transition's own object than a plain ST routine's line
+   tree hangs below the routine itself (13+ levels vs. the ST case's usual few). `_st_routine_lines`
+   was given a `max_depth` parameter (default 6, unchanged for existing ST callers) specifically so
+   SFC could reuse it verbatim with a larger value (15) instead of forking a near-duplicate
+   function — the exact same "one function, one grammar" discipline the FBD section above already
+   established for `_st_routine_lines` itself.
+3. **The routine's own comps record has several 4-byte extended-record attribute values that are
+   themselves other objects' object_ids** — the same "candidate object id list" shape
+   `_fbd_shadow_region` reads. Unlike FBD (disambiguated by region_map ownership), SFC has no
+   region_map signal to key off at all, so the real candidate is identified the same way FBD
+   breaks its own remaining ties — "whichever candidate's own nameless subtree is by far the
+   largest" (`_sfc_count_descendants`) — confirmed to unambiguously pick the right one in both real
+   projects (hundreds of descendants for the real content vs. 0–9 for the other, genuinely-unused
+   candidates, e.g. `Stop`/`SbrRet` collections, empty in both available samples).
+
+**The investigation itself** (an earlier research-spike round, checkpointed before implementation
+per this project's own discipline) started from nothing and had to work byte-by-byte from the raw
+`Recipe_Sweet_Cream_Op` nameless subtree. The single most useful early break: dumping every node's
+raw `uint32`-field-decoded bytes revealed that several small (28–52 byte) leaf/near-leaf nodes'
+"text" (when decoded via the same `fffeff` marker scan `_parse_fffeff` already expects) was a bare
+`@hexid@` reference resolving, via the ordinary `comps` table, directly to a real Step/Transition/
+Action tag name (e.g. a node whose only content was the literal string `"@f4638583@"` resolved to
+`Reset_All`). That one observation cracked the whole shape: Steps, Transitions, and Actions are all
+*wrapper* nodes distinguished purely by (a) having this bare-`@hexid@` own-text and (b) their own
+immediate child count — no other structural marker was needed:
+
+- **Step**: own-text = bare `@hexid@` (resolves to the Step's own `SFC_STEP` tag name), 5
+  children.
+- **Transition**: own-text = bare `@hexid@` (`Tran` tag name), 2 children.
+- **Branch**: no own-text at all, 1 child (a "legs" container whose own children — 2 or 3 observed
+  across both real projects — are the Branch's Legs, themselves plain leaves).
+- **Action**: own-text = bare `@hexid@` (`Action` tag name), 3 children. Not a content-root child
+  like the other three — nested arbitrarily deep inside its owning Step's own subtree (a Step with
+  N actions has N such nodes as siblings under one intermediate "actions" node — confirmed against
+  `SimpleMotion`'s `ServosOn` step, which has 3 real actions, each correctly attributed).
+
+Steps, Transitions, and Branches are all direct children of one shared "content root" node, found
+generically (no hardcoded parent-chain depth — the two real projects' own intermediate structure
+differs in exactly how many single-child "region" hops separate the routine from this node) by
+searching the whole shadow subtree for whichever node has a Step-shaped child (bare `@hexid@` text
++ 5 children). DirectedLinks turned out to live as a **sibling** of this content root, one level
+further up — not nested inside it at all — which made "first locate the DirectedLinks container by
+name/position" the wrong approach; the actual fix was to stop trying to locate it as a specific
+node and instead apply one global, self-contained filter over the *entire* shadow subtree: any
+zero-child, `type==0x1000000` node whose own two reference fields (`u32` index 6 and 8) **both**
+resolve to an already-identified Step/Transition/Branch/Leg object id is a real DirectedLink.
+Confirmed to recover exactly the real 21/21 links in both projects, semantically isomorphic to the
+real `FromID`/`ToID` graph (via names/coordinates — see below for why not literal ID numbers —
+including each project's own `Show="false"` links: 1 in the first project, 4 in the second, all
+correctly identified via `u32` index 10: `0` = shown, nonzero = hidden). A leaf node accidentally
+matching this filter by coincidence is not a real concern: both fields must independently collide
+with a real object id out of the full 32-bit id space, and every non-DirectedLink leaf shape in
+practice already fails on other grounds (coordinates, GUID bytes, etc. are not valid object ids).
+
+**Byte fields confirmed, with the exact evidence for each** (all offsets are `uint32` LE field
+*indices*, i.e. `index * 4` bytes into the node's own raw record):
+
+- **X/Y** (`u32` index 6/7 of the Step/Transition's own wrapper record) and **DescX/DescY**
+  (`u32` index 6/7 of a dedicated child shaped `type==0x1000000`, 32 bytes total) — confirmed
+  **exact** for all 15 Steps + 14 Transitions across both real projects (e.g. `Step_Agitate`:
+  X=1080, Y=560, DescX=1120, DescY=540, matching the real L5X to the pixel).
+- **HideDesc** (`u32` index 8 of the Step/Transition wrapper: `1` = hidden, `0` = shown) —
+  confirmed exact against a real mix of both values (`SFC_GearChange` has both `HideDesc="true"`
+  and `HideDesc="false"` Steps/Transitions; `Equipment_Phase_Sequencer` alone only ever showed
+  `false`, so this specific attribute needed the second project to close).
+- **InitialStep** (`u32` index 10 of the Step wrapper): `0x11` for every normal Step, `0x12` for
+  the one Step with `InitialStep="true"` in each project (`Wait_For_Start`, `ServosOn`) — confirmed
+  unique and correct in both, not just "differs from the others" but reproducibly the same two
+  values across two unrelated real projects.
+- **BranchType + BranchFlow, combined** (`u32` index 4 of the Branch wrapper) — a clean 2×2 grid,
+  confirmed against all 8 real Branches across both projects (5 `Simultaneous` in the first
+  project, 3 `Selection` in the second — the second project was the *only* one available with a
+  positive `Selection` example, closing what had been an explicitly open gap after the first
+  project alone):
+
+      0x103fb = Simultaneous + Diverge      0x103f9 = Selection + Diverge
+      0x103fc = Simultaneous + Converge     0x103fa = Selection + Converge
+
+  `Priority="Default"` is only ever seen on a Selection+Diverge Branch in either real project
+  (never on a Simultaneous+Diverge one, and Converge branches never have it at all — matching the
+  real schema's own semantics, since Priority only matters when multiple legs could otherwise
+  seize control simultaneously); no byte-level source for its own *value* was found (there is no
+  contrasting non-`"Default"` example in either sample), so it's rendered as the confirmed-common
+  literal string whenever that one structural condition holds, not decoded from any field.
+- **Qualifier** (`u32` index 8 of the Action wrapper) — 4 distinct real values seen across the 18
+  real Actions in both projects:
+
+      0x1 = NonStored     0x6 = Pulse
+      0x7 = PulseRisingEdge     0x8 = PulseFallingEdge
+
+  These are Rockwell's own internal ordinals, not the IEC 61131-3 standard's own qualifier-letter
+  ordering (N/S/R/L/D/P/SD/DS/SL/P1/P0) — the 4 known codes don't fit any obvious linear mapping
+  onto that 11-value list, so the other 7 real Rockwell codes remain genuinely unknown.
+  `_SFC_QUALIFIER_CODE` only maps the 4 confirmed values; an unrecognized code falls back to
+  `_SFC_QUALIFIER_DEFAULT` (`"PulseRisingEdge"`, the single most common real value: 11 of 18 real
+  Actions across both projects) rather than fabricating a mapping — flagged clearly here and in the
+  code as an open gap, the exact same "don't guess a bit mapping to force it" discipline used for
+  the still-open ALMA `AckRequired`/`Suppressed`/`Disabled` gap above.
+
+**One real implementation bug found and fixed by the verification loop, worth restating the
+pattern for**: the first working version of the Action Body decoder swept the *entire* Action
+wrapper's subtree for `_ST_LINE_RECORD_TYPE` leaves with a real (non-`0xFFFFFFFF`) `seq`, exactly
+mirroring `_st_routine_lines`'s own top-level walk. This produced exactly one extra, bogus, empty
+(`""`) line in **every single real Action's Body across both projects** — invisible to a
+smoke-level "does it produce lines" check, only caught by a full attribute-by-attribute line-count
+diff against ground truth. Root cause: an Action wrapper's 3 children are a leader/sentinel node
+(own text always `""`, but a *real*, non-sentinel `seq` — itself harmless, already correctly
+excluded elsewhere), an unused Preset placeholder (`type==0x0`, structurally present even when
+completely empty), and the real Body text container (`type==0x1000000`, a "region" node shaped
+exactly like an ST routine's own Map→Region tree) — and the unused Preset placeholder's own
+descendant chain, though never populated with real content in either sample, independently
+contains one more zero-length-text `ST_LINE_RECORD_TYPE` leaf with a genuine `seq` number of its
+own, which a subtree-wide sweep can't distinguish from a real (if empty) Body line. Fixed by
+scoping the line search to the one specific child shaped `type==0x1000000`, not the whole Action
+subtree — the same general lesson the FBD/ALMA sections above make repeatedly: a fix that produces
+plausible-looking output on a smoke test isn't proof the underlying sweep is scoped correctly;
+only a real, exact ground-truth diff catches an off-by-one-line bug like this.
+
+**What is explicitly NOT recovered, and out of scope for this round** (mostly following the same
+precedent the FBD "what is NOT recovered" list above already set):
+
+- **Studio's own small integer ID numbering** (`0, 2, 4, ..., 37` in the real L5X). Unlike FBD's
+  blocks (which also don't recover Studio's real numbering, but additionally never recover real
+  X/Y either — they render at a synthetic grid position), SFC Steps/Transitions/Branches/Actions/
+  Legs' real X/Y coordinates **are** recovered and rendered exactly, but the small integer
+  `ID="..."` values themselves are freshly synthesized per render (sequential, in the same
+  Step(+its Actions), Transition, Branch(+its Legs) order real Studio's own native L5X export
+  uses — confirmed against both real ground truths structurally, just with different literal
+  numbers) — the same "Studio's own element numbering is out of scope" position already taken for
+  FBD.
+- **`IsBoolean="true"`**: every real Action in both projects (18 total) is `IsBoolean="false"` — no
+  positive example exists anywhere to find the differentiating bit, so it's always rendered
+  `"false"`.
+- **A populated `Preset`/`LimitHigh`/`LimitLow` expression on any Step**: every real Step in both
+  projects (15 total) has `PresetUsesExpr="false" LimitHighUsesExpr="false"
+  LimitLowUsesExpr="false"` and no `<Preset>`/`<LimitHigh>`/`<LimitLow>` child element at all. The
+  3 per-step placeholder slots these would occupy WERE located in the raw record tree (structurally
+  identical scaffolding under every Step, in both projects, each holding what looks like a raw GUID
+  rather than any text), but since none is ever populated in either available sample there is no
+  ground truth to confirm which of the 3 is which, or how a populated one would even be shaped — so
+  these three are never emitted at all (matching what both real ground truths actually do for a
+  Step with no expression), and the three `UsesExpr` attributes are always rendered `"false"`.
+- **`<Stop>`/`<SbrRet>` elements**: the real schema has both, but neither appears even once across
+  either available real project, so there is no ground truth to decode either against.
+- **`<TextBox>` elements**: purely decorative diagram annotations, no bearing on the executable
+  Step/Transition/Branch/DirectedLink graph a live SFC engine actually walks; not rendered at all.
+- **`SheetOrientation`**: no byte-level source was found for it at all, and unlike `SheetSize`/
+  `StepName`/`TransitionName`/`ActionName`/`StopName` (identical literal defaults in both real
+  projects, so simply hardcoded), `SheetOrientation` genuinely differs between the two real
+  projects (`Portrait` vs. `Landscape`) and a fixed default would be wrong for one of them.
+  Instead it's inferred **geometrically** from the decoded elements' own bounding box (wider than
+  tall → `Landscape`, else `Portrait`) — a principled heuristic that happens to get both real
+  projects right, not a byte-level decode; if a future sample disagrees with this heuristic, that
+  would be a genuine new finding worth its own investigation round, not evidence the heuristic's
+  own logic is wrong as currently understood.
+
+**Verified end-to-end, attribute-by-attribute, not just element counts, for both real projects**:
+every Step (name/X/Y/DescX/DescY/HideDesc/InitialStep), every Action (name/Qualifier/Body text,
+correctly attributed to its own owning Step — including `SimpleMotion`'s `ServosOn` step, which
+has 3 real actions, all correctly attributed), every Transition (name/X/Y/DescX/DescY/HideDesc/
+Condition text), every Branch (Y/BranchType/BranchFlow/Priority/Leg count), and the full
+DirectedLink graph (topology + `Show` flag) match the real Studio 5000 L5X exactly for both
+`Recipe_Sweet_Cream_Op` (8 Steps/8 Actions/5 Transitions/5 Branches/21 DirectedLinks) and
+`SimpleMotion` (7 Steps/10 Actions/9 Transitions/3 Branches/21 DirectedLinks).
+
+**A genuinely stronger check than the usual offline attribute diff, specific to SFC**: since the
+sibling `plc-studio` repo (a separate, independently-developed, already-deeply-validated
+Studio-5000-like viewer/simulator sharing the same real sample files) has a real, live SFC
+execution engine already proven correct against `Equipment_Phase_Sequencer.L5X`'s own real Studio
+export (see that repo's own `SFC_EQUIPMENT_PHASE_PLAN.md` and `test/live-scan-cycle.test.js`), the
+converted output was fed through that exact same live engine (`loadModel` → force
+`Recipe_Ops__Start` via the real `commitWatchEdit` path → `globalTick()` × 500, the identical
+mechanism its own HEADLINE test uses) rather than just diffed offline. This genuinely proved
+stronger: it caught a real, confirmed bug — **not** in this round's SFC decode itself (the
+`<SFCContent>` topology drives the live engine through exactly the right graph, confirmed by
+patching around the actual bug and observing the simulation then complete a full real cycle
+identically to the real L5X: ends parked back at `Wait_For_Start`, `LoopCount == 1`, all 6
+Equipment Phase programs reset to `Idle`) — but in a **separate, pre-existing gap**: this
+converter's `Program`/`ProgramBuilder` has never decoded or rendered `Type="EquipmentPhase"` (nor
+the accompanying `InitialStepIndex`/`InitialState`/`CompleteStateIfNotImpl`/`LossOfCommCmd`/
+`ExternalRequestAction` attributes) on an Equipment Phase Program's own `<Program>` element — every
+Program is rendered as an ordinary one. Without `Type="EquipmentPhase"`, plc-studio's own engine
+never recognizes `Add_Sugar_M2`/`Add_Egg_M2`/etc. as Equipment Phase programs and never schedules
+their own `Running` routine at all, so a real PCMD-commanded phase gets stuck in `Running` state
+forever with its own `MyCounter` frozen at 0 — confirmed by manually patching just those 6
+attributes onto the converted L5X's `Program` tags and observing the exact same simulation then
+complete correctly. This is unrelated to any code touched in this round (no `Program`/
+`ProgramBuilder` code was modified for SFC), was never noticed before because no prior
+verification round included a live execution check *or* a project using Equipment Phase programs,
+and is being left as an explicitly flagged, precisely-diagnosed open gap for its own future
+round — not fixed here, since it needs its own from-scratch byte-offset investigation with the same
+rigor this SFC round itself required, not a guess.
+
+**A second, separate pre-existing Python/JS divergence, found only because `SFC_GearChange.ACD`
+was run through both pipelines for the first time this round** (this project has real Motion axis
+tags — `axis0`/`axis1` — that no prior fixture, in either language, ever exercised): the two
+languages' full converted documents differ starting partway through an axis-typed tag's own decoded
+initial value (a `DataValueMember` list mismatch — different member names/order past a certain
+point, e.g. `ProcessStatus`/`OutputLimitStatus`/`PositionLockStatus` on this (Python) side vs.
+`ServoFault`/`ModuleFaults` on the JS side). The `<SFCContent>` section itself is confirmed
+byte-identical between the two languages (see above) — this divergence is entirely outside it, in
+the ordinary UDT/tag decode path this round never touched in either language. Left as an explicitly
+flagged, unresolved finding for a future round (would need the same from-scratch byte-verification
+rigor as any other decode gap in this project, starting from a real ground-truth L5X for this
+specific project, which is not currently available for `SFC_GearChange.ACD` beyond its own SFC
+content) — not investigated further here, consistent with this round's own scope.
 
 ## `VisiblePins` is a per-block-TYPE default, not "pins observed wired" — SOLVED (real
 ## PLC-Studio rendering bug, found because the multi-sheet round's own verification was blind to it)
