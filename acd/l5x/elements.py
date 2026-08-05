@@ -488,11 +488,65 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
     ],
 }
 
-# Types for which we emit no Decorated element at all (they use other formats).
+# Types for which we suppress the <Tag> element's own Constant attribute
+# (opaque built-in types that don't support it) AND -- for the *fallback*
+# zero-value rendering path only (Tag.to_xml's "no successfully-decoded
+# initial value" branch, and the nested-struct-member helpers below) -- for
+# which we emit no Decorated element at all.
+#
+# IMPORTANT: despite the name, this set is NOT a blanket "never show
+# Decorated for these types" list -- see _NO_NATIVE_DECORATED_FORMAT below
+# for that. PID_ENHANCED is deliberately still in *this* set (it does
+# suppress Constant -- verified against a real project's PID_ENHANCED tag,
+# which shows no Constant attribute at all) but must NOT be treated as
+# "skip Decorated", since a real project's PID_ENHANCED tag with a known
+# initial value DOES get an ordinary <Data Format="Decorated"><Structure
+# DataType="PID_ENHANCED">... block, verified against
+# FBDLevelControlSimulation.L5X's real "LevelController" tag -- the
+# original theory here (that PID_ENHANCED belongs alongside AXIS_SERVO/
+# MOTION_GROUP as an "opaque, no-Decorated" type) was never actually
+# checked against real ground truth and turned out to be wrong for the
+# Decorated question specifically, right only for the Constant question.
 _SKIP_DECORATED: set = {
     "ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED",
     "AXIS_CIP_DRIVE", "MOTION_GROUP",
 }
+
+# Types that use their own dedicated native L5X <Data Format="..."> block
+# (e.g. "Axis", "MotionGroup") instead of ever showing ordinary
+# Format="L5K"/"Decorated" content -- Tag.to_xml's UDT-dict/UDT-array
+# branches must skip generating Decorated/L5K for these regardless of
+# whether TagBuilder successfully decoded a struct-shaped initial value
+# for them (native-format rendering itself is out of scope for this
+# read-only converter; the correct behavior is simply to omit <Data>
+# entirely rather than show a wrong/synthetic Decorated structure).
+#
+# AXIS_SERVO and MOTION_GROUP verified directly against real ground truth
+# (SFC_GearChange.L5X): axis0/axis1 (AXIS_SERVO) use
+# <Data Format="Axis"><AxisParameters .../></Data>; group1 (MOTION_GROUP)
+# uses <Data Format="MotionGroup"><MotionGroupParameters .../></Data> --
+# neither has any L5K or Decorated block at all. AXIS_CIP_DRIVE is included
+# by inference only (the same Motion-axis-instance family as AXIS_SERVO,
+# almost certainly also rendered as Format="Axis" by real Studio 5000) --
+# no fixture available exercises it, so this is unverified; flag if a
+# real AXIS_CIP_DRIVE tag ever turns up and contradicts this.
+#
+# Found via a real, reproducible bug: TagBuilder/ControllerBuilder's second
+# pass can successfully decode a dict-shaped _initial_value for an
+# AXIS_SERVO tag (its "DataType" comps record IS present and walkable, even
+# though it's a hidden/built-in system type never exported under
+# <DataTypes>) -- Tag.to_xml's `elif isinstance(iv, dict):` /
+# `elif isinstance(iv, list) and iv and isinstance(iv[0], dict):` branches
+# never checked _SKIP_DECORATED (only the separate "no decoded value at
+# all" fallback branch did), so a real AXIS_SERVO/MOTION_GROUP tag with a
+# successfully-decoded value got a synthetic <Data Format="Decorated">
+# block Studio 5000 never produces, built from whatever (possibly
+# incorrect -- see the BIT-overlay-target caveat in CLAUDE.md) member
+# layout TagBuilder happened to resolve for that hidden system type. Since
+# AXIS_SERVO's own "DataType" is excluded from <DataTypes> and (with this
+# fix) never rendered under any <Tag> either, its internal member/BIT-
+# target-resolution correctness no longer affects any L5X output at all.
+_NO_NATIVE_DECORATED_FORMAT: set = {"AXIS_SERVO", "AXIS_CIP_DRIVE", "MOTION_GROUP"}
 
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
@@ -2284,15 +2338,36 @@ class Program(L5xElement):
     from `project.controller.tags` (controller-scope)."""
 
     name: str
+    # "EquipmentPhase" for a real Equipment Phase program, None (omitted from
+    # XML) for an ordinary program -- see ProgramBuilder.build() / CLAUDE.md's
+    # "Equipment Phase Program attributes" section for how this is decoded.
+    program_type: Union[str, None]
     test_edits: str
     main_routine_name: Union[str, None]  # None if absent (omitted from XML)
     fault_routine_name: Union[str, None]  # None if absent (omitted from XML)
     disabled: str
     synchronize_redundancy_data_after_execution: Union[str, None]  # None → omit attr
-    use_as_folder: str
+    use_as_folder: Union[str, None]  # None for an EquipmentPhase program (never present in real ground truth for one)
+    # The following 5 are only ever present on a real EquipmentPhase program
+    # (None -> omitted -- for an ordinary program) -- see CLAUDE.md, all 5
+    # are rendered as confirmed-common literal defaults, not decoded from a
+    # byte field (every real EquipmentPhase Program available has identical
+    # values for all 5; no contrasting example exists to decode against).
+    initial_step_index: Union[str, None]
+    initial_state: Union[str, None]
+    complete_state_if_not_impl: Union[str, None]
+    loss_of_comm_cmd: Union[str, None]
+    external_request_action: Union[str, None]
     tags: List[Tag]        # Tags section before Routines (matches L5X export order)
     routines: List[Routine]
     _description: Union[str, None] = field(default=None)
+
+    def __post_init__(self):
+        super().__post_init__()
+        # "program_type" -> "Type" -- title()/replace("_","") on the raw
+        # field name would produce "ProgramType", not the real attribute
+        # name Studio 5000 actually uses.
+        self._xml_attr_overrides = {"program_type": "Type"}
 
     def to_xml(self) -> str:
         base = super().to_xml()
@@ -6153,6 +6228,44 @@ class ProgramBuilder(L5xElementBuilder):
         )
         disabled = "true" if disabled_flag else "false"
 
+        # --- Equipment Phase Program detection, from ext[0x01] offsets 0xBD/0xBE ---
+        # Confirmed against 6 real EquipmentPhase Programs (Equipment_Phase_Sequencer.ACD:
+        # Add_Cream_M2/Add_Egg_M2/Add_Milk_M2/Add_Sugar_M2/Agitate_M2/Heat_M2) and 31 real
+        # ordinary Programs across 5 other real projects (that same project's own
+        # Recipe_Ops, plus CuteLogix.ACD/SFC_GearChange.ACD/FBDLevelControlSimulation.ACD/
+        # RefProjA_V33_R17_4_Changed_AOI_VESSEL.ACD) -- every single EquipmentPhase Program
+        # has byte 0xBD=0x00, byte 0xBE=0x02; every single ordinary Program has 0xBD=0x01,
+        # 0xBE=0x01; zero exceptions either direction. Checked as a pair (not just byte
+        # 0xBE alone) since both bytes happen to be perfectly correlated in all available
+        # real data and there's no reason to discard the extra confirmation.
+        #
+        # The 5 sibling attributes (InitialStepIndex/InitialState/CompleteStateIfNotImpl/
+        # LossOfCommCmd/ExternalRequestAction) are NOT decoded from any byte field -- every
+        # real EquipmentPhase Program available (all 6) has identical values for all 5, so
+        # there is no contrasting example to find the real encoding against. Rendered as
+        # the confirmed-common literal defaults, same "don't guess a bit mapping to force
+        # it" discipline as SFC's IsBoolean/Priority (see CLAUDE.md's "SFC" and "Equipment
+        # Phase Program attributes" sections) -- if a future real project ever shows a
+        # different value for any of these 5, that's a genuine new finding requiring its
+        # own investigation, not something this heuristic already accounts for.
+        is_equipment_phase = len(ext01) >= 0xBF and ext01[0xBD] == 0x00 and ext01[0xBE] == 0x02
+        if is_equipment_phase:
+            program_type: Union[str, None] = "EquipmentPhase"
+            use_as_folder: Union[str, None] = None
+            initial_step_index: Union[str, None] = "0"
+            initial_state: Union[str, None] = "Idle"
+            complete_state_if_not_impl: Union[str, None] = "StateComplete"
+            loss_of_comm_cmd: Union[str, None] = "None"
+            external_request_action: Union[str, None] = "None"
+        else:
+            program_type = None
+            use_as_folder = "false"
+            initial_step_index = None
+            initial_state = None
+            complete_state_if_not_impl = None
+            loss_of_comm_cmd = None
+            external_request_action = None
+
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
             + str(self._object_id)
@@ -6233,8 +6346,10 @@ class ProgramBuilder(L5xElementBuilder):
         # against a real project ("_2_TONGLOADER" -> "Tong Loader Master Control").
         description = _lookup_object_description(self._cur, r, prog_record)
 
-        return Program(name, name, "false", main_routine_name, fault_routine_name,
-                       disabled, sync_redundancy, "false", tags, routines, description)
+        return Program(name, name, program_type, "false", main_routine_name, fault_routine_name,
+                       disabled, sync_redundancy, use_as_folder, initial_step_index, initial_state,
+                       complete_state_if_not_impl, loss_of_comm_cmd, external_request_action,
+                       tags, routines, description)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}

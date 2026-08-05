@@ -291,11 +291,11 @@ a hard error since callers mostly only care whether IO is input-like or output-l
   `Preset`/`LimitHigh`/`LimitLow` expression, `<Stop>`/`<SbrRet>` elements, `<TextBox>` elements,
   and `SheetOrientation` (geometric heuristic, not decoded) — see that section for the full
   detail and why each one is currently unconfirmable rather than just unimplemented. Also found
-  via SFC's own live-simulation verification, but unrelated to SFC decoding itself: Equipment
-  Phase `<Program>` elements never render `Type="EquipmentPhase"` (or its accompanying
-  `InitialStepIndex`/`InitialState`/`CompleteStateIfNotImpl`/`LossOfCommCmd`/
-  `ExternalRequestAction` attributes) — a separate, pre-existing `Program`/`ProgramBuilder` gap,
-  flagged in the SFC section below, not yet fixed.
+  via SFC's own live-simulation verification, but unrelated to SFC decoding itself and now
+  **fixed** in its own follow-up round: Equipment Phase `<Program>` elements were never rendering
+  `Type="EquipmentPhase"` (or its accompanying `InitialStepIndex`/`InitialState`/
+  `CompleteStateIfNotImpl`/`LossOfCommCmd`/`ExternalRequestAction` attributes) — see "Equipment
+  Phase Program attributes" below for the real byte-offset fix and its own verification.
 
 ## Structured Text (ST) routine content (`_st_routine_lines`)
 
@@ -815,21 +815,12 @@ stronger: it caught a real, confirmed bug — **not** in this round's SFC decode
 `<SFCContent>` topology drives the live engine through exactly the right graph, confirmed by
 patching around the actual bug and observing the simulation then complete a full real cycle
 identically to the real L5X: ends parked back at `Wait_For_Start`, `LoopCount == 1`, all 6
-Equipment Phase programs reset to `Idle`) — but in a **separate, pre-existing gap**: this
-converter's `Program`/`ProgramBuilder` has never decoded or rendered `Type="EquipmentPhase"` (nor
-the accompanying `InitialStepIndex`/`InitialState`/`CompleteStateIfNotImpl`/`LossOfCommCmd`/
-`ExternalRequestAction` attributes) on an Equipment Phase Program's own `<Program>` element — every
-Program is rendered as an ordinary one. Without `Type="EquipmentPhase"`, plc-studio's own engine
-never recognizes `Add_Sugar_M2`/`Add_Egg_M2`/etc. as Equipment Phase programs and never schedules
-their own `Running` routine at all, so a real PCMD-commanded phase gets stuck in `Running` state
-forever with its own `MyCounter` frozen at 0 — confirmed by manually patching just those 6
-attributes onto the converted L5X's `Program` tags and observing the exact same simulation then
-complete correctly. This is unrelated to any code touched in this round (no `Program`/
-`ProgramBuilder` code was modified for SFC), was never noticed before because no prior
-verification round included a live execution check *or* a project using Equipment Phase programs,
-and is being left as an explicitly flagged, precisely-diagnosed open gap for its own future
-round — not fixed here, since it needs its own from-scratch byte-offset investigation with the same
-rigor this SFC round itself required, not a guess.
+Equipment Phase programs reset to `Idle`) — but in a **separate, pre-existing gap**, diagnosed here
+only via a transient, uncommitted, diagnostic-only patch (manually setting the 6 attributes on the
+converted output just to unblock this specific check) and properly re-derived and fixed for real in
+its own follow-up round — see "Equipment Phase Program attributes" below for the real byte-offset
+fix, which this SFC round's own text originally (and correctly, per this project's own checkpoint
+discipline) left as an open, not-yet-fixed gap rather than treating that transient patch as done.
 
 **A second, separate pre-existing Python/JS divergence, found only because `SFC_GearChange.ACD`
 was run through both pipelines for the first time this round** (this project has real Motion axis
@@ -844,6 +835,107 @@ flagged, unresolved finding for a future round (would need the same from-scratch
 rigor as any other decode gap in this project, starting from a real ground-truth L5X for this
 specific project, which is not currently available for `SFC_GearChange.ACD` beyond its own SFC
 content) — not investigated further here, consistent with this round's own scope.
+
+## Equipment Phase Program attributes (`Type`/`InitialStepIndex`/`InitialState`/`CompleteStateIfNotImpl`/`LossOfCommCmd`/`ExternalRequestAction`) — SOLVED
+
+Found (diagnosed, not fixed) by the SFC round's own live-simulator check above via a transient,
+uncommitted, diagnostic-only patch — this section is the real, from-scratch re-derivation and fix,
+in its own follow-up round, with its own verification, per this project's own standing "a
+diagnostic patch is not a verified fix" discipline.
+
+**The bug**: `Program`/`ProgramBuilder` never rendered `Type="EquipmentPhase"` (nor the 5
+accompanying attributes) on an Equipment Phase Program's own `<Program>` element — every Program
+was rendered as an ordinary one, regardless of its real kind. Real ground truth
+(`Equipment_Phase_Sequencer.L5X`) has 6 real Equipment Phase Programs, all with identical values:
+
+    <Program Name="Add_Cream_M2" Type="EquipmentPhase" TestEdits="false" Disabled="false"
+     InitialStepIndex="0" InitialState="Idle" CompleteStateIfNotImpl="StateComplete"
+     LossOfCommCmd="None" ExternalRequestAction="None">
+
+— confirmed identical across all 6 (`Add_Cream_M2`/`Add_Egg_M2`/`Add_Milk_M2`/`Add_Sugar_M2`/
+`Agitate_M2`/`Heat_M2`), and confirmed that the same file's one ordinary Program (`Recipe_Ops`)
+correctly has none of these 6 attributes at all (`<Program Name="Recipe_Ops" TestEdits="false"
+MainRoutineName="MainRoutine" Disabled="false">`).
+
+**Where it lives, and how it was found**: `ProgramBuilder.build()` already reads several
+Program-level flags out of the Program's own comps record's extended-record attribute `0x01` (a
+large, ~4.2KB blob) — `Disabled` at absolute offset `0x24`, for one. Two hypotheses were checked
+against real data before picking one, per this project's own "don't assume" discipline:
+
+1. **A genuinely separate stored flag on the Program's own record** — checked by byte-diffing
+   ext `0x1` across all 6 real Equipment Phase Programs against the one real ordinary Program in
+   the same file, looking for positions where all 6 EquipmentPhase Programs agree with each other
+   but disagree with the ordinary one. Found exactly 2 such byte positions: absolute offset `0xBD`
+   (`0x00` for every EquipmentPhase Program, `0x01` for the ordinary one) and `0xBE` (`0x02` vs.
+   `0x01`).
+2. **Derivable from something else already decoded** (e.g. a `PHASE`-typed local tag or similar
+   structural marker, the way `SFC_STEP`/`SFC_ACTION` turned out to be recognizable structural UDTs
+   for the SFC round) — a real, separately-named comps object matching each Phase Program's own
+   name does exist (`record_type=1280`, `cip_type=0x6B`, presumably the underlying phase-state tag
+   the live engine reads, e.g. `engine.tags["Add_Egg_M2"].Complete`), but this is a SEPARATE
+   `comps` object from the Program's own record, one extra join/lookup away — not needed, since
+   hypothesis 1 already gave a clean, direct, single-record answer. Not investigated further; noted
+   here in case a future round finds hypothesis 1's discriminator insufficient for some other real
+   project's data and needs a fallback thread to pull on.
+
+Hypothesis 1 was confirmed and used. **Cross-validated far beyond the one available sample**: byte
+`0xBD`/`0xBE` were also checked against every ordinary Program in 4 other real projects with no
+Equipment Phase content at all (`resources/CuteLogix.ACD`: 3 Programs; `SFC_GearChange.ACD`: 1;
+`FBDLevelControlSimulation.ACD`: 1; `RefProjA_V33_R17_4_Changed_AOI_VESSEL.ACD`: 29) — all 30
+additional real ordinary Programs show `0xBD=0x01, 0xBE=0x01` (same as `Recipe_Ops`), zero
+exceptions. Combined with the 6 real EquipmentPhase Programs, this is a
+clean, unambiguous discriminator confirmed against 37 real Programs total (6 positive, 31
+negative), checked as a pair (not just byte `0xBE` alone) since both bytes are perfectly correlated
+in every real example available and there's no reason to discard the extra confirmation:
+
+    ext[0x1][0xBD] == 0x00 and ext[0x1][0xBE] == 0x02   ->  EquipmentPhase
+    ext[0x1][0xBD] == 0x01 and ext[0x1][0xBE] == 0x01   ->  ordinary Program
+
+**The 5 sibling attributes are NOT decoded from any byte field.** Every real EquipmentPhase
+Program available (all 6, in the only real project with any) has identical values for all 5 —
+`InitialStepIndex="0"`, `InitialState="Idle"`, `CompleteStateIfNotImpl="StateComplete"`,
+`LossOfCommCmd="None"`, `ExternalRequestAction="None"` — so there is no contrasting example to find
+the real per-attribute encoding against. Rendered as the confirmed-common literal defaults, same
+"don't guess a bit mapping to force it" discipline as SFC's `IsBoolean`/`Priority` gaps above — if
+a future real project ever shows a different value for any of these 5, that would be a genuine new
+finding requiring its own investigation, not something this fix already accounts for.
+
+**XML attribute ordering, a real subtlety worth documenting**: `Program`'s existing `use_as_folder`
+field was previously always rendered as `UseAsFolder="false"` unconditionally. Real ground truth
+shows NO `UseAsFolder` attribute at all on EITHER a real EquipmentPhase Program or the one real
+ordinary Program checked (`Recipe_Ops`) — this is a **separate, pre-existing** discrepancy, not
+part of this fix's scope, and it was carefully NOT touched for the ordinary-Program case (its
+value stays exactly `"false"`, byte-identical to before this round, confirmed by diffing the full
+converted output for every fixture with no Equipment Phase content against its own pre-this-round
+baseline). For an EquipmentPhase Program specifically, though, `use_as_folder` now becomes `None`
+(omitted) rather than `"false"` — required for correct output (real ground truth genuinely has no
+`UseAsFolder` on any real EquipmentPhase Program either), and safe/well-scoped since it only
+changes behavior for Programs newly recognized as EquipmentPhase by this same fix, never for an
+ordinary Program. The new fields were positioned in `Program`'s own field list (`program_type`
+right after `name`; `initial_step_index`/`initial_state`/`complete_state_if_not_impl`/
+`loss_of_comm_cmd`/`external_request_action` right after `use_as_folder`) specifically so the
+existing reflection-based `L5xElement.to_xml()` (attribute order follows field declaration order,
+`None` values are skipped entirely) produces the exact right XML attribute order for BOTH Program
+shapes with no special-casing: `Name, Type, TestEdits, Disabled, InitialStepIndex, InitialState,
+CompleteStateIfNotImpl, LossOfCommCmd, ExternalRequestAction` for an EquipmentPhase Program
+(`MainRoutineName`/`FaultRoutineName`/`SynchronizeRedundancyDataAfterExecution`/`UseAsFolder` all
+correctly `None` for one, so skipped), and the original, unchanged `Name, TestEdits,
+MainRoutineName, Disabled, UseAsFolder` order for an ordinary one.
+
+**Verified attribute-by-attribute against real ground truth**: all 6 real EquipmentPhase Programs
+in `Equipment_Phase_Sequencer.ACD` now render their full `<Program ...>` opening tag **exactly**
+byte-for-byte identical to the real L5X export. `Recipe_Ops` (ordinary) and `SFC_GearChange.ACD`'s
+own `MainProgram` (ordinary) correctly do NOT get `Type`/`InitialStepIndex`/etc — their own output
+is unchanged from before this fix (still missing the separate, pre-existing, out-of-scope
+`UseAsFolder` omission noted above, exactly as before).
+
+**Regression-verified**: full `pytest` suite still 111 passed / 2 skipped (the one pre-existing,
+environment-specific `test_to_xml` file-lock flake reproduces identically on the unmodified
+codebase too, confirmed by stashing this round's change and re-running). Full converted-document
+diff (modulo `ExportDate`) for every fixture with NO Equipment Phase content
+(`resources/CuteLogix.ACD`, `FBDLevelControlSimulation.ACD`,
+`RefProjA_V33_R17_4_Changed_AOI_VESSEL.ACD`) confirmed **byte-for-byte unchanged** by this round —
+zero regressions outside the intended Equipment Phase Program fix.
 
 ## `VisiblePins` is a per-block-TYPE default, not "pins observed wired" — SOLVED (real
 ## PLC-Studio rendering bug, found because the multi-sheet round's own verification was blind to it)
