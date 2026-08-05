@@ -488,11 +488,65 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
     ],
 }
 
-# Types for which we emit no Decorated element at all (they use other formats).
+# Types for which we suppress the <Tag> element's own Constant attribute
+# (opaque built-in types that don't support it) AND -- for the *fallback*
+# zero-value rendering path only (Tag.to_xml's "no successfully-decoded
+# initial value" branch, and the nested-struct-member helpers below) -- for
+# which we emit no Decorated element at all.
+#
+# IMPORTANT: despite the name, this set is NOT a blanket "never show
+# Decorated for these types" list -- see _NO_NATIVE_DECORATED_FORMAT below
+# for that. PID_ENHANCED is deliberately still in *this* set (it does
+# suppress Constant -- verified against a real project's PID_ENHANCED tag,
+# which shows no Constant attribute at all) but must NOT be treated as
+# "skip Decorated", since a real project's PID_ENHANCED tag with a known
+# initial value DOES get an ordinary <Data Format="Decorated"><Structure
+# DataType="PID_ENHANCED">... block, verified against
+# FBDLevelControlSimulation.L5X's real "LevelController" tag -- the
+# original theory here (that PID_ENHANCED belongs alongside AXIS_SERVO/
+# MOTION_GROUP as an "opaque, no-Decorated" type) was never actually
+# checked against real ground truth and turned out to be wrong for the
+# Decorated question specifically, right only for the Constant question.
 _SKIP_DECORATED: set = {
     "ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED",
     "AXIS_CIP_DRIVE", "MOTION_GROUP",
 }
+
+# Types that use their own dedicated native L5X <Data Format="..."> block
+# (e.g. "Axis", "MotionGroup") instead of ever showing ordinary
+# Format="L5K"/"Decorated" content -- Tag.to_xml's UDT-dict/UDT-array
+# branches must skip generating Decorated/L5K for these regardless of
+# whether TagBuilder successfully decoded a struct-shaped initial value
+# for them (native-format rendering itself is out of scope for this
+# read-only converter; the correct behavior is simply to omit <Data>
+# entirely rather than show a wrong/synthetic Decorated structure).
+#
+# AXIS_SERVO and MOTION_GROUP verified directly against real ground truth
+# (SFC_GearChange.L5X): axis0/axis1 (AXIS_SERVO) use
+# <Data Format="Axis"><AxisParameters .../></Data>; group1 (MOTION_GROUP)
+# uses <Data Format="MotionGroup"><MotionGroupParameters .../></Data> --
+# neither has any L5K or Decorated block at all. AXIS_CIP_DRIVE is included
+# by inference only (the same Motion-axis-instance family as AXIS_SERVO,
+# almost certainly also rendered as Format="Axis" by real Studio 5000) --
+# no fixture available exercises it, so this is unverified; flag if a
+# real AXIS_CIP_DRIVE tag ever turns up and contradicts this.
+#
+# Found via a real, reproducible bug: TagBuilder/ControllerBuilder's second
+# pass can successfully decode a dict-shaped _initial_value for an
+# AXIS_SERVO tag (its "DataType" comps record IS present and walkable, even
+# though it's a hidden/built-in system type never exported under
+# <DataTypes>) -- Tag.to_xml's `elif isinstance(iv, dict):` /
+# `elif isinstance(iv, list) and iv and isinstance(iv[0], dict):` branches
+# never checked _SKIP_DECORATED (only the separate "no decoded value at
+# all" fallback branch did), so a real AXIS_SERVO/MOTION_GROUP tag with a
+# successfully-decoded value got a synthetic <Data Format="Decorated">
+# block Studio 5000 never produces, built from whatever (possibly
+# incorrect -- see the BIT-overlay-target caveat in CLAUDE.md) member
+# layout TagBuilder happened to resolve for that hidden system type. Since
+# AXIS_SERVO's own "DataType" is excluded from <DataTypes> and (with this
+# fix) never rendered under any <Tag> either, its internal member/BIT-
+# target-resolution correctness no longer affects any L5X output at all.
+_NO_NATIVE_DECORATED_FORMAT: set = {"AXIS_SERVO", "AXIS_CIP_DRIVE", "MOTION_GROUP"}
 
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
@@ -1716,6 +1770,17 @@ class Tag(L5xElement):
                     f'{_string_literal_cdata(text)}\n</Data>'
                 )
 
+            elif isinstance(iv, dict) and dt_base in _NO_NATIVE_DECORATED_FORMAT:
+                # AXIS_SERVO/MOTION_GROUP/AXIS_CIP_DRIVE: TagBuilder can
+                # successfully decode a dict-shaped value for these (their
+                # "DataType" comps record is walkable even though it's a
+                # hidden system type), but real Studio 5000 never shows
+                # Decorated for them -- see _NO_NATIVE_DECORATED_FORMAT's
+                # docstring. Leave data_xml empty (no L5K, no Decorated);
+                # the tag's own native format (Format="Axis"/"MotionGroup")
+                # is out of scope for this read-only converter.
+                pass
+
             elif isinstance(iv, dict):
                 # UDT scalar. Verified against a real project: this also
                 # gets a <Data Format="L5K"> block alongside Decorated,
@@ -1743,6 +1808,16 @@ class Tag(L5xElement):
                     f'<Data Format="L5K">\n<![CDATA[{l5k_udt_val}]]>\n</Data>'
                     f'<Data Format="Decorated">\n{body}\n</Data>'
                 )
+
+            elif isinstance(iv, list) and iv and isinstance(iv[0], dict) and dt_base in _NO_NATIVE_DECORATED_FORMAT:
+                # Array of AXIS_SERVO/MOTION_GROUP/AXIS_CIP_DRIVE structs --
+                # same reasoning as the scalar dict branch above: no L5K, no
+                # Decorated, native format only (out of scope). Unverified
+                # against any real fixture (no array-of-axis tag is
+                # available anywhere), but follows directly from the same
+                # ground-truth finding for the scalar case, which is the
+                # common case in practice.
+                pass
 
             elif isinstance(iv, list) and iv and isinstance(iv[0], dict):
                 # UDT array. Same L5K-block fix as the scalar case above --

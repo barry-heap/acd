@@ -2102,6 +2102,29 @@ project against a *whole-project* L5X export, not just the specific UDT named in
 Don't treat "fixes the reported case" as "correct in general" for this kind of byte-offset
 heuristic — cross-check against everything available before considering it done.
 
+**Addendum — a third real UDT shape found (`AXIS_SERVO`, a hidden/built-in Motion-axis system
+type), where declaration order is ALSO wrong, in the opposite direction from `Bin_Sequence`'s
+collision — deliberately NOT fixed, see "Motion-axis tags never get Decorated output" below for the
+full writeup and why**: `AXIS_SERVO`'s `ProcessStatus`/`OutputLimitStatus`/`PositionLockStatus`/...
+BIT members' real backing field is `ServoStatus`, a **non-hidden** DINT — but `_fallback_target`
+("most recent preceding *hidden* member") instead resolves to `DEAD_ZONE107`, an unrelated hidden
+`REAL` padding field declared immediately before `ServoStatus` in the same UDT. Confirmed via direct
+byte inspection: `ProcessStatus`'s own `0x60=232` (its own extended-record byte-offset field)
+**correctly** matches `ServoStatus`'s own `0x60=232` — i.e. for this UDT, the offset-based lookup
+(step 3's "fallback, not primary" mechanism) would have given the right answer, while declaration-
+order (the primary mechanism, correct for `Bin_Sequence`) gives the wrong one. Measured the fix
+"track the most recent *qualifying plain field regardless of hidden*, not just hidden ones" (which
+would correctly resolve `ServoStatus`) directly against all 164 real `DataType`s in `CuteLogix.ACD`
+before touching anything: it **regresses 84 of them**, including `CONTROL`'s own `EN`/`EU`/`DN`/...
+(real shape: hidden `Control` DWORD declared *first*, visible `LEN`/`POS` declared *between* it and
+its own BIT overlays — broadening the rule walks the tracker onto `POS` before reaching `EN`, the
+mirror-image failure). The two real shapes (hidden-backing-declared-first-with-visible-fields-
+between, vs. visible-backing-with-a-hidden-padding-field-between) are genuinely ambiguous under
+either "most recent hidden" or "most recent qualifying-regardless-of-hidden" in isolation.
+**Not fixed** — no general rule found this session that resolves both without an as-yet-undiscovered
+extra signal; left as a known, narrow, currently-harmless (see below for why) latent bug rather than
+force a change that would trade one real regression for another.
+
 ## Nested-UDT decode recursion-depth double-increment (`_decode_single_udt_element`)
 
 A real Studio 5000 import of an `export_routine()` output failed with `Failed to set the 'Data'
@@ -2694,3 +2717,126 @@ just documented accurately somewhere in the file.
   is affected. Already independently identified once before (see `js/CLAUDE.md`'s Round 2 section),
   so this isn't a new finding — re-documented here since it keeps resurfacing in every fresh
   `pytest` run's output and is worth not re-investigating from scratch each time.
+
+## Motion-axis tags (`AXIS_SERVO`/`MOTION_GROUP`) never get `Decorated` output — a Python/JS
+## divergence that was really "both sides wrong the same way," not a Python-vs-JS question
+
+`js/CLAUDE.md`'s "Round 8" (SFC content) flagged, but deliberately left open, a real Python/JS
+divergence found by running `SFC_GearChange.ACD` (a real project with two Motion-axis tags,
+`axis0`/`axis1`, both `DataType="AXIS_SERVO"`) through both pipelines for the first time: the two
+languages' full converted documents diverged partway through `axis0`/`axis1`'s own decoded initial
+value — a `DataValueMember` list mismatch. Investigated with the user-supplied ground truth
+(`Samples/SFC_GearChange.L5X`, confirmed to contain real `axis0`/`axis1`/`group1` tags at lines
+42/94/201) as the actual arbiter, per this project's standing "never assume Python is right just
+because it's the reference" discipline.
+
+**The reported divergence turned out to be the wrong question.** Real Studio 5000 never shows
+`Data Format="Decorated"` for either tag at all:
+
+```xml
+<Tag Name="axis0" TagType="Base" DataType="AXIS_SERVO">
+<Data Format="Axis">
+<AxisParameters MotionGroup="group1" MotionModule="&lt;NA&gt;" ConversionConstant="8000.0" ...
+ MaximumSpeed="25.0" MaximumAcceleration="3512.3972" ... PositionProportionalGain="101.72524" .../>
+</Data>
+</Tag>
+```
+
+and the sibling `group1` tag (`DataType="MOTION_GROUP"`) uses `<Data Format="MotionGroup">
+<MotionGroupParameters .../></Data>`. Neither has any `Data Format="L5K"` or `Data Format="Decorated"`
+block at all. **Both Python and JS were wrong**, in the same way (emitting a synthetic Decorated
+block real Studio 5000 never produces) — they merely disagreed with each other about that synthetic
+block's own content, which is a separate bug (see below). This is exactly the "consistently wrong,
+not correct" trap this project's own verification discipline warns against: making the two languages
+agree with each other here would NOT have been a fix.
+
+**Root cause of the wrong Decorated block existing at all**: `_SKIP_DECORATED` (`elements.py`) already
+existed and already lists `AXIS_SERVO`/`MOTION_GROUP` (among 4 others) as types real Studio 5000
+renders with no Decorated content — but it was only ever checked in `Tag.to_xml()`'s *fallback*
+branch (reached only when `_initial_value` is `None`). `TagBuilder`'s own second pass (run from
+`ProgramBuilder`/`ControllerBuilder` once `data_types_map` is available) CAN successfully decode a
+dict-shaped `_initial_value` for an `AXIS_SERVO`/`MOTION_GROUP` tag — its "DataType" comps record is
+present and walkable (a real row in the `comps` table with real members, just a hidden/built-in
+system type that's never exported under `<DataTypes>`) — so `Tag.to_xml()`'s `elif isinstance(iv,
+dict):` / `elif isinstance(iv, list) and iv and isinstance(iv[0], dict):` branches ran instead, and
+**neither ever checked `_SKIP_DECORATED`** — a genuine oversight (the set's own comment says "Types
+for which we emit no Decorated element at all"), not a deliberate carve-out.
+
+**Why Python and JS disagreed about the (wrong) block's own content**: `AXIS_SERVO` has BIT-overlay
+BOOL pseudo-members (`ProcessStatus`/`OutputLimitStatus`/`PositionLockStatus`/... on `ServoStatus`)
+whose backing-field resolution picks the WRONG field identically on both sides — see the new
+addendum in "BIT-overlay member Target resolution" above (`DEAD_ZONE107` vs. the true `ServoStatus`)
+for the full byte-level detail; not re-derived here. Both languages resolve `target="DEAD_ZONE107"`
+for these members — confirmed via direct instrumentation of `MemberBuilder(...).build()` (Python) and
+`buildMember(...)` (JS), byte-for-byte identical. The two languages only diverge **downstream** of
+this identical wrong target, in `_decode_single_udt_element`'s second pass (line ~1471-1476): Python's
+`isinstance(target_val, int)` only checks the *runtime type* of the (wrongly-targeted) decoded value
+— and `DEAD_ZONE107`'s computed byte offset happens to fall outside `axis0`'s real data blob, so
+Python's existing out-of-bounds fallback (`_decode_scalar_member`, always returns a plain `int 0`
+regardless of declared type — see "Initial-value decoding offset bugs" above) makes `isinstance(...,
+int)` pass by accident, producing spurious-but-present `BOOL` members. JS's stricter, already-
+verified-correct `isGenuineFloat`/declared-type check (ported from this exact file's own earlier
+`PID_Master`/`SP` REAL-target fix) correctly refuses to bit-extract from a target whose *declared*
+type is `REAL` (`DEAD_ZONE107` is declared `REAL`), so those 18 keys are simply absent from JS's
+decoded dict, and JS's `udtScalarToXml` skips any member whose key is missing — while Python's
+`_udt_scalar_to_xml` (walking the same dict) finds the key present (value `0`) and renders it. Two
+previously-verified-correct fixes (Python's real-int-fallback sentinel; JS's `isGenuineFloat` guard)
+interacting with one already-known-imperfect heuristic produced two different flavors of the same
+underlying wrong answer — worth remembering: "both sides independently verified correct in isolation"
+does not imply "produces the same output when composed on a case neither was tested against."
+
+**The fix actually applied (Python first, then ported to JS)**: added a new, deliberately NARROWER
+set, `_NO_NATIVE_DECORATED_FORMAT = {"AXIS_SERVO", "AXIS_CIP_DRIVE", "MOTION_GROUP"}`, and made
+`Tag.to_xml()`'s UDT-dict and UDT-array-of-dict branches skip `<Data>` generation entirely when
+`dt_base` is in it, regardless of whether `iv` decoded successfully. **Deliberately did NOT reuse
+`_SKIP_DECORATED` itself for this** (which stays completely unchanged, all 6 original entries,
+still governing `Constant`-attribute suppression and the pre-existing fallback-only skip) — because
+checking ground truth for every member of the existing set individually (not assuming they behave
+uniformly) found `_SKIP_DECORATED`'s own inclusion of `PID_ENHANCED` was ALSO wrong, in the opposite
+direction: `Samples/FBDLevelControlSimulation.L5X`'s real `LevelController` tag and
+`Samples/RefProjA...L5X`'s 4 real `PID_ENHANCED` tags confirm Studio 5000 DOES show ordinary
+`<Data Format="Decorated"><Structure DataType="PID_ENHANCED">...` for these (all 165 real
+`DataValueMember`s present, correctly named and ordered, matching ground truth exactly — 10 of 165
+have pre-existing, unrelated value-*formatting* mismatches, float32-max exponential notation and
+DINT-Hex zero-padding, flagged here for the record but explicitly out of this fix's scope, not
+touched). The pre-existing dict-branch bypass of `_SKIP_DECORATED` was, by accident, already CORRECT
+for `PID_ENHANCED` (never checking the set meant it always got real Decorated content) — the
+"obvious," uniform-looking fix (make the dict branches respect the existing, unmodified
+`_SKIP_DECORATED` set) would have fixed `AXIS_SERVO`/`MOTION_GROUP` while silently BREAKING
+`PID_ENHANCED`. `ALARM_DIGITAL`/`MESSAGE`/`AXIS_CIP_DRIVE` remain unverified either way — no fixture
+available exercises any of them with a decodable value — left untouched in both sets pending real
+evidence rather than guessed at.
+
+**Why the deferred BIT-target-resolution bug (see addendum above) is currently harmless, not just
+postponed**: `AXIS_SERVO`'s own "DataType" record is never rendered under `<DataTypes>` (hidden/
+system type, excluded by `class_type`) and, after this fix, never rendered under any `<Tag>` either
+(no `<Data>` child at all now) — so its internal member/BIT-target correctness no longer reaches any
+L5X output on either language, unless a future real fixture uses one of these three types as a
+*nested member* inside an ordinary, exported UDT (not observed in any of the 8 fixtures checked this
+session: `CuteLogix.ACD`, `Test_IO.ACD`, `ACDTestsWithAOI.ACD`, `ACDTestsNonRedundant.ACD`,
+`SFC_GearChange.ACD`, `FBDLevelControlSimulation.ACD`, `Equipment_Phase_Sequencer.ACD`,
+`RefProjA_V33_R17_4_Changed_AOI_VESSEL.ACD`).
+
+**Verified**: `axis0`/`axis1`/`group1`'s `<Tag>` elements now render as exactly `<Tag Name="axis0"
+TagType="Base" DataType="AXIS_SERVO" ExternalAccess="Read/Write"></Tag>` (no `<Data>` child at all)
+on both languages — matching real ground truth's own absence of any L5K/Decorated block for these
+three tags exactly (the real `Format="Axis"`/`Format="MotionGroup"` native content itself remains out
+of scope, consistent with every other write-back/native-format exclusion this project has drawn
+elsewhere). `SFC_GearChange.ACD`'s entire converted document (62,057 characters) is now
+**byte-for-byte identical between Python and JS**, modulo `ExportDate` — the divergence
+`js/CLAUDE.md`'s Round 8 flagged is fully closed. Re-verified zero regressions: `CuteLogix.ACD` (164
+real DataTypes — all previously-verified BIT targets completely untouched, since the fragile
+heuristic itself was never changed), `Test_IO.ACD`, `ACDTestsWithAOI.ACD`, `ACDTestsNonRedundant.ACD`,
+`FBDLevelControlSimulation.ACD` all still produce byte-for-byte-identical Python/JS output to their
+established baselines. `RefProjA_V33_R17_4_Changed_AOI_VESSEL.ACD`'s full ~2.87MB document matches too
+once the pre-existing, unrelated, already-flagged 1ms `CreatedDate` FILETIME-rounding artifact
+(`js/CLAUDE.md`'s Round 8 finding, not this fix's concern) is normalized out of the diff; its 4 real
+`PID_ENHANCED` tags are confirmed unaffected (not a member of the new, narrower
+`_NO_NATIVE_DECORATED_FORMAT` set). Full `pytest` suite: 111 passed, 2 skipped (up from 109 passed as
+more tests were added upstream of this session; no test assertions needed updating for this fix, and
+the one transient `PermissionError` seen in one full-suite run — a concurrent process holding
+`resources/CuteLogix/acd.db` open — is confirmed environmental, not a regression, by re-running the
+same test in isolation, where it passes cleanly).
+
+**Not committed** — held in the working tree pending review, same discipline this project uses
+throughout for a fix this size.
