@@ -2115,15 +2115,37 @@ byte inspection: `ProcessStatus`'s own `0x60=232` (its own extended-record byte-
 order (the primary mechanism, correct for `Bin_Sequence`) gives the wrong one. Measured the fix
 "track the most recent *qualifying plain field regardless of hidden*, not just hidden ones" (which
 would correctly resolve `ServoStatus`) directly against all 164 real `DataType`s in `CuteLogix.ACD`
-before touching anything: it **regresses 84 of them**, including `CONTROL`'s own `EN`/`EU`/`DN`/...
-(real shape: hidden `Control` DWORD declared *first*, visible `LEN`/`POS` declared *between* it and
-its own BIT overlays — broadening the rule walks the tracker onto `POS` before reaching `EN`, the
-mirror-image failure). The two real shapes (hidden-backing-declared-first-with-visible-fields-
-between, vs. visible-backing-with-a-hidden-padding-field-between) are genuinely ambiguous under
-either "most recent hidden" or "most recent qualifying-regardless-of-hidden" in isolation.
-**Not fixed** — no general rule found this session that resolves both without an as-yet-undiscovered
-extra signal; left as a known, narrow, currently-harmless (see below for why) latent bug rather than
-force a change that would trade one real regression for another.
+before touching anything: it **regresses 84 of them** (relative to their current, *not* independently
+ground-truth-confirmed, output — see the epistemic-status correction below), including `CONTROL`'s
+own `EN`/`EU`/`DN`/... (real shape: hidden `Control` DWORD declared *first*, visible `LEN`/`POS`
+declared *between* it and its own BIT overlays — broadening the rule walks the tracker onto `POS`
+before reaching `EN`, the mirror-image failure). The two real shapes (hidden-backing-declared-first-
+with-visible-fields-between, vs. visible-backing-with-a-hidden-padding-field-between) are genuinely
+ambiguous under either "most recent hidden" or "most recent qualifying-regardless-of-hidden" in
+isolation. **Not fixed** — no general rule found this session that resolves both without an
+as-yet-undiscovered extra signal; left as a known, narrow, deliberately-unfixed latent bug rather
+than force a change that would trade one real regression for another (see below for why *`AXIS_SERVO`
+itself* is currently harmless — a narrower, separately-justified claim, not a claim about the other
+84 `DataType`s).
+
+**Epistemic-status correction — "regresses 84" is not "breaks 84 confirmed-correct outputs," and
+this project's own discipline requires saying so plainly**: unlike this section's own `LugWrk`/
+`Lug`/`Bin_Sequence` ground-truth work above (99 `DataType`s checked against that real project's own
+Studio 5000 export), `CuteLogix.ACD` has no real Studio 5000 ground-truth `L5X` anywhere in this repo
+tree (it's used throughout this project purely as "the sample fixture ACD," per this file's own
+"Commands" section, never with a companion real Studio export the way `SFC_GearChange`/
+`Equipment_Phase_Sequencer`/`RefProjA...` all have). Every "verified" claim made about
+`CuteLogix.ACD`'s 164 `DataType`s anywhere in this project's history means Python/JS cross-language
+agreement, or — in a regression re-run like this session's — "byte-for-byte unchanged from the
+currently-shipped baseline," never independent confirmation against genuine Studio output. So
+`AXIS_SERVO` is the only *known* symptom of this BIT-target ambiguity because it's the only one
+anyone happened to go looking for (via this session's cross-language `SFC_GearChange.ACD` diff), NOT
+because it's confirmed to be the only real symptom that *exists*. Any of the 84 `DataType`s that
+would change under the broadened rule (or any of the other 80 that wouldn't) could already carry a
+silently-wrong `BIT`-overlay `Target` in real shipped output today — genuinely unverified, not
+settled-safe. This is an open gap in this project's own ground-truth coverage, documented honestly
+here rather than left implied-safe by "regresses" language alone. Actually fixing the underlying
+heuristic is a separate, larger investigation, out of scope for this note.
 
 ## Nested-UDT decode recursion-depth double-increment (`_decode_single_udt_element`)
 
@@ -2825,8 +2847,10 @@ of scope, consistent with every other write-back/native-format exclusion this pr
 elsewhere). `SFC_GearChange.ACD`'s entire converted document (62,057 characters) is now
 **byte-for-byte identical between Python and JS**, modulo `ExportDate` — the divergence
 `js/CLAUDE.md`'s Round 8 flagged is fully closed. Re-verified zero regressions: `CuteLogix.ACD` (164
-real DataTypes — all previously-verified BIT targets completely untouched, since the fragile
-heuristic itself was never changed), `Test_IO.ACD`, `ACDTestsWithAOI.ACD`, `ACDTestsNonRedundant.ACD`,
+real DataTypes — all left byte-for-byte unchanged, since the fragile heuristic itself was never
+touched; "unchanged" here means exactly that, not "ground-truth-confirmed correct" — see the
+epistemic-status correction in "BIT-overlay member Target resolution" above), `Test_IO.ACD`,
+`ACDTestsWithAOI.ACD`, `ACDTestsNonRedundant.ACD`,
 `FBDLevelControlSimulation.ACD` all still produce byte-for-byte-identical Python/JS output to their
 established baselines. `RefProjA_V33_R17_4_Changed_AOI_VESSEL.ACD`'s full ~2.87MB document matches too
 once the pre-existing, unrelated, already-flagged 1ms `CreatedDate` FILETIME-rounding artifact
