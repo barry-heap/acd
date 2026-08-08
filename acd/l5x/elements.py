@@ -5807,9 +5807,21 @@ def _parse_sfc_network(cur: Cursor, routine_object_id: int):
         return None
 
     def _desc_xy(kids: List[int]) -> Tuple[int, int]:
+        # The description-textbox child is the one Step/Transition kid with
+        # record length 32 -- reliably unique among the 5/2 siblings in
+        # every real example checked. Previously also required its own
+        # u32[1] === 0x1000000, which turned out to just be a redundant
+        # HideDesc echo (0x1000000 when HideDesc="false", 0 when
+        # HideDesc="true") rather than part of identifying the right child
+        # -- confirmed via a real HideDesc="true" step (Step_000,
+        # Equipment_Phase_Sequencer_SQO_SQI.ACD) whose real DescX/DescY
+        # (240/80) live in a u32[1]===0 record of the same length-32 shape;
+        # requiring 0x1000000 wrongly fell through to (0, 0) for it.
+        # Dropped the u32[1] check entirely, re-verified against every
+        # pre-existing HideDesc="false" real example too.
         for kid in kids:
             _pid, krec = subtree[kid]
-            if len(krec) == 32 and _sfc_u32(krec, 1) == 0x1000000:
+            if len(krec) == 32:
                 return _sfc_u32(krec, 6) or 0, _sfc_u32(krec, 7) or 0
         return 0, 0
 
@@ -5912,13 +5924,24 @@ def _parse_sfc_network(cur: Cursor, routine_object_id: int):
                 if _sfc_u32(krec, 1) == 0x1000000:
                     body_root = kid
                     break
+            # Byte 8's own u32 packs both Qualifier (low nibble, same codes
+            # as _SFC_QUALIFIER_CODE) and a Boolean-Action flag (bit 0x10)
+            # into one field -- confirmed against the one real
+            # IsBoolean="true" example available (TestBoolAction,
+            # Equipment_Phase_Sequencer_SQO_SQI.ACD: raw field8=0x11 =
+            # 0x10 | _SFC_QUALIFIER_CODE[0x1]="NonStored") and all 8 other
+            # real Actions in the same project plus every Action in both
+            # earlier real SFC samples (field8 always a bare 7/8 with no
+            # 0x10 bit set, all IsBoolean="false" in ground truth).
+            qualifier_field = _sfc_u32(rec, 8)
+            is_boolean = bool(qualifier_field & 0x10)
             step["actions"].append(
                 {
                     "oid": oid,
                     "name": name,
-                    "qualifier": _SFC_QUALIFIER_CODE.get(_sfc_u32(rec, 8), _SFC_QUALIFIER_DEFAULT),
-                    "is_boolean": False,
-                    "body_lines": _st_routine_lines(cur, body_root, max_depth=14),
+                    "qualifier": _SFC_QUALIFIER_CODE.get(qualifier_field & ~0x10, _SFC_QUALIFIER_DEFAULT),
+                    "is_boolean": is_boolean,
+                    "body_lines": [] if is_boolean else _st_routine_lines(cur, body_root, max_depth=14),
                 }
             )
 
@@ -5989,13 +6012,24 @@ def _render_sfc_content(network: dict) -> str:
         actions_xml = []
         for action in step["actions"]:
             alloc(action["oid"])
+            # A Boolean Action (ground-truth-confirmed via TestBoolAction,
+            # Equipment_Phase_Sequencer_SQO_SQI.ACD) just sets its own named
+            # BOOL tag per Qualifier -- no ST code, so real Studio 5000
+            # renders it as a bare self-closing <Action .../>, no <Body>
+            # child at all.
+            if action["is_boolean"]:
+                actions_xml.append(
+                    f'<Action ID="{id_of[action["oid"]]}" Operand="{_escape_xml_attr(action["name"])}" '
+                    f'Qualifier="{action["qualifier"]}" IsBoolean="true" PresetUsesExpr="false"/>'
+                )
+                continue
             lines_xml = "".join(
                 f'<Line Number="{number}"><![CDATA[{text}]]></Line>' for number, text in action["body_lines"]
             )
             body_xml = f'<Body><STContent>{lines_xml}</STContent></Body>' if lines_xml else "<Body/>"
             actions_xml.append(
                 f'<Action ID="{id_of[action["oid"]]}" Operand="{_escape_xml_attr(action["name"])}" '
-                f'Qualifier="{action["qualifier"]}" IsBoolean="{"true" if action["is_boolean"] else "false"}" '
+                f'Qualifier="{action["qualifier"]}" IsBoolean="false" '
                 f'PresetUsesExpr="false">{body_xml}</Action>'
             )
         parts.append(

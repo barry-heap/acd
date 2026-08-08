@@ -2864,3 +2864,48 @@ same test in isolation, where it passes cleanly).
 
 **Not committed** — held in the working tree pending review, same discipline this project uses
 throughout for a fix this size.
+
+## SFC Action `IsBoolean`/`Qualifier` packed field, and a `DescX`/`DescY` bug for `HideDesc="true"` Steps
+
+A purpose-built test project, `Equipment_Phase_Sequencer_SQO_SQI.ACD`/`.L5X` (available in the JS
+port's own `Samples/` directory — see that repo's `CLAUDE.md`, "Round 14", for the parallel writeup
+and the SQI/SQO-vs-`SEQ_*` finding this same investigation also produced), supplied the first real
+`IsBoolean="true"` SFC Action ground truth this project has ever had, plus the first real
+`HideDesc="true"` SFC Step. Two real bugs found and fixed, ported here identically to the JS side:
+
+1. **`_sfc_u32(rec, 8)` packs both Qualifier and a Boolean-Action flag into one field.** The real
+   `TestBoolAction` has `field8 = 0x11`; every other real Action checked (this project's other 8, plus
+   `Equipment_Phase_Sequencer.ACD`'s 8 and `SFC_GearChange.ACD`'s 10) has a bare `7` or `8` with no
+   high bits set. `0x11 = 0x10 | 0x01`, and `_SFC_QUALIFIER_CODE[0x01] = "NonStored"` — ground truth's
+   own real `Qualifier` for this Action. Fixed: `is_boolean = bool(qualifier_field & 0x10)`,
+   `qualifier = _SFC_QUALIFIER_CODE.get(qualifier_field & ~0x10, ...)` in `_parse_sfc_network`'s
+   Action-decode loop, and the matching render-side change (`_render_sfc_content`): a Boolean Action
+   renders as a bare self-closing `<Action .../>`, no `<Body>` child, matching ground truth's own
+   shape (a Boolean Action just sets its named `BOOL` tag per Qualifier — no ST code).
+2. **`_desc_xy`'s child-selection required both `len(rec) == 32` and `_sfc_u32(rec, 1) == 0x1000000`.**
+   `Step_000` (`HideDesc="true"`) has real `DescX="240" DescY="80"`, but the second condition failed
+   for it (`u32[1] == 0`, not `0x1000000`) so it fell through to `(0, 0)`. Raw-byte inspection: `u32[1]`
+   is `0x1000000` for every known `HideDesc="false"` Step/Transition and `0` for this one
+   `HideDesc="true"` example — a redundant echo of `HideDesc` on that specific child record, not
+   something needed to find it (`len(rec) == 32` alone already uniquely identifies the description-
+   holding child among the 5/2 siblings in every real case checked). Fixed by dropping the `u32[1]`
+   check entirely.
+
+Neither fix touches anything used by `_resolve_bit_target`'s BIT-overlay work (Round 12/above), the
+Motion-axis suppression, or any non-SFC code path.
+
+**Verified**: byte-for-byte identical to JS's own converted output for this new project (73,925
+characters, modulo `ExportDate`) and for `CuteLogix.ACD`, `FBDLevelControlSimulation.ACD`,
+`Equipment_Phase_Sequencer.ACD`, `SFC_GearChange.ACD` (zero regressions — all 8 real `HideDesc="false"`
+Steps in `Equipment_Phase_Sequencer.ACD` still match their own established ground truth exactly).
+`pytest` suite: 110 passed, 2 skipped, plus the same 2 pre-existing/environmental failures this repo's
+own checkout has carried for several rounds now (`test_header_offset` — the checkout's own long-
+standing protected/modified `resources/CuteLogix.ACD` being a different revision than the test
+expects, unrelated to this fix; `test_to_xml` — Windows file-locking flakiness, confirmed passes in
+isolation) and 1 pre-existing missing-plugin error (`test_database.py`). The companion JS-side
+`CLAUDE.md` documents the live 28-routine MBH FBD regression check and the honest, unresolved `SEQ_*`
+finding (this sample's SQI/SQO content turned out to be the classic RLL Sequencer instructions, not
+the Rockwell Sequence-Manager `SEQ_BOOL`/`SEQ_DINT`/.../`SEQ_STEP` UDT family the actual documented
+gap needs — no `SEQ_*` type appears anywhere in this project's ground truth).
+
+**Not committed** — held in the working tree pending review, same discipline as every round.
