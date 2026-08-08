@@ -266,13 +266,25 @@ _PRIMITIVE_L5K_ZERO: Dict[str, str] = {
 }
 
 
-def _l5k_prim_literal(dt_upper: str, val) -> str:
+def _l5k_prim_literal(dt_upper: str, val, is_array_element: bool = False) -> str:
     """Format a single primitive value in Rockwell's L5K convention:
-    "2#0"/"2#1" for BOOL/BIT, scientific notation for REAL/LREAL
-    (_l5k_real_literal), plain decimal for every other integer type.
+    scientific notation for REAL/LREAL (_l5k_real_literal), plain decimal
+    for every other integer type. BOOL/BIT depends on context: a real BOOL
+    ARRAY element uses the "2#0"/"2#1" binary-literal prefix (confirmed
+    against a real 128-element BOOL array tag, MOV_SRC in
+    MBH_PLC01_V33_R17_4.L5X), but a SCALAR BOOL/BIT value (a plain tag, or
+    a UDT struct member -- confirmed against SEQ_BOOL's own "Value"/
+    "InitialValue", the first real ground truth to exercise a scalar BOOL
+    struct member's own L5K rendering at all) is a bare "1"/"0", same
+    convention Tag.to_xml() already uses for a top-level scalar BOOL tag.
+    Defaults to scalar (False) since that's the direct/common caller
+    (_l5k_udt_literal's own scalar branch); only _l5k_array_literal passes
+    True.
     """
     if dt_upper in ("BOOL", "BIT"):
-        return f"2#{1 if val else 0}"
+        if is_array_element:
+            return f"2#{1 if val else 0}"
+        return "1" if val else "0"
     if dt_upper in ("REAL", "LREAL"):
         return _l5k_real_literal(val)
     return str(int(val))
@@ -290,7 +302,7 @@ def _l5k_array_literal(dt_base: str, values: list) -> str:
     whitespace-insignificant for both XML and L5K parsing, so this emits
     a single line.
     """
-    return "[" + ",".join(_l5k_prim_literal(dt_base, v) for v in values) + "]"
+    return "[" + ",".join(_l5k_prim_literal(dt_base, v, is_array_element=True) for v in values) + "]"
 
 
 def _l5k_udt_literal(dt_name: str, values, data_types_map: Dict[str, 'DataType']) -> str:
@@ -924,8 +936,22 @@ def _udt_scalar_to_xml(dt_name: str, values: dict,
             )
 
         elif mdt_upper in ("BOOL", "BIT"):
+            # A genuine (non-overlay) BOOL member gets Radix="Decimal", same
+            # as a top-level scalar BOOL tag always has -- confirmed via
+            # SEQ_BOOL's own "Value"/"InitialValue" and SEQ_TRANSITION's
+            # "Status" (the first real ground truth exercising a standalone
+            # BOOL struct member at all; every previously-verified BOOL/BIT
+            # member in TIMER/PID/etc. is a BIT-overlay pseudo-member, which
+            # never gets a Radix attribute regardless of its own declared
+            # member.radix -- confirmed still true here too, e.g. SEQ_BOOL's
+            # own "Valid" BIT-overlay member has no Radix in ground truth
+            # despite radix="Decimal" on its Member record, same as every
+            # other BIT-overlay checked). Gating on mdt_upper (BOOL vs the
+            # reassigned "BIT") rather than member.radix, since member.radix
+            # is "Decimal" almost universally and carries no signal here.
+            radix_attr = ' Radix="Decimal"' if mdt_upper == "BOOL" else ""
             parts.append(
-                f'<DataValueMember Name="{mname}" DataType="BOOL" '
+                f'<DataValueMember Name="{mname}" DataType="BOOL"{radix_attr} '
                 f'Value="{"1" if val else "0"}"/>'
             )
 

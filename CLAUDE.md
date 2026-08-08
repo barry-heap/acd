@@ -2909,3 +2909,70 @@ the Rockwell Sequence-Manager `SEQ_BOOL`/`SEQ_DINT`/.../`SEQ_STEP` UDT family th
 gap needs — no `SEQ_*` type appears anywhere in this project's ground truth).
 
 **Not committed** — held in the working tree pending review, same discipline as every round.
+
+**Update, later in the same session**: this fix was committed and pushed (`49d6fe6` on `claude/dev`),
+verified live 3 ways. The `SEQ_*` gap itself stayed open at that point, per the task's explicit
+instruction not to bundle it in — closed separately below, once real `SEQ_*` ground truth arrived.
+
+## SEQ_* BIT-overlay gap closed — target resolution was already correct, the real bugs were two BOOL-rendering gaps
+
+A purpose-built ground-truth sample, `Equipment_Phase_Sequencer_SEQ_TAGSI.ACD`/`.L5X` (JS port's own
+`Samples/` directory — see that repo's `CLAUDE.md`, "Round 15", for the full parallel writeup this
+mirrors), supplies real, populated tags for all 8 real `SEQ_*` types Studio 5000 offers (`SEQ_BOOL`,
+`SEQ_DINT`, `SEQ_INT`, `SEQ_REAL`, `SEQ_SINT`, `SEQ_STEP`, `SEQ_STRING`, `SEQ_TRANSITION`), closing the
+gap the "BIT-overlay Target ground-truth verification" round above left explicitly open (no fixture
+existed anywhere with a real `SEQ_*`-typed tag to check `last_plain_backing`'s guess against).
+
+**Headline finding: BIT-overlay Target resolution for the whole family was already correct.** That
+round worried the family's second BIT-overlay run (`Valid`/`DisableExpression`/`ForceExpressionEval`/
+`AssignOValue`/`ExchangeData`/`ForceValid`/`Connection`/`Expression`) had no plain backing field at the
+byte range its `val60` implies. Direct inspection confirms `State` (an `INT`, genuinely `hidden=True`,
+declared immediately before the whole run) is exactly right — `last_hidden_backing` (the higher-
+priority tracker) already resolves every one of these bits correctly, across all 7 non-`SEQ_TRANSITION`
+types plus `SEQ_TRANSITION`'s own two runs (`State`/`FiringAttr`, both real hidden fields). **No
+target-resolution code change was needed** — the earlier round's own fix already handled this family;
+the gap was in verification data, not code.
+
+**Two real bugs, both BOOL-rendering, neither reachable by any prior fixture**:
+1. A genuine (non-overlay) `BOOL` struct member never got `Radix="Decimal"` in Decorated XML —
+   `_udt_scalar_to_xml`'s BOOL/BIT branch unconditionally omitted it. Correct for `BIT` (overlay
+   pseudo-members, still Radix-less, unchanged) but wrong for a genuine `BOOL` field (`SEQ_BOOL`'s own
+   `Value`/`InitialValue`, `SEQ_TRANSITION`'s own `Status`) — no previously-verified fixture had ever
+   exercised a standalone (non-overlay) `BOOL` struct member before. Fixed by gating the `Radix`
+   attribute on `mdt_upper == "BOOL"` (the genuine case) vs. the reassigned `"BIT"`.
+2. A scalar `BOOL`/`BIT` L5K value always rendered as a binary literal (`2#1`/`2#0`), even when not an
+   array element — `_l5k_prim_literal` had no scalar/array distinction. A real BOOL **array** tag
+   (`MOV_SRC`, `BOOL[128]`, `MBH_PLC01_V33_R17_4.L5X`) genuinely does use `2#0`/`2#1` per element
+   (confirming `_l5k_array_literal` was already right), but a **scalar** BOOL (`SEQ_BOOL.Value`/
+   `InitialValue`) is a bare `1`/`0`, matching `Tag.to_xml()`'s own top-level scalar BOOL convention.
+   Fixed by adding `is_array_element` (default `False`) to `_l5k_prim_literal`; only
+   `_l5k_array_literal` passes `True`.
+
+A red herring ruled out first: an initial `2#[01]` grep across real MBH ground truth found 857 "hits"
+that turned out to be false positives (the first digit of unrelated `DINT Radix="Binary"` 32-bit
+literals) — a precise re-check found zero real single-digit BOOL/BIT `2#` literals anywhere, confirming
+there was no prior positive evidence for the old scalar behavior.
+
+**Deliberately not touched**: the pre-existing, already-documented DINT-Hex-zero-padding gap (10 of
+165 CuteLogix DataTypes flagged earlier) re-surfaced here too (`SEQ_STEP1`'s `Status`/`State`/
+`ValidCommands`, `SEQ_TRAN1`'s `State`/`FiringAttr` all render `Value="0"` instead of ground truth's
+`"16#0000_0000"`) — same root cause (`_udt_scalar_to_xml`'s non-BOOL branch has no `Radix == "Hex"`
+case), out of this round's scope, unchanged. Also reconfirmed unrelated/unchanged: the L5K long-array
+line-wrap cosmetic difference and the `<Tag>`-attribute-order cosmetic gap.
+
+**Verified**: byte-for-byte identical to JS's own converted output for this new project (82,735
+characters, modulo `ExportDate`) and for all 5 pre-existing real-controller fixtures re-checked this
+round (`CuteLogix.ACD`, `FBDLevelControlSimulation.ACD`, `Equipment_Phase_Sequencer.ACD`,
+`SFC_GearChange.ACD`, `Equipment_Phase_Sequencer_SQO_SQI.ACD`) — the fix's reach extends correctly
+beyond the new sample: `FBDLevelControlSimulation.ACD`'s real `PID_ENHANCED` tags' own `EnableIn`/
+`EnableOut` now also correctly render `Radix="Decimal"`, independently confirmed against
+`FBDLevelControlSimulation.L5X`'s own real ground truth (exactly 1 of 7 real occurrences is the
+genuine struct member the fix targets, matching ground truth's own count exactly; the other 6 are a
+different, unaffected, structural AOI/Parameter code path). `pytest` suite: 110 passed, 2 skipped, the
+same 2 pre-existing/environmental failures carried for several rounds (`test_header_offset`/
+`test_to_xml`, both confirmed unrelated) plus 1 pre-existing missing-plugin error. The companion JS-side
+`CLAUDE.md` documents the live 28-routine MBH FBD regression check (28/28 PASS, zero regressions from
+touching shared L5K/Decorated value-formatting helpers) and the `dist/` build-freshness check.
+
+**Closes the last of the three Studio-5000-test-case gaps** (`IsBoolean`/`HideDesc`-`DescXY` committed
+earlier; this is the third). Not committed yet — held in the working tree pending review.
