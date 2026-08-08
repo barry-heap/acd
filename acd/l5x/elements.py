@@ -507,9 +507,20 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
 # MOTION_GROUP as an "opaque, no-Decorated" type) was never actually
 # checked against real ground truth and turned out to be wrong for the
 # Decorated question specifically, right only for the Constant question.
+# AXIS_VIRTUAL joined AXIS_SERVO/AXIS_CIP_DRIVE/MOTION_GROUP here (same dual
+# membership in this set and _NO_NATIVE_DECORATED_FORMAT below) during the
+# BIT-overlay ground-truth round -- without this, Tag.to_xml's fallback
+# branch (no dict/array decoded, or _NO_NATIVE_DECORATED_FORMAT left
+# data_xml empty) still called _generate_decorated() for it, producing the
+# exact same kind of synthetic Decorated block this set exists to prevent.
+# AXIS_GENERIC/AXIS_CONSUMED/AXIS_SERVO_DRIVE/AXIS_GENERIC_DRIVE are NOT
+# included here -- see _NO_NATIVE_DECORATED_FORMAT's own comment below for
+# why they're deliberately left as an open, untested question rather than
+# added on the strength of "same family" inference alone (that exact move
+# broke a real case before, in the DEDT/VisiblePins round -- see CLAUDE.md).
 _SKIP_DECORATED: set = {
     "ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED",
-    "AXIS_CIP_DRIVE", "MOTION_GROUP",
+    "AXIS_CIP_DRIVE", "MOTION_GROUP", "AXIS_VIRTUAL",
 }
 
 # Types that use their own dedicated native L5X <Data Format="..."> block
@@ -525,11 +536,30 @@ _SKIP_DECORATED: set = {
 # (SFC_GearChange.L5X): axis0/axis1 (AXIS_SERVO) use
 # <Data Format="Axis"><AxisParameters .../></Data>; group1 (MOTION_GROUP)
 # uses <Data Format="MotionGroup"><MotionGroupParameters .../></Data> --
-# neither has any L5K or Decorated block at all. AXIS_CIP_DRIVE is included
-# by inference only (the same Motion-axis-instance family as AXIS_SERVO,
-# almost certainly also rendered as Format="Axis" by real Studio 5000) --
-# no fixture available exercises it, so this is unverified; flag if a
-# real AXIS_CIP_DRIVE tag ever turns up and contradicts this.
+# neither has any L5K or Decorated block at all. AXIS_VIRTUAL verified the
+# same way against CuteLogix.L5X's real "VAxis" tag (also Format="Axis",
+# no L5K/Decorated) -- found missing from this set during the BIT-overlay
+# ground-truth round (CLAUDE.md), where VAxis was wrongly emitting a
+# synthetic Decorated block same as the original AXIS_SERVO bug this set
+# was created to fix. AXIS_CIP_DRIVE is included by inference only (a
+# pre-existing, unchanged addition) -- the same Motion-axis-instance family
+# as AXIS_SERVO, almost certainly also rendered as Format="Axis" by real
+# Studio 5000, but no fixture available exercises it, so it remains
+# unverified; flag if a real AXIS_CIP_DRIVE tag ever turns up and
+# contradicts this.
+#
+# OPEN, DELIBERATELY UNVERIFIED, NOT IN EITHER SET: AXIS_GENERIC,
+# AXIS_CONSUMED, AXIS_SERVO_DRIVE, AXIS_GENERIC_DRIVE. Each has the
+# identical DEAD_ZONE-padded internal member shape as AXIS_SERVO/
+# AXIS_VIRTUAL (confirmed by inspection during the BIT-overlay ground-truth
+# round) and is almost certainly also Format="Axis"-only in real Studio
+# 5000 -- but "almost certainly, same family" is exactly the reasoning that
+# broke a real case before (the DEDT/VisiblePins generalization mistake,
+# see CLAUDE.md), so these four are intentionally left OUT of both sets
+# until a real fixture with one of these tag types actually confirms it,
+# not added preemptively. If a project with any of these DataTypes ever
+# turns up, check it against real ground truth the same way AXIS_VIRTUAL
+# was checked this round before adding it here.
 #
 # Found via a real, reproducible bug: TagBuilder/ControllerBuilder's second
 # pass can successfully decode a dict-shaped _initial_value for an
@@ -546,7 +576,19 @@ _SKIP_DECORATED: set = {
 # AXIS_SERVO's own "DataType" is excluded from <DataTypes> and (with this
 # fix) never rendered under any <Tag> either, its internal member/BIT-
 # target-resolution correctness no longer affects any L5X output at all.
-_NO_NATIVE_DECORATED_FORMAT: set = {"AXIS_SERVO", "AXIS_CIP_DRIVE", "MOTION_GROUP"}
+#
+# MESSAGE verified directly against real ground truth (CuteLogix.L5X's real
+# "Message"/"WebPage" tags): both use
+# <Data Format="Message"><MessageParameters .../></Data>, no L5K/Decorated
+# block at all -- found during the same BIT-overlay ground-truth round.
+# MESSAGE was already in _SKIP_DECORATED (governs Constant suppression and
+# the separate "no decoded value at all" fallback path) but, same as the
+# original AXIS_SERVO bug, was never checked by Tag.to_xml's UDT-dict/
+# UDT-array branches, so a MESSAGE tag with a successfully-decoded value
+# still got a synthetic Decorated block Studio 5000 never produces.
+_NO_NATIVE_DECORATED_FORMAT: set = {
+    "AXIS_SERVO", "AXIS_CIP_DRIVE", "MOTION_GROUP", "AXIS_VIRTUAL", "MESSAGE",
+}
 
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
@@ -1009,14 +1051,20 @@ _STRING_SIZE = 88
 def _string_literal_cdata(text: str) -> str:
     """Format a decoded string value as Rockwell's quoted-literal CDATA content.
 
-    Studio 5000 renders a non-empty STRING/string-family DATA member's text
-    as ``<![CDATA['the text']]>`` -- wrapped in a CDATA section AND in
-    literal single quotes (matching its L5K string-literal convention), with
-    any embedded single quote doubled (Pascal/Ada-style escaping). An empty
-    string renders as bare ``<![CDATA[]]>`` with no quotes at all. Both
-    verified against a real Studio 5000 L5X export.
+    Studio 5000 renders a STRING/string-family DATA member's text as
+    ``<![CDATA['the text']]>`` -- wrapped in a CDATA section AND in literal
+    single quotes (matching its L5K string-literal convention), with any
+    embedded single quote doubled (Pascal/Ada-style escaping) -- including
+    the empty-string case, which still renders quoted
+    (``<![CDATA['']]>``), not bare. This docstring previously claimed the
+    empty case renders bare ``<![CDATA[]]>`` with no quotes, "verified
+    against a real Studio 5000 L5X export" -- that claim turned out to be
+    wrong, corrected during the BIT-overlay ground-truth round (CLAUDE.md)
+    after checking two independent real exports (CuteLogix.L5X's real
+    "Controller_Name" tag, and MBH_PLC01_V33_R17_4.L5X's own equivalent
+    empty-STRING tag): both show quoted-empty CDATA, never bare.
     """
-    if not text:
+    if text is None:
         return "<![CDATA[]]>"
     escaped = text.replace("'", "''")
     safe = Tag._sanitize_xml_text(escaped)
@@ -2844,26 +2892,89 @@ class DataTypeBuilder(L5xElementBuilder):
                         val_60 = struct.unpack_from("<I", rec, 0x60)[0]
                         offset60_to_name[val_60] = child[0]
 
-            # Track the most recent preceding hidden SINT (fallback target for
-            # Pattern-2 BIT members).
+            # last_hidden_backing: most recently declared *hidden* member --
+            # correctly resolves the common case (TIMER/COUNTER/CONTROL's own
+            # hidden "Control" DWORD, always both hidden and immediately
+            # adjacent to its own BIT overlays). last_plain_backing: most
+            # recently declared member of *any* kind (hidden or not) that
+            # isn't itself a BIT-overlay member -- used only when no hidden
+            # member has been seen yet for this run of BIT members (PID's
+            # CTL, MOTION_INSTRUCTION's FLAGS, SFC_STEP/SFC_ACTION/SFC_STOP's
+            # Status, PHASE/PHASE_INSTRUCTION/DATALOG_INSTRUCTION/SEQUENCE/
+            # SEQ_TRANSITION's own status word -- none of these are hidden,
+            # but each is declared immediately before its own BIT-overlay run
+            # with nothing in between). Declaration order is used rather than
+            # the raw 0x60 byte field precisely because that field's own
+            # semantics turned out to differ across real Studio 5000
+            # revisions -- confirmed by real ground truth from two different
+            # real projects at two different SoftwareRevisions: for
+            # PID/MOTION_INSTRUCTION in a rev-30 project, a BIT member's
+            # 0x60 equals its true host's *end* byte offset; for the
+            # identical MOTION_INSTRUCTION type in a rev-33 project, 0x60
+            # instead equals the host's *start* offset. Neither convention is
+            # safe to hard-code, so this declaration-order tracker replaces
+            # byte-offset arithmetic entirely for the "no hidden backing"
+            # case -- see CLAUDE.md's "BIT-overlay Target ground-truth
+            # verification" round for the full derivation, including why a
+            # broader "always track most recent field, hidden or not"
+            # version (considered and rejected in an earlier round) is
+            # wrong: it would incorrectly walk last_hidden_backing's own
+            # cases (TIMER/COUNTER/CONTROL) forward onto a later non-hidden
+            # field. Kept strictly lower priority than last_hidden_backing,
+            # so those cases are completely unaffected -- last_plain_backing
+            # only ever matters once last_hidden_backing has already been
+            # ruled out (still None).
             last_hidden_backing: Union[str, None] = None
+            last_plain_backing: Union[str, None] = None
             for key in member_keys:
                 rec = extended_records[key]
                 member_name = DataTypeBuilder._decode_member_name(rec)
                 child = name_to_child.get(member_name)
                 if child is None:
                     continue
-                # Update last_hidden_backing when we see a hidden member
+                fallback_target = (
+                    last_hidden_backing if last_hidden_backing is not None else last_plain_backing
+                )
                 if len(rec) >= 0x74:
-                    is_hidden = bool(struct.unpack_from("<I", rec, 0x70)[0])
-                    if is_hidden:
-                        last_hidden_backing = child[0]
+                    data_type_id2 = struct.unpack_from("<I", rec, 0x58)[0]
+                    self._cur.execute(
+                        "SELECT comp_name FROM comps WHERE object_id=" + str(data_type_id2)
+                    )
+                    dt_row2 = self._cur.fetchone()
+                    # A BIT-overlay member (itself the *result* of another
+                    # member's overlay resolution, never a valid host) must
+                    # never become last_hidden_backing/last_plain_backing for
+                    # a later sibling, even when it happens to be hidden
+                    # itself -- found via a real, reproducible case
+                    # (SEQ_STEP's own "EX", a hidden BIT-typed member) where
+                    # an unconditional "if is_hidden: last_hidden_backing =
+                    # child[0]" (no BIT-overlay guard) let EX poison every
+                    # subsequent bit's fallback target with EX's own name, a
+                    # nonsensical bit-targets-a-bit result. This bug pre-dates
+                    # this round's changes (the original code had the
+                    # identical unconditional check) but was only surfaced by
+                    # adding last_plain_backing, since only then does a
+                    # hidden BIT-overlay member's own bogus "backing" ever
+                    # get consumed.
+                    is_bit_overlay = (
+                        dt_row2 is not None
+                        and dt_row2[0] == "BOOL"
+                        and not (
+                            struct.unpack_from("<I", rec, 0x6C)[0] == 0xFFFFFFFF
+                            and struct.unpack_from("<I", rec, 0x68)[0] == 0x800
+                        )
+                    )
+                    if not is_bit_overlay:
+                        is_hidden = bool(struct.unpack_from("<I", rec, 0x70)[0])
+                        if is_hidden:
+                            last_hidden_backing = child[0]
+                        last_plain_backing = child[0]
                 try:
                     children.append(
                         MemberBuilder(
                             self._cur, child[1], rec,
                             offset60_to_name,
-                            last_hidden_backing,
+                            fallback_target,
                         ).build()
                     )
                     del name_to_child[member_name]
